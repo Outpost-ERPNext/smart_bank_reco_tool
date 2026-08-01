@@ -13,8 +13,7 @@ app_license = "MIT"
 # ------------------
 
 # include js, css files in header of desk.html
-# app_include_css = "/assets/smart_bank_reconciliation/css/smart_bank_reconciliation.css"
-# app_include_js = "/assets/smart_bank_reconciliation/js/smart_bank_reconciliation.js"
+app_include_css = "/assets/smart_bank_reconciliation/css/recon.css"
 
 # include js, css files in header of web template
 # web_include_css = "/assets/smart_bank_reconciliation/css/smart_bank_reconciliation.css"
@@ -31,7 +30,12 @@ app_license = "MIT"
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
+doctype_js = {
+    "Bank Reconciliation Tool": [
+        "public/js/recon_ui.js",
+        "public/js/recon_form_extension.js",
+    ]
+}
 # doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
@@ -52,6 +56,17 @@ app_license = "MIT"
 
 # automatically create page for each record of this doctype
 # website_generators = ["Web Page"]
+
+# Fixtures — export/import custom fields with the app
+fixtures = [
+    {
+        "dt": "Custom Field",
+        "filters": [
+            ["dt", "in", ["Bank Transaction", "Bank Reconciliation Tool"]],
+            ["fieldname", "like", "recon_%"],
+        ],
+    }
+]
 
 # Installation
 # ------------

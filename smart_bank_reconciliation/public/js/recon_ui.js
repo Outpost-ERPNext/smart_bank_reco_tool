@@ -1,0 +1,2237 @@
+/* recon_ui.js — Rendering helpers for Bank Reconciliation panel (Phase 2) */
+
+window.ReconUI = (function () {
+
+  /* ── Constants ── */
+
+  var QUEUE_COLOR = {
+    "Auto":       { bg: "#DCFCE7", text: "#16A34A", border: "#16A34A" },
+    "Review":     { bg: "#FEF3C7", text: "#D97706", border: "#D97706" },
+    "Unmatched":  { bg: "#FEE2E2", text: "#DC2626", border: "#DC2626" },
+    "High-Val":   { bg: "#EDE9FE", text: "#7C3AED", border: "#7C3AED" },
+    "Duplicate":  { bg: "#FEE2E2", text: "#B91C1C", border: "#B91C1C" },
+    "Aging":      { bg: "#FFEDD5", text: "#EA580C", border: "#EA580C" },
+    "Reconciled": { bg: "#F1F5F9", text: "#64748B", border: "#CBD5E1" },
+  };
+
+  var SIGNAL_LABEL = {
+    amount: "amount", reference: "reference", date: "date",
+    party: "party", side: "side", history: "history",
+  };
+
+  var TILE_TO_QUEUE = {
+    "AUTO": "Auto", "REVIEW": "Review", "UNMATCHED": "Unmatched",
+    "HIGH-VAL": "High-Val", "DUPES": "Duplicate", "AGING": "Aging", "RECONCILED": "Reconciled",
+  };
+
+  /* ── Simple helpers ── */
+
+  function queueBadge(queue) {
+    var c = QUEUE_COLOR[queue] || { bg: "#F1F5F9", text: "#64748B", border: "#CBD5E1" };
+    return '<span class="sbr-badge" style="background:' + c.bg +
+           ';color:' + c.text + ';border-color:' + c.border + '">' +
+           (queue || "—") + "</span>";
+  }
+
+  function formatAmount(val) {
+    if (!val) return "—";
+    return "₦" + parseFloat(val).toLocaleString("en-NG", {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+  }
+
+  function confidenceBar(pct) {
+    var color = pct >= 90 ? "#16A34A" : pct >= 50 ? "#D97706" : "#DC2626";
+    return '<div class="sbr-conf-bar-wrap">' +
+      '<div class="sbr-conf-bar-fill" style="width:' + pct + '%;background:' + color + '"></div>' +
+      '</div><span class="sbr-conf-pct" style="color:' + color + '">' + pct.toFixed(1) + "%</span>";
+  }
+
+  function signalBadges(signals) {
+    if (!signals) return "";
+    var html = '<div class="sbr-signal-row">';
+    Object.keys(signals).forEach(function (k) {
+      var v = Math.round(signals[k]);
+      var ok = v >= 80 ? "#16A34A" : v >= 50 ? "#D97706" : "#DC2626";
+      html += '<span class="sbr-signal-chip" style="color:' + ok + ';border-color:' + ok + '">' +
+              (SIGNAL_LABEL[k] || k) + " " + v + "%</span>";
+    });
+    return html + "</div>";
+  }
+
+  // Confidence badge for Match column (Phase 2 — replaces queue badge)
+  function confidenceBadge(pct, queue) {
+    if (queue === "Reconciled") {
+      return '<span class="sbr-conf-badge sbr-conf-reconciled">✓ Reconciled</span>';
+    }
+    if (!pct || pct <= 0) {
+      return '<span style="color:#cbd5e1;font-size:12px">—</span>';
+    }
+    var level, cls;
+    if (pct >= 90)      { level = "HIGH"; cls = "sbr-conf-high"; }
+    else if (pct >= 60) { level = "MED";  cls = "sbr-conf-med";  }
+    else                { level = "LOW";  cls = "sbr-conf-low";  }
+    return '<span class="sbr-conf-badge ' + cls + '">▲ ' + Math.round(pct) + "% " + level + "</span>";
+  }
+
+  /* ── Tab shell ── */
+
+  function renderTabShell($container, bankCount) {
+    if ($container.find(".sbr-tab-bar").length) return; // already built
+
+    var $inner = $container.find(".sbr-panel-inner");
+
+    // Balance bar — populated later by renderBalanceSummary
+    $inner.append(
+      '<div class="sbr-balance-bar">' +
+        '<span class="sbr-balance-placeholder">Balance summary loading…</span>' +
+      '</div>'
+    );
+
+    // AI analysis banner — hidden until AI runs
+    $inner.append('<div class="sbr-ai-banner" style="display:none"></div>');
+
+    // Tab bar
+    $inner.append(
+      '<div class="sbr-tab-bar">' +
+        '<button class="sbr-tab sbr-tab-active" data-tab="bank">Bank Transactions' +
+          ' <span class="sbr-tab-badge">' + (bankCount || 0) + "</span></button>" +
+        '<button class="sbr-tab" data-tab="erp">ERP Vouchers' +
+          ' <span class="sbr-tab-badge">0</span></button>' +
+        '<button class="sbr-tab" data-tab="ai">AI Match Pairs' +
+          ' <span class="sbr-tab-badge">0</span></button>' +
+        '<button class="sbr-tab" data-tab="audit">Audit Trail' +
+          ' <span class="sbr-tab-badge">0</span></button>' +
+      "</div>"
+    );
+
+    // Tab content areas
+    $inner.append(
+      '<div class="sbr-tab-content sbr-tab-active" data-tab="bank">' +
+        '<div class="sbr-bank-toolbar">' +
+          '<select class="sbr-queue-filter">' +
+            '<option value="">All Queues</option>' +
+            '<option value="Auto">Auto-Match</option>' +
+            '<option value="Review">Review</option>' +
+            '<option value="Unmatched">Unmatched</option>' +
+            '<option value="High-Val">High-Value</option>' +
+            '<option value="Duplicate">Duplicate</option>' +
+            '<option value="Aging">Aging</option>' +
+            '<option value="Reconciled">Reconciled</option>' +
+          "</select>" +
+          '<select class="sbr-party-type-filter" style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151;background:#fff">' +
+            '<option value="">All Party Types</option>' +
+            '<option value="Customer">Customer</option>' +
+            '<option value="Supplier">Supplier</option>' +
+            '<option value="Employee">Employee</option>' +
+          "</select>" +
+          '<input type="text" class="sbr-search-input" placeholder="Search description, reference, party…" ' +
+            'style="flex:1;min-width:180px;max-width:340px;padding:5px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151">' +
+          '<span class="sbr-txn-counter"></span>' +
+          '<div class="sbr-toolbar-sel-btns">' +
+            '<button class="sbr-toolbar-rerun-sel" type="button" style="display:none">↺ Re-run Selected</button>' +
+            '<button class="sbr-toolbar-consolidate-sel" type="button" style="display:none">↕ Consolidate Selected</button>' +
+            '<button class="sbr-toolbar-sel-btn sbr-toolbar-select-all" type="button">Select All</button>' +
+            '<button class="sbr-toolbar-sel-btn sbr-toolbar-clear-sel" type="button">Clear</button>' +
+          "</div>" +
+        "</div>" +
+        '<div class="sbr-table-wrap"></div>' +
+      "</div>" +
+      '<div class="sbr-tab-content" data-tab="erp" style="display:none">' +
+        '<p class="sbr-empty" style="padding:24px 0">ERP Vouchers appear here after loading. ' +
+        'Load transactions first, then run AI Match All.</p>' +
+      "</div>" +
+      '<div class="sbr-tab-content" data-tab="ai" style="display:none">' +
+        '<div class="sbr-suggestion-panel sbr-suggestion-panel-tab"></div>' +
+      "</div>" +
+      '<div class="sbr-tab-content sbr-audit-tab" data-tab="audit" style="display:none">' +
+        '<p class="sbr-empty sbr-audit-empty" style="padding:32px 16px;color:#94a3b8">No actions recorded yet. ' +
+        'Actions appear here after you Approve transactions.</p>' +
+      "</div>"
+    );
+
+    // Tab click
+    $container.on("click", ".sbr-tab", function () {
+      switchTab($container, $(this).data("tab"));
+    });
+
+    // Queue dropdown change
+    $container.on("change", ".sbr-queue-filter", function () {
+      filterByQueue($container, $(this).val() || null, true);
+    });
+
+    // Party Type dropdown change
+    $container.on("change", ".sbr-party-type-filter", function () {
+      $container.data("sbr-party-type-filter", $(this).val() || null);
+      applyFilters($container);
+    });
+
+    // Text search — combines with active queue filter and party type filter
+    $container.on("input", ".sbr-search-input", function () {
+      $container.data("sbr-text-filter", $(this).val() || "");
+      applyFilters($container);
+    });
+
+    // Helper: show/hide selection-context buttons based on checked count
+    function updateConsolidateBtn() {
+      var n = $container.find(".sbr-row-check:checked").length;
+      var $consBtn  = $container.find(".sbr-toolbar-consolidate-sel");
+      var $rerunBtn = $container.find(".sbr-toolbar-rerun-sel");
+      if (n >= 2) {
+        $consBtn.text("↕ Consolidate Selected (" + n + ")").show();
+      } else {
+        $consBtn.hide();
+      }
+      if (n >= 1) {
+        $rerunBtn.text("↺ Re-run Selected (" + n + ")").show();
+      } else {
+        $rerunBtn.hide();
+      }
+    }
+
+    // Select All button — checks only visible (filtered) rows
+    $container.on("click", ".sbr-toolbar-select-all", function () {
+      $container.find(".sbr-row:visible .sbr-row-check").prop("checked", true);
+      $container.find(".sbr-select-all").prop("checked", true);
+      updateConsolidateBtn();
+    });
+
+    // Clear button — unchecks everything
+    $container.on("click", ".sbr-toolbar-clear-sel", function () {
+      $container.find(".sbr-row-check, .sbr-select-all").prop("checked", false);
+      updateConsolidateBtn();
+    });
+
+    // Individual / header checkboxes — keep Consolidate button in sync
+    $container.on("change", ".sbr-row-check, .sbr-select-all", function () {
+      setTimeout(updateConsolidateBtn, 0);
+    });
+
+  }
+
+  function switchTab($container, tabName) {
+    $container.find(".sbr-tab").removeClass("sbr-tab-active");
+    $container.find('.sbr-tab[data-tab="' + tabName + '"]').addClass("sbr-tab-active");
+    $container.find(".sbr-tab-content").hide().removeClass("sbr-tab-active");
+    $container.find('.sbr-tab-content[data-tab="' + tabName + '"]').show().addClass("sbr-tab-active");
+  }
+
+  function updateTabBadge($container, tabName, count) {
+    $container.find('.sbr-tab[data-tab="' + tabName + '"] .sbr-tab-badge').text(count);
+  }
+
+  /* ── Summary tiles ── */
+
+  function renderSummaryTiles($container, counts) {
+    var tiles = [
+      { key: "total",      label: "TOTAL",      color: "#1D4ED8" },
+      { key: "auto",       label: "AUTO",       color: "#16A34A" },
+      { key: "review",     label: "REVIEW",     color: "#D97706" },
+      { key: "unmatched",  label: "UNMATCHED",  color: "#DC2626" },
+      { key: "high_val",   label: "HIGH-VAL",   color: "#7C3AED" },
+      { key: "duplicate",  label: "DUPES",      color: "#B91C1C" },
+      { key: "aging",      label: "AGING",      color: "#EA580C" },
+      { key: "reconciled", label: "RECONCILED", color: "#64748B" },
+    ];
+    var html = '<div class="sbr-tiles">';
+    tiles.forEach(function (t) {
+      var n = counts[t.key] || 0;
+      html += '<div class="sbr-tile" data-queue="' + t.label +
+              '" style="border-top:3px solid ' + t.color + '">' +
+              '<div class="sbr-tile-num" style="color:' + t.color + '">' + n + "</div>" +
+              '<div class="sbr-tile-label">' + t.label + "</div>" +
+              "</div>";
+    });
+    html += "</div>";
+
+    var $tiles = $container.find(".sbr-tiles");
+    if ($tiles.length) {
+      $tiles.replaceWith(html);
+    } else {
+      $container.find(".sbr-panel-inner").prepend(html);
+    }
+
+    $container.find(".sbr-tile").on("click", function () {
+      var tileLabel = $(this).data("queue");
+      var queueName = tileLabel === "TOTAL" ? null : (TILE_TO_QUEUE[tileLabel] || null);
+      filterByQueue($container, queueName);
+      switchTab($container, "ai");
+    });
+  }
+
+  /* ── Balance summary bar ── */
+
+  function renderBalanceSummary($container, balance) {
+    if (!balance) return;
+    var bankClosing = parseFloat(balance.bank_closing || 0);
+    var erpClosing  = parseFloat(balance.erp_closing  || 0);
+    var diff        = bankClosing - erpClosing;
+    var diffStyle   = Math.abs(diff) < 0.01 ? "color:#16a34a" : "color:#dc2626";
+    var diffSign    = diff < 0 ? "−" : diff > 0 ? "+" : "";
+
+    $container.find(".sbr-balance-bar").html(
+      '<div class="sbr-balance-item">' +
+        '<div class="sbr-balance-label">Closing Balance as per Bank Statement</div>' +
+        '<div class="sbr-balance-val">' + (bankClosing ? formatAmount(bankClosing) : '<span style="color:#94a3b8;font-size:12px">Not entered</span>') + "</div>" +
+      "</div>" +
+      '<div class="sbr-balance-sep"></div>' +
+      '<div class="sbr-balance-item">' +
+        '<div class="sbr-balance-label">Closing Balance as per ERP</div>' +
+        '<div class="sbr-balance-val">' + formatAmount(erpClosing) + "</div>" +
+      "</div>" +
+      '<div class="sbr-balance-sep"></div>' +
+      '<div class="sbr-balance-item">' +
+        '<div class="sbr-balance-label">Difference</div>' +
+        '<div class="sbr-balance-val" style="' + diffStyle + '">' +
+          (Math.abs(diff) < 0.01 ? "₦0.00" : diffSign + formatAmount(Math.abs(diff))) +
+        "</div>" +
+      "</div>"
+    );
+  }
+
+  /* ── AI Analysis banner ── */
+
+  function renderAIBanner($container, counts) {
+    var total     = counts.total     || 0;
+    var auto      = counts.auto      || 0;
+    var review    = counts.review    || 0;
+    var unmatched = counts.unmatched || 0;
+    var rate      = total > 0 ? Math.round((auto / total) * 100) : 0;
+
+    $container.find(".sbr-ai-banner").html(
+      '<span class="sbr-ai-banner-icon">✦</span>' +
+      '<span class="sbr-ai-banner-title">AI Analysis Complete</span>' +
+      '<span class="sbr-ai-banner-sep">|</span>' +
+      '<span class="sbr-ai-stat"><span class="sbr-ai-dot" style="color:#1d4ed8">●</span> ' + auto + " Auto-matched</span>" +
+      '<span class="sbr-ai-stat"><span class="sbr-ai-dot" style="color:#d97706">●</span> ' + review + " Review</span>" +
+      '<span class="sbr-ai-stat"><span class="sbr-ai-dot" style="color:#dc2626">●</span> ' + unmatched + " Unmatched</span>" +
+      '<span class="sbr-ai-stat"><span class="sbr-ai-dot" style="color:#7c3aed">●</span> ' + (counts.draft || 0) + " Draft entry</span>" +
+      '<span class="sbr-ai-stat sbr-ai-stat-rate">' + rate + "% Automation Rate</span>" +
+      '<div class="sbr-ai-banner-actions">' +
+        '<button class="sbr-btn sbr-btn-accept sbr-banner-approve-btn">' +
+          "✓ Approve All Auto (" + auto + ")</button>" +
+      "</div>"
+    ).show();
+  }
+
+  /* ── Filter by queue ── */
+
+  function applyFilters($container) {
+    var queueName  = $container.data("sbr-queue-filter") || null;
+    var partyType  = $container.data("sbr-party-type-filter") || null;
+    var txt = ($container.data("sbr-text-filter") || "").toLowerCase().trim();
+
+    var total = 0, visible = 0;
+    $container.find(".sbr-row").each(function () {
+      total++;
+      var $row = $(this);
+      var queueOk  = !queueName  || $row.data("queue")       === queueName;
+      var ptOk     = !partyType  || $row.data("party-type")  === partyType;
+      var textOk   = !txt || ($row.data("search-text") || "").indexOf(txt) !== -1;
+      if (queueOk && ptOk && textOk) { $row.show(); visible++; }
+      else                            { $row.hide(); }
+    });
+    if (total > 0) {
+      $container.find(".sbr-txn-counter").text(
+        (queueName || txt)
+          ? "Showing " + visible + " of " + total + " transactions"
+          : total + " transactions"
+      );
+    }
+
+    $container.find(".sbr-card").each(function () {
+      if (!queueName || $(this).data("queue") === queueName) { $(this).show(); }
+      else                                                    { $(this).hide(); }
+    });
+
+    var $panel = $container.find(".sbr-suggestion-panel");
+    $panel.find(".sbr-sp-queue-tab").removeClass("sbr-sp-queue-tab-active").css("background", "#fff");
+    var $activeTab = $panel.find('.sbr-sp-queue-tab[data-filter="' + (queueName || "all") + '"]');
+    if ($activeTab.length) {
+      $activeTab.addClass("sbr-sp-queue-tab-active");
+      var c = queueName ? (QUEUE_COLOR[queueName] || {}) : {};
+      $activeTab.css("background", queueName ? (c.bg || "#f8fafc") : "#EFF6FF");
+    }
+  }
+
+  function filterByQueue($container, queueName, fromDropdown) {
+    // Highlight matching tile
+    $container.find(".sbr-tile").removeClass("sbr-tile-active");
+    if (!queueName) {
+      $container.find('.sbr-tile[data-queue="TOTAL"]').addClass("sbr-tile-active");
+    } else {
+      var tileLabel = null;
+      Object.keys(TILE_TO_QUEUE).forEach(function (k) {
+        if (TILE_TO_QUEUE[k] === queueName) tileLabel = k;
+      });
+      if (tileLabel) {
+        $container.find('.sbr-tile[data-queue="' + tileLabel + '"]').addClass("sbr-tile-active");
+      }
+    }
+
+    // Sync dropdown (unless change came from dropdown itself)
+    if (!fromDropdown) {
+      $container.find(".sbr-queue-filter").val(queueName || "");
+    }
+
+    $container.data("sbr-queue-filter", queueName || null);
+    applyFilters($container);
+  }
+
+  /* ── Transaction table ── */
+
+  function renderTransactionTable($container, transactions) {
+    if (!transactions || !transactions.length) {
+      $container.find(".sbr-table-wrap").html(
+        '<p class="sbr-empty" style="padding:16px">No transactions found for this period.</p>'
+      );
+      $container.find(".sbr-txn-counter").text("0 transactions");
+      return;
+    }
+
+    // Store for modal and consolidate access
+    $container.data("transactions", transactions);
+
+    var html = '<table class="sbr-table"><thead><tr>' +
+      '<th class="sbr-check-col"><input type="checkbox" class="sbr-select-all" title="Select all visible"></th>' +
+      '<th style="width:36px;color:#94a3b8;font-weight:600">#</th>' +
+      "<th>Date</th>" +
+      "<th>Description / Narration</th>" +
+      "<th>Deposit (₦)</th>" +
+      "<th>Withdrawal (₦)</th>" +
+      "<th>Unallocated (₦)</th>" +
+      "<th>Reference No.</th>" +
+      "<th>AI Match</th>" +
+      "<th>Matched ERP Entry</th>" +
+      "<th>Actions</th>" +
+      "</tr></thead><tbody>";
+
+    transactions.forEach(function (t, idx) {
+      var queue = t.recon_queue || "";
+      var pct   = parseFloat(t.recon_confidence) || 0;
+      var matchCell = confidenceBadge(pct, queue);
+      var isReconciled = queue === "Reconciled";
+
+      // Parse matched ERP entry names from JSON
+      var matchedEntryHtml = "—";
+      var rawEntries = t.recon_matched_entries;
+      if (rawEntries) {
+        try {
+          var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
+          if (entryNames && entryNames.length) {
+            matchedEntryHtml = entryNames.map(function (en) {
+              return '<a class="sbr-link" href="/app/' + encodeURIComponent(en) + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
+            }).join('<br>');
+          }
+        } catch (e) {}
+      }
+
+      var searchText = [t.description, t.reference_number, t.party]
+        .filter(Boolean).join(" ").toLowerCase().replace(/"/g, "");
+      html += '<tr class="sbr-row' + (isReconciled ? " sbr-row-done" : "") + '"' +
+              ' data-txn="' + t.name + '" data-queue="' + queue + '"' +
+              ' data-party-type="' + (t.party_type || "") + '"' +
+              ' data-search-text="' + searchText + '">' +
+              '<td class="sbr-check-col">' +
+                (isReconciled ? "" :
+                  '<input type="checkbox" class="sbr-row-check" data-txn="' + t.name + '">') +
+              "</td>" +
+              '<td style="color:#94a3b8;font-size:11px;font-variant-numeric:tabular-nums">' + (idx + 1) + "</td>" +
+              "<td style='white-space:nowrap'>" + (t.date || "") + "</td>" +
+              "<td class='sbr-desc'>" + (t.description || t.party || "—") + "</td>" +
+              '<td style="color:#16a34a;font-weight:600;font-variant-numeric:tabular-nums">' +
+                (t.deposit && parseFloat(t.deposit) > 0 ? formatAmount(t.deposit) : "") + "</td>" +
+              '<td style="color:#dc2626;font-weight:600;font-variant-numeric:tabular-nums">' +
+                (t.withdrawal && parseFloat(t.withdrawal) > 0 ? formatAmount(t.withdrawal) : "") + "</td>" +
+              '<td style="color:#64748b;font-variant-numeric:tabular-nums">' +
+                (t.unallocated_amount && parseFloat(t.unallocated_amount) > 0
+                  ? formatAmount(t.unallocated_amount) : "—") + "</td>" +
+              "<td class='sbr-ref'>" + (t.reference_number || "—") + "</td>" +
+              '<td class="sbr-match-cell">' + matchCell + "</td>" +
+              '<td class="sbr-ref" style="max-width:160px">' + matchedEntryHtml + "</td>" +
+              "<td>" + (isReconciled
+                ? '<span style="font-size:11px;color:#16a34a;font-weight:500">&#10003; Reconciled</span>' +
+                  ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
+                  '" title="Remove this reconciliation">&#8617; Unreconcile</button>'
+                : '<button class="sbr-btn sbr-row-action-btn sbr-btn-action-blue"' +
+                  ' data-txn="' + t.name + '">Actions</button>'
+              ) + "</td>" +
+              "</tr>";
+    });
+    html += "</tbody></table>";
+
+    $container.find(".sbr-table-wrap").html(html);
+    $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
+
+    // Select-all: only affects visible rows
+    $container.find(".sbr-select-all").on("change", function () {
+      var checked = $(this).prop("checked");
+      $container.find(".sbr-row:visible .sbr-row-check").prop("checked", checked);
+    });
+
+    // Row click → switch to AI tab (Actions button handled by sbr_bind_card_actions)
+    $container.find(".sbr-row").on("click", function (e) {
+      if ($(e.target).is("button, a, input")) return;
+      var txnName = $(this).data("txn");
+      $container.find(".sbr-row").removeClass("sbr-row-active");
+      $(this).addClass("sbr-row-active");
+      showSuggestionCard($container, txnName);
+    });
+  }
+
+  function updateMatchBadges($container, transactions) {
+    if (!transactions) return;
+    transactions.forEach(function (t) {
+      var $row = $container.find('.sbr-row[data-txn="' + t.name + '"]');
+      if (!$row.length) return;
+      var queue = t.recon_queue || "";
+      var pct   = parseFloat(t.recon_confidence) || 0;
+      $row.attr("data-queue", queue);
+      if (queue === "Reconciled") $row.addClass("sbr-row-done");
+      $row.find(".sbr-match-cell").html(confidenceBadge(pct, queue));
+      if (queue === "Reconciled") {
+        $row.find(".sbr-row-action-btn").replaceWith(
+          '<span style="font-size:11px;color:#16a34a;font-weight:500">&#10003; Reconciled</span>' +
+          ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
+          '" title="Remove this reconciliation">&#8617; Unreconcile</button>'
+        );
+      }
+    });
+  }
+
+  /* ── Reconcile Modal ── */
+
+  function renderReconcileModal($container, txnName, onConfirm) {
+    var transactions = $container.data("transactions") || [];
+    var suggestions  = $container.data("suggestions")  || [];
+
+    var txn = null;
+    for (var i = 0; i < transactions.length; i++) {
+      if (transactions[i].name === txnName) { txn = transactions[i]; break; }
+    }
+    // If not in the transactions cache, reconstruct from suggestion data so the
+    // modal still opens when the Bank Transactions tab hasn't been loaded.
+    if (!txn) {
+      var sug0 = null;
+      for (var k = 0; k < suggestions.length; k++) {
+        if (suggestions[k].bank_txn === txnName) { sug0 = suggestions[k]; break; }
+      }
+      if (sug0) {
+        txn = {
+          name:             txnName,
+          deposit:          sug0.deposit      || 0,
+          withdrawal:       sug0.withdrawal   || 0,
+          description:      sug0.description  || "",
+          reference_number: sug0.reference_number || "",
+          date:             sug0.date         || "",
+          party:            sug0.party        || "",
+        };
+      } else {
+        return;
+      }
+    }
+
+    var suggestion = null;
+    for (var j = 0; j < suggestions.length; j++) {
+      if (suggestions[j].bank_txn === txnName) { suggestion = suggestions[j]; break; }
+    }
+
+    $(".sbr-modal-overlay").remove();
+
+    var txnAmount = parseFloat(txn.deposit || 0) || parseFloat(txn.withdrawal || 0) || 0;
+    var isDeposit = parseFloat(txn.deposit || 0) > 0;
+    var txnType   = isDeposit ? "Deposit" : "Withdrawal";
+    var amtStr    = txnAmount > 0 ? txnType + " " + formatAmount(txnAmount) : "—";
+    var rname     = txnName.replace(/\W/g, "");
+
+    // Detect 1:Many group match
+    var isMany = !!(suggestion && suggestion.matched &&
+                   suggestion.matched.match_type === "1:Many" &&
+                   suggestion.matched.entries && suggestion.matched.entries.length > 1);
+    var matchedEntries = isMany ? (suggestion.matched.entries || []) : [];
+    var matchedEntryNames = matchedEntries.map(function (e) { return e.name; });
+
+    var preselectedName = (!isMany && suggestion && suggestion.matched)
+        ? (suggestion.matched.name || "") : "";
+    var aiConf = parseFloat((suggestion || {}).confidence || 0);
+
+    // ── AI suggestion card ──
+    var aiCardHtml = "";
+    if (suggestion && suggestion.matched && suggestion.matched.name) {
+      var m = suggestion.matched;
+      var confLevel = aiConf >= 90 ? "HIGH" : aiConf >= 60 ? "MED" : "LOW";
+      var cc = aiConf >= 90 ? "#16a34a" : aiConf >= 60 ? "#d97706" : "#dc2626";
+      var cbg = aiConf >= 90 ? "#dcfce7" : aiConf >= 60 ? "#fef3c7" : "#fee2e2";
+
+      var sigs = {};
+      try { sigs = typeof m.signals === "string" ? JSON.parse(m.signals || "{}") : (m.signals || {}); }
+      catch (e) { sigs = {}; }
+
+      var sigHtml = "";
+      if (Object.keys(sigs).length) {
+        sigHtml = '<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:10px">';
+        Object.keys(sigs).forEach(function (k) {
+          var v  = Math.round(sigs[k]);
+          var sc = v >= 80 ? "#16a34a" : v >= 50 ? "#d97706" : "#dc2626";
+          sigHtml += '<span style="font-size:11px;border:1px solid ' + sc + ';border-radius:99px;' +
+                     'padding:1px 9px;color:' + sc + '">' +
+                     k.charAt(0).toUpperCase() + k.slice(1) + " " + v + "%</span>";
+        });
+        sigHtml += "</div>";
+      }
+
+      var barWidth = Math.min(100, aiConf).toFixed(0);
+      var confHeader =
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">' +
+          '<span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:4px;' +
+          'background:' + cc + ';color:#fff">' + confLevel + '</span>' +
+          '<span style="font-weight:700;font-size:13px;color:#0f172a;flex:1">' +
+            m.name + ' – ' + (m.entry_type || m.voucher_type || "Entry") + '</span>' +
+          '<span style="font-size:12px;color:' + cc + ';font-weight:700">' +
+            'Confidence: ' + aiConf.toFixed(1) + '%</span>' +
+        '</div>' +
+        '<div style="width:100%;height:4px;background:#e2e8f0;border-radius:99px;margin-bottom:12px">' +
+          '<div style="width:' + barWidth + '%;height:100%;background:' + cc + ';border-radius:99px"></div>' +
+        '</div>';
+
+      var cardBody;
+      if (isMany) {
+        var totalMatched = matchedEntries.reduce(function (s, e) { return s + parseFloat(e.amount || 0); }, 0);
+        var entryRows = matchedEntries.map(function (e) {
+          return '<tr style="background:#f5f3ff">' +
+            '<td style="font-family:ui-monospace,monospace;font-size:11px;color:#6d28d9;font-weight:600">' +
+              '<a class="sbr-link" href="/app/payment-entry/' + encodeURIComponent(e.name) +
+              '" target="_blank" onclick="event.stopPropagation()">' + e.name + '</a></td>' +
+            '<td style="font-size:12px;white-space:nowrap">' + (e.posting_date || e.cheque_date || "—") + '</td>' +
+            '<td style="font-weight:700;font-variant-numeric:tabular-nums;font-size:12px;color:#6d28d9">' +
+              formatAmount(e.amount || 0) + '</td>' +
+            '<td style="font-size:12px;color:#64748b">' + (e.party || "—") + '</td>' +
+            '</tr>';
+        }).join("");
+        cardBody =
+          '<div style="font-size:11px;font-weight:700;color:#6d28d9;text-transform:uppercase;' +
+            'letter-spacing:.06em;margin-bottom:8px">' +
+            'AI-Proposed Group — ' + matchedEntries.length + ' Payment Entries</div>' +
+          '<div style="overflow-x:auto;border:1px solid #ddd6fe;border-radius:6px">' +
+            '<table class="sbr-table" style="margin:0"><thead><tr>' +
+              '<th>Voucher</th><th>Date</th><th>Amount</th><th>Party</th>' +
+            '</tr></thead><tbody>' + entryRows +
+            '<tr style="background:#ede9fe;border-top:2px solid #c4b5fd">' +
+              '<td colspan="2" style="font-weight:700;font-size:12px;color:#6d28d9">TOTAL</td>' +
+              '<td style="font-weight:800;font-size:13px;color:#6d28d9;font-variant-numeric:tabular-nums">' +
+                formatAmount(totalMatched) + '</td>' +
+              '<td style="font-size:11px;color:#16a34a;font-weight:700">✓ Matches Bank Amount</td>' +
+            '</tr>' +
+            '</tbody></table>' +
+          '</div>';
+      } else {
+        var mAmount = formatAmount(m.amount || m.paid_amount || m.received_amount || 0);
+        var mDate   = m.posting_date || "";
+        var mRef    = m.reference_no || m.cheque_no || "—";
+        var mType   = m.entry_type || m.voucher_type || "Entry";
+        var mParty  = m.party || "—";
+        cardBody =
+          '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px 20px;font-size:12px">' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Matched To</div><strong>' + m.name + '</strong></div>' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Type</div>' + mType + '</div>' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Party</div>' + mParty + '</div>' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Amount</div><strong>' + mAmount + '</strong></div>' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Date</div>' + (mDate || "—") + '</div>' +
+            '<div><div style="color:#94a3b8;margin-bottom:2px">Reference</div>' + mRef + '</div>' +
+          '</div>';
+      }
+
+      aiCardHtml =
+        '<div style="border:1px solid ' + cc + ';border-radius:8px;padding:14px 16px;' +
+        'margin-bottom:14px;background:' + cbg + '20;overflow:hidden">' +
+          confHeader + cardBody + sigHtml +
+        '</div>';
+    }
+
+    var modalHtml =
+      '<div class="sbr-modal-overlay" role="dialog" aria-modal="true">' +
+        '<div class="sbr-modal" style="max-width:740px;width:96%;max-height:90vh;display:flex;flex-direction:column">' +
+          // Header
+          '<div class="sbr-modal-header">' +
+            '<div>' +
+              '<div class="sbr-modal-title">Reconcile the Bank Transaction</div>' +
+              '<div class="sbr-modal-subtitle">' + txnName +
+                ' &middot; ' + (txn.date || "") + ' &middot; ' + amtStr + '</div>' +
+            '</div>' +
+            '<button class="sbr-modal-close" type="button" aria-label="Close">&times;</button>' +
+          '</div>' +
+          // Body
+          '<div class="sbr-modal-body" style="overflow-y:auto;flex:1;padding:16px 20px 8px">' +
+            // Action dropdown
+            '<div style="margin-bottom:14px">' +
+              '<div style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:.04em;' +
+              'text-transform:uppercase;margin-bottom:5px">Action</div>' +
+              '<select class="sbr-recon-action-sel" style="width:260px;padding:7px 10px;' +
+              'border:1px solid #cbd5e1;border-radius:6px;font-size:13px;color:#0f172a;' +
+              'background:#fff;cursor:pointer">' +
+                '<option value="match">Match Against Voucher</option>' +
+                '<option value="createVoucher">Create Voucher</option>' +
+                '<option value="updateTransaction">Update Bank Transaction</option>' +
+                '<option value="reconcile">Mark as Reconciled</option>' +
+              '</select>' +
+            '</div>' +
+            // AI card — always visible above all panes
+            aiCardHtml +
+            // Match pane
+            '<div class="sbr-recon-pane" data-pane="match">' +
+              // Filters
+              '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;' +
+              'margin-bottom:10px;font-size:12px">' +
+                '<span style="font-weight:600;color:#0f172a">Filters</span>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-type-filter" value="Payment Entry" checked> Payment Entry</label>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-type-filter" value="Sales Invoice" checked> Sales Invoice</label>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-type-filter" value="Purchase Invoice" checked> Purchase Invoice</label>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-type-filter" value="Journal Entry" checked> Journal Entry</label>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-type-filter" value="Loan" checked> Loan</label>' +
+                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+                  '<input type="checkbox" class="sbr-exact-filter"> Show Exact Amount Only</label>' +
+              '</div>' +
+              '<div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:6px">' +
+                'Select Voucher to Match</div>' +
+              '<div class="sbr-modal-voucher-list">' +
+                '<div class="sbr-loading"><div class="sbr-spinner"></div>' +
+                '<span>Searching vouchers…</span></div>' +
+              '</div>' +
+            '</div>' +
+            // Create Voucher pane — just a brief note; real form opens in a Frappe dialog
+            '<div class="sbr-recon-pane" data-pane="createVoucher" style="display:none;padding:20px 0">' +
+              '<p class="sbr-modal-info">Click <strong>Submit</strong> to open the voucher creation form ' +
+              'where you can choose Payment Entry or Journal Entry and fill in the details.</p>' +
+            '</div>' +
+            // Mark as Reconciled pane
+            '<div class="sbr-recon-pane" data-pane="reconcile" style="display:none;padding:20px 0">' +
+              '<p class="sbr-modal-info">This will mark the bank transaction as Reconciled ' +
+              'without linking any ERP voucher.</p>' +
+            '</div>' +
+            // Update Bank Transaction pane
+            '<div class="sbr-recon-pane" data-pane="updateTransaction" style="display:none;padding:20px 0">' +
+              '<p class="sbr-modal-info">Click <strong>Submit</strong> to open the Update Bank Transaction ' +
+              'form where you can edit the Reference Number, Party Type, and Party.</p>' +
+            '</div>' +
+          '</div>' +
+          // Footer
+          '<div class="sbr-modal-footer">' +
+            '<span style="font-size:12px;color:#64748b;flex:1">' +
+              'Review the AI suggestion, then click Submit.</span>' +
+            '<button class="sbr-modal-cancel sbr-btn" type="button">Cancel</button>' +
+            '<button class="sbr-modal-confirm sbr-btn sbr-btn-accept" type="button">Submit</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+
+    var $modal = $(modalHtml);
+    $("body").append($modal);
+
+    // Escape key
+    $(document).on("keydown.sbrmodal", function (e) {
+      if (e.key === "Escape") { $modal.remove(); $(document).off("keydown.sbrmodal"); }
+    });
+
+    // Close / cancel
+    $modal.on("click", ".sbr-modal-close, .sbr-modal-cancel", function () {
+      $modal.remove(); $(document).off("keydown.sbrmodal");
+    });
+    $modal.on("click", function (e) {
+      if ($(e.target).hasClass("sbr-modal-overlay")) {
+        $modal.remove(); $(document).off("keydown.sbrmodal");
+      }
+    });
+
+    // Action dropdown — switch pane
+    $modal.on("change", ".sbr-recon-action-sel", function () {
+      var val = $(this).val();
+      $modal.find(".sbr-recon-pane").hide();
+      $modal.find('.sbr-recon-pane[data-pane="' + val + '"]').show();
+      // Create Voucher / Update Bank Transaction: skip Submit, open the form dialog immediately
+      if (val === "createVoucher" || val === "updateTransaction") {
+        if (typeof onConfirm === "function") {
+          onConfirm({ pane: val, selectedVoucher: null, note: "" }, $modal);
+        }
+      }
+    });
+
+    // Voucher list state
+    var allVouchers = [];
+
+    function _manyTotal() {
+      var total = 0;
+      $modal.find(".sbr-voucher-check:checked").each(function () {
+        var nm = $(this).val();
+        for (var k = 0; k < allVouchers.length; k++) {
+          if (allVouchers[k].name === nm) { total += parseFloat(allVouchers[k].amount || 0); break; }
+        }
+      });
+      $modal.find(".sbr-many-total-amt").text(formatAmount(total));
+      var ok = Math.abs(total - txnAmount) < 0.01;
+      $modal.find(".sbr-many-total-match")
+        .css("color", ok ? "#16a34a" : "#dc2626")
+        .text(ok ? "= Bank Amount ✓" : "≠ Bank Amount");
+    }
+
+    function buildVoucherRows(list) {
+      if (!list.length) {
+        $modal.find(".sbr-modal-voucher-list").html(
+          '<p class="sbr-empty" style="padding:12px 0">No matching ERP vouchers found.</p>'
+        );
+        return;
+      }
+      var rows = list.map(function (v, idx) {
+        var isSel = isMany
+            ? (matchedEntryNames.indexOf(v.name) !== -1)
+            : (preselectedName && preselectedName === v.name);
+        var aiBadge = "";
+        if (isSel && aiConf > 0) {
+          var bc = isMany ? "#6d28d9" : (aiConf >= 90 ? "#16a34a" : aiConf >= 60 ? "#d97706" : "#dc2626");
+          aiBadge = '<span style="font-size:10px;border:1px solid ' + bc +
+                    ';border-radius:99px;padding:1px 7px;color:' + bc +
+                    ';font-weight:700">' + (isMany ? "AI Match" : "&#9650;" + Math.round(aiConf) + "%") +
+                    '</span>';
+        }
+        var rowBg = isSel ? (isMany ? "background:#f5f3ff" : "background:#eff6ff") : "";
+        var inputCell = isMany
+          ? '<td style="width:30px;text-align:center"><input type="checkbox" class="sbr-voucher-check" ' +
+              'value="' + v.name + '"' + (isSel ? " checked" : "") + '></td>'
+          : '<td style="width:30px;text-align:center"><input type="radio" class="sbr-voucher-radio" ' +
+              'name="sbr-v-' + rname + '" value="' + v.name + '"' + (isSel ? " checked" : "") + '></td>';
+        return '<tr class="sbr-voucher-row' + (isSel ? " sbr-voucher-row-selected" : "") +
+               '" style="cursor:pointer;' + rowBg + '">' +
+               inputCell +
+               '<td style="font-size:11px;color:#94a3b8;font-weight:600;width:28px">' + (idx + 1) + '</td>' +
+               '<td style="font-size:12px;white-space:nowrap">' + v.type + '</td>' +
+               '<td class="sbr-ref"><a class="sbr-link" href="/app/' +
+                 v.type.toLowerCase().replace(/ /g, "-") + "/" + encodeURIComponent(v.name) +
+                 '" target="_blank" onclick="event.stopPropagation()">' + v.name + "</a></td>" +
+               '<td style="white-space:nowrap;font-size:12px">' + (v.date || "") + '</td>' +
+               '<td style="font-weight:700;font-variant-numeric:tabular-nums;font-size:12px">' +
+                 formatAmount(v.amount) + '</td>' +
+               '<td style="font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis;' +
+                 'white-space:nowrap">' + (v.party || "—") + '</td>' +
+               '<td>' + aiBadge + '</td>' +
+               '</tr>';
+      }).join("");
+
+      // Running total footer for 1:Many
+      var initialTotal = 0;
+      if (isMany) {
+        list.forEach(function (v) {
+          if (matchedEntryNames.indexOf(v.name) !== -1) initialTotal += parseFloat(v.amount || 0);
+        });
+      }
+      var totalFooter = isMany
+        ? '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;' +
+            'background:#f8f7ff;border:1px solid #ddd6fe;border-top:none;' +
+            'border-radius:0 0 6px 6px;font-size:12px">' +
+            '<span style="color:#6d28d9;font-weight:600">Selected total:</span>' +
+            '<span class="sbr-many-total-amt" style="font-weight:700;font-variant-numeric:tabular-nums">' +
+              formatAmount(initialTotal) + '</span>' +
+            '<span class="sbr-many-total-match" style="font-weight:600;color:' +
+              (Math.abs(initialTotal - txnAmount) < 0.01 ? "#16a34a" : "#dc2626") + '">' +
+              (Math.abs(initialTotal - txnAmount) < 0.01 ? "= Bank Amount ✓" : "≠ Bank Amount") +
+            '</span>' +
+            '<span style="color:#94a3b8;font-size:11px;margin-left:auto">' +
+              'Check/uncheck to adjust the group</span>' +
+          '</div>'
+        : '';
+
+      $modal.find(".sbr-modal-voucher-list").html(
+        '<div style="overflow-x:auto;border:1px solid ' + (isMany ? '#ddd6fe' : '#e2e8f0') +
+        ';border-radius:' + (isMany ? '6px 6px 0 0' : '6px') +
+        ';max-height:240px;overflow-y:auto">' +
+        '<table class="sbr-table" style="margin:0"><thead><tr>' +
+          '<th style="width:30px"></th>' +
+          '<th style="width:28px;color:#94a3b8">#</th>' +
+          '<th>TYPE</th><th>DOCUMENT NAME</th><th>DATE</th>' +
+          '<th>AMOUNT</th><th>PARTY</th><th>AI</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>' + totalFooter
+      );
+
+      if (isMany) {
+        // Checkbox: clicking the row toggles the checkbox
+        $modal.find(".sbr-voucher-row").on("click", function (e) {
+          if ($(e.target).is("a, input")) return;
+          var $cb = $(this).find(".sbr-voucher-check");
+          $cb.prop("checked", !$cb.prop("checked"));
+          $(this).toggleClass("sbr-voucher-row-selected", $cb.prop("checked"));
+          $(this).css("background", $cb.prop("checked") ? "#f5f3ff" : "");
+          _manyTotal();
+        });
+        $modal.find(".sbr-modal-voucher-list").on("change", ".sbr-voucher-check", function () {
+          var $row = $(this).closest("tr");
+          var checked = $(this).prop("checked");
+          $row.toggleClass("sbr-voucher-row-selected", checked);
+          $row.css("background", checked ? "#f5f3ff" : "");
+          _manyTotal();
+        });
+      } else {
+        // Radio: row click selects
+        $modal.find(".sbr-voucher-row").on("click", function (e) {
+          if ($(e.target).is("a")) return;
+          $modal.find(".sbr-voucher-row").removeClass("sbr-voucher-row-selected").css("background", "");
+          $(this).addClass("sbr-voucher-row-selected").css("background", "#eff6ff");
+          $(this).find(".sbr-voucher-radio").prop("checked", true);
+        });
+      }
+    }
+
+    function applyFilters() {
+      var checkedTypes = [];
+      $modal.find(".sbr-type-filter:checked").each(function () {
+        checkedTypes.push($(this).val());
+      });
+      var exactOnly = $modal.find(".sbr-exact-filter").prop("checked");
+
+      var filtered = allVouchers.filter(function (v) {
+        if (checkedTypes.indexOf(v.type) === -1) return false;
+        if (exactOnly && Math.abs(parseFloat(v.amount || 0) - txnAmount) > 0.01) return false;
+        return true;
+      });
+      // AI-matched entries always first
+      filtered.sort(function (a, b) {
+        var aMatch = isMany ? (matchedEntryNames.indexOf(a.name) !== -1) : (a.name === preselectedName);
+        var bMatch = isMany ? (matchedEntryNames.indexOf(b.name) !== -1) : (b.name === preselectedName);
+        if (aMatch && !bMatch) return -1;
+        if (!aMatch && bMatch) return 1;
+        return 0;
+      });
+      buildVoucherRows(filtered);
+    }
+
+    $modal.on("change", ".sbr-type-filter, .sbr-exact-filter", applyFilters);
+
+    // Confirm
+    $modal.on("click", ".sbr-modal-confirm", function () {
+      var action = $modal.find(".sbr-recon-action-sel").val();
+
+      // 1:Many — collect all checked entries with their individual amounts
+      if (action === "match" && isMany) {
+        var selectedVouchers = [];
+        $modal.find(".sbr-voucher-check:checked").each(function () {
+          var nm = $(this).val();
+          for (var k = 0; k < allVouchers.length; k++) {
+            if (allVouchers[k].name === nm) {
+              selectedVouchers.push({ name: nm, amount: allVouchers[k].amount || 0 });
+              break;
+            }
+          }
+        });
+        if (!selectedVouchers.length) {
+          frappe.msgprint(__("Please select at least one voucher."));
+          return;
+        }
+        if (typeof onConfirm === "function") {
+          onConfirm({ pane: "match", selectedVouchers: selectedVouchers, selectedVoucher: null, note: "" }, $modal);
+        }
+        return;
+      }
+
+      var selectedVoucher = $modal.find(".sbr-voucher-radio:checked").val() || null;
+      if (action === "match" && !selectedVoucher) {
+        frappe.msgprint(__("Please select a voucher to reconcile against."));
+        return;
+      }
+      if (typeof onConfirm === "function") {
+        onConfirm({ pane: action, selectedVoucher: selectedVoucher, note: "" }, $modal);
+      }
+    });
+
+    // Fetch ERP vouchers — pass preselectedName so the API always includes the AI pick
+    frappe.call({
+      method: "smart_bank_reconciliation.reconciliation.api.get_erp_vouchers_for_match",
+      args: { bank_transaction: txnName, preselected_entry: preselectedName || null },
+      callback: function (r) {
+        if (r.exc || !r.message || !r.message.length) {
+          $modal.find(".sbr-modal-voucher-list").html(
+            '<p class="sbr-empty" style="padding:12px 0">' +
+            'No matching ERP vouchers found in the ±30-day window.</p>'
+          );
+          return;
+        }
+        allVouchers = r.message;
+        applyFilters();
+      },
+    });
+
+    return $modal;
+  }
+
+  /* ── Get currently-checked transaction objects ── */
+
+  function getSelectedTxns($container) {
+    var transactions = $container.data("transactions") || [];
+    var selected = [];
+    $container.find(".sbr-row-check:checked").each(function () {
+      var name = $(this).data("txn");
+      for (var i = 0; i < transactions.length; i++) {
+        if (transactions[i].name === name) { selected.push(transactions[i]); break; }
+      }
+    });
+    return selected;
+  }
+
+  /* ── AI Suggestion Panel (AI Match Pairs tab) ── */
+
+  function renderSuggestionsPanel($container, suggestions) {
+    $container.data("suggestions", suggestions || []);
+
+    var $panel = $container.find(".sbr-suggestion-panel");
+    if (!suggestions || !suggestions.length) {
+      $panel.html(
+        '<p class="sbr-empty" style="text-align:center;padding:24px 8px">No suggestions found.</p>'
+      );
+      updateTabBadge($container, "ai", 0);
+      return;
+    }
+
+    var queueCounts = {};
+    suggestions.forEach(function (s) {
+      var q = s.queue || "Unmatched";
+      queueCounts[q] = (queueCounts[q] || 0) + 1;
+    });
+
+    var signalCount = suggestions.filter(function (s) {
+      return s.queue === "Auto" || s.queue === "Review" || s.queue === "High-Val";
+    }).length;
+    var autoCount = queueCounts["Auto"] || 0;
+
+    var html = '<div class="sbr-sp-header">' +
+      '<span style="font-weight:700;font-size:14px;color:#0f172a">AI Match Pairs</span>' +
+      '<div style="display:flex;align-items:center;gap:8px">' +
+        '<button class="sbr-sp-scroll-btn sbr-scroll-bot-btn" title="Scroll to bottom">&#8681;</button>' +
+        '<span class="sbr-sp-badge">' + signalCount + " SIGNALS</span>" +
+      '</div>' +
+      "</div>";
+
+    // Queue filter tabs
+    var QUEUE_ORDER = ["Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging"];
+    var QUEUE_LABEL = {
+      "Auto": "AUTO", "Review": "REVIEW", "Unmatched": "UNMATCHED",
+      "High-Val": "HIGH-VAL", "Duplicate": "DUPES", "Aging": "AGING",
+    };
+    html += '<div class="sbr-sp-queue-tabs">';
+    html += '<span class="sbr-sp-queue-tab sbr-sp-queue-tab-active" data-filter="all"' +
+            ' style="color:#1D4ED8;border-color:#1D4ED8;background:#EFF6FF">' +
+            '<span class="sbr-sp-qtab-num">' + suggestions.length + "</span>" +
+            '<span class="sbr-sp-qtab-lbl">ALL</span></span>';
+    QUEUE_ORDER.forEach(function (q) {
+      var cnt = queueCounts[q] || 0;
+      var c = QUEUE_COLOR[q] || { bg: "#F1F5F9", text: "#64748B", border: "#CBD5E1" };
+      html += '<span class="sbr-sp-queue-tab" data-filter="' + q + '"' +
+              ' style="color:' + c.text + ';border-color:' + c.border + ";background:#fff" +
+              (cnt === 0 ? ";opacity:0.4" : "") + '">' +
+              '<span class="sbr-sp-qtab-num">' + cnt + "</span>" +
+              '<span class="sbr-sp-qtab-lbl">' + (QUEUE_LABEL[q] || q.toUpperCase()) + "</span></span>";
+    });
+    html += "</div>";
+
+    if (autoCount > 0) {
+      html += '<div class="sbr-sp-summary">' + autoCount + " auto-match" +
+              (autoCount > 1 ? "es" : "") + " ready</div>";
+    }
+
+    // Duplicate bulk-action toolbar — shown only when Duplicate queue filter is active
+    html +=
+      '<div class="sbr-dup-bulk-bar" style="display:none;align-items:center;gap:10px;' +
+        'padding:8px 12px;background:#fef2f2;border:1px solid #fecaca;' +
+        'border-radius:6px;margin-bottom:10px">' +
+        '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:600;color:#7f1d1d">' +
+          '<input type="checkbox" class="sbr-dup-select-all"> Select All' +
+        '</label>' +
+        '<span style="flex:1"></span>' +
+        '<button class="sbr-btn sbr-dup-del-selected" disabled ' +
+          'style="background:#dc2626;color:#fff;border-color:#b91c1c;opacity:0.5">' +
+          '&#128465; Delete Selected (<span class="sbr-dup-sel-count">0</span>)' +
+        '</button>' +
+      '</div>';
+
+    suggestions.forEach(function (s) { html += buildCard(s); });
+
+    // Sticky-bottom ↑ FAB — positioned after all cards, no position:fixed needed
+    html += '<div class="sbr-scroll-fab-wrap">' +
+      '<button class="sbr-sp-scroll-btn sbr-scroll-top-btn" title="Back to top">&#8679;</button>' +
+      '</div>';
+
+    $panel.html(html);
+    updateTabBadge($container, "ai", suggestions.length);
+
+    // Queue tab clicks stay in sync with tiles + dropdown
+    $panel.find(".sbr-sp-queue-tab").on("click", function () {
+      var filter = $(this).data("filter");
+      filterByQueue($container, filter === "all" ? null : filter);
+    });
+
+    // ↓ button — scroll to last visible card
+    $panel.find(".sbr-scroll-bot-btn").on("click", function () {
+      var $cards = $panel.find(".sbr-pair-card:visible");
+      var $target = $cards.last().length ? $cards.last() : $($panel[0]);
+      if ($target.length) {
+        var cardBottom = $target.offset().top + $target.outerHeight();
+        window.scrollTo({ top: cardBottom - window.innerHeight + 20, behavior: "smooth" });
+      }
+    });
+
+    // ↑ FAB — scroll back to panel header
+    $panel.find(".sbr-scroll-top-btn").on("click", function () {
+      var target = (_panelOffsetTop && _panelOffsetTop > 80) ? _panelOffsetTop - 80 : 0;
+      window.scrollTo({ top: target, behavior: "smooth" });
+    });
+
+    // Toggle ↓ (in header) and ↑ FAB based on scroll position
+    var _panelOffsetTop = null;
+    function _updateScrollFab() {
+      if (!$panel[0] || !document.body.contains($panel[0])) {
+        $(window).off("scroll.sbr-fab");
+        return;
+      }
+      if (!_panelOffsetTop || _panelOffsetTop < 10) {
+        var off = $panel.offset();
+        _panelOffsetTop = off ? off.top : 0;
+      }
+      var scrollY = window.scrollY || document.documentElement.scrollTop;
+      var scrolledPast = scrollY > _panelOffsetTop + 200;
+      $panel.find(".sbr-scroll-bot-btn").toggle(!scrolledPast);
+      $panel.find(".sbr-scroll-fab-wrap").toggleClass("sbr-fab-visible", scrolledPast);
+    }
+    $(window).off("scroll.sbr-fab").on("scroll.sbr-fab", _updateScrollFab);
+    setTimeout(_updateScrollFab, 120);
+  }
+
+  /* ── ERP Vouchers tab ── */
+
+  var ERP_TYPE_COLOR = {
+    "PE": { bg: "#EFF6FF", text: "#1D4ED8", border: "#1D4ED8" },
+    "JE": { bg: "#EDE9FE", text: "#7C3AED", border: "#7C3AED" },
+    "SI": { bg: "#DCFCE7", text: "#16A34A", border: "#16A34A" },
+    "PI": { bg: "#FFEDD5", text: "#EA580C", border: "#EA580C" },
+  };
+
+  function renderERPVouchersTab($container, vouchers) {
+    var $tab = $container.find('.sbr-tab-content[data-tab="erp"]');
+    var count = (vouchers || []).length;
+    updateTabBadge($container, "erp", count);
+
+    if (!count) {
+      $tab.html('<p class="sbr-empty" style="padding:24px 16px">No ERP vouchers found for this period.</p>');
+      return;
+    }
+
+    function buildRows(list) {
+      if (!list.length) {
+        return '<tr><td colspan="7" class="sbr-empty" style="padding:20px;text-align:center">No vouchers match this filter.</td></tr>';
+      }
+      return list.map(function (v) {
+        var tc = ERP_TYPE_COLOR[v.type_short] || ERP_TYPE_COLOR["JE"];
+        var badge = '<span class="sbr-badge" style="background:' + tc.bg + ";color:" + tc.text +
+                    ";border-color:" + tc.border + '">' + (v.type_short || "?") + "</span>";
+        var doctype = encodeURIComponent(v.type);
+        var link = '<a class="sbr-link" href="/app/' + v.type.toLowerCase().replace(/ /g, "-") +
+                   "/" + encodeURIComponent(v.name) + '" target="_blank">' + v.name + "</a>";
+        var statusHtml = v.status === "Cleared"
+          ? '<span style="color:#16a34a;font-size:11px;font-weight:600">✓ Cleared</span>'
+          : '<span style="color:#dc2626;font-size:11px;font-weight:600">Unreconciled</span>';
+        var amtColor = v.payment_type === "Pay" || v.payment_type === "Payment" ? "#dc2626" : "#16a34a";
+        var party = (v.party || "—").substring(0, 40);
+        return "<tr>" +
+          "<td>" + badge + "</td>" +
+          '<td class="sbr-ref">' + link + "</td>" +
+          "<td style='white-space:nowrap'>" + (v.date || "") + "</td>" +
+          "<td style='max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title='" + (v.party || "") + "'>" + party + "</td>" +
+          '<td style="font-weight:600;font-variant-numeric:tabular-nums;color:' + amtColor + '">' + formatAmount(v.amount) + "</td>" +
+          '<td style="font-family:ui-monospace,monospace;font-size:11px;color:#64748b">' + (v.reference || "—") + "</td>" +
+          "<td>" + statusHtml + "</td>" +
+          "</tr>";
+      }).join("");
+    }
+
+    var toolbarHtml =
+      '<div class="sbr-erp-toolbar">' +
+        '<input class="sbr-erp-search" type="text" placeholder="Search voucher or party…">' +
+        '<select class="sbr-erp-type-filter">' +
+          '<option value="">All Types</option>' +
+          '<option value="Payment Entry">Payment Entry</option>' +
+          '<option value="Journal Entry">Journal Entry</option>' +
+        '</select>' +
+        '<span class="sbr-txn-counter sbr-erp-counter">' + count + " vouchers</span>" +
+      "</div>";
+
+    var tableHtml =
+      '<div class="sbr-table-wrap">' +
+      '<table class="sbr-table"><thead><tr>' +
+        '<th style="width:44px">Type</th><th>Voucher</th><th>Date</th>' +
+        '<th>Party / Remark</th><th>Amount (₦)</th><th>Reference</th><th>Status</th>' +
+      "</tr></thead><tbody>" + buildRows(vouchers) + "</tbody></table></div>";
+
+    $tab.html(toolbarHtml + tableHtml);
+
+    // Client-side search + type filter (no API round-trip)
+    function applyFilter() {
+      var search = ($tab.find(".sbr-erp-search").val() || "").toLowerCase();
+      var typeVal = $tab.find(".sbr-erp-type-filter").val();
+      var filtered = vouchers.filter(function (v) {
+        var ok = (!typeVal || v.type === typeVal);
+        if (ok && search) {
+          ok = v.name.toLowerCase().indexOf(search) !== -1 ||
+               (v.party || "").toLowerCase().indexOf(search) !== -1 ||
+               (v.reference || "").toLowerCase().indexOf(search) !== -1;
+        }
+        return ok;
+      });
+      $tab.find(".sbr-table tbody").html(buildRows(filtered));
+      $tab.find(".sbr-erp-counter").text(
+        (filtered.length < count ? filtered.length + " of " : "") + count + " vouchers"
+      );
+    }
+
+    $tab.off("input", ".sbr-erp-search").on("input", ".sbr-erp-search", applyFilter);
+    $tab.off("change", ".sbr-erp-type-filter").on("change", ".sbr-erp-type-filter", applyFilter);
+  }
+
+  /* ── Card builder — P2.4 side-by-side pair layout ── */
+
+  function buildCard(s) {
+    var matchedEntry = s.matched || {};
+    var signals = matchedEntry.signals || null;
+    var pct = parseFloat(s.confidence) || 0;
+    var confColor = pct >= 90 ? "#16a34a" : pct >= 50 ? "#d97706" : "#dc2626";
+    var queue = s.queue || "";
+    var hasMatch = !!(matchedEntry.name);
+
+    var qc = QUEUE_COLOR[queue] || { bg: "#F1F5F9", text: "#64748B", border: "#CBD5E1" };
+
+    var bankAmtStr = (s.deposit && parseFloat(s.deposit) > 0)
+      ? '<span style="color:#16a34a;font-weight:700">' + formatAmount(s.deposit) + " CR</span>"
+      : (s.withdrawal && parseFloat(s.withdrawal) > 0
+          ? '<span style="color:#dc2626;font-weight:700">' + formatAmount(s.withdrawal) + " DR</span>"
+          : '<span style="color:#94a3b8">—</span>');
+
+    var html = '<div class="sbr-card sbr-pair-card" data-txn="' + (s.bank_txn || "") +
+               '" data-queue="' + queue + '">';
+
+    // ── Header: queue badge + match type + confidence bar ──
+    var mtypePill = (hasMatch && matchedEntry.match_type)
+      ? '<span class="sbr-pair-mtype">' + matchedEntry.match_type + "</span>"
+      : "";
+    var confHtml = "";
+    if (pct > 0) {
+      var barW = Math.min(100, pct).toFixed(0);
+      confHtml =
+        '<div class="sbr-pair-conf-wrap">' +
+          '<div class="sbr-pair-conf-track">' +
+            '<div class="sbr-pair-conf-fill" style="width:' + barW + "%;background:" + confColor + '"></div>' +
+          "</div>" +
+          '<span class="sbr-pair-conf-pct" style="color:' + confColor + '">' + pct.toFixed(1) + "%</span>" +
+        "</div>";
+    }
+
+    // Aging days badge — how long this transaction has been unreconciled
+    var agingDaysBadge = "";
+    if (queue === "Aging" && s.date) {
+      var txnMs  = new Date(s.date).getTime();
+      var nowMs  = Date.now();
+      var daysOld = Math.floor((nowMs - txnMs) / 86400000);
+      if (daysOld > 0) {
+        var agBg    = daysOld > 30 ? "#fee2e2" : "#ffedd5";
+        var agColor = daysOld > 30 ? "#dc2626" : "#ea580c";
+        agingDaysBadge =
+          '<span style="background:' + agBg + ';color:' + agColor + ';border:1px solid ' + agColor + ';' +
+            'padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700;white-space:nowrap">' +
+            daysOld + 'd unreconciled' +
+          '</span>';
+      }
+    }
+
+    var dupChk = queue === "Duplicate"
+      ? '<input type="checkbox" class="sbr-dup-chk" data-txn="' + (s.bank_txn || "") +
+        '" style="width:15px;height:15px;cursor:pointer;flex-shrink:0" title="Select for bulk delete">'
+      : "";
+    html +=
+      '<div class="sbr-pair-header">' +
+        (dupChk ? '<div style="display:flex;align-items:center;gap:8px;flex:1">' + dupChk + '<div class="sbr-pair-meta">' : '<div class="sbr-pair-meta">') +
+          '<span class="sbr-badge" style="background:' + qc.bg + ";color:" + qc.text + ";border-color:" + qc.border + '">' +
+            (queue || "—") +
+          "</span>" +
+          mtypePill +
+          agingDaysBadge +
+        (dupChk ? "</div></div>" : "</div>") +
+        confHtml +
+      "</div>";
+
+    // ── Pair body ──
+    if (hasMatch) {
+      var mType  = matchedEntry.entry_type || matchedEntry.voucher_type || "Entry";
+      var mDate  = matchedEntry.posting_date || "";
+      var mRef   = matchedEntry.reference_no || matchedEntry.cheque_no || "";
+      var mParty = matchedEntry.party || "";
+      var mAmt   = formatAmount(matchedEntry.amount || 0);
+      var isMany = matchedEntry.match_type === "1:Many" &&
+                   matchedEntry.entries && matchedEntry.entries.length > 1;
+
+      var erpIdHtml = isMany
+        ? '<div class="sbr-pair-id" style="color:#7c3aed">Group of ' + matchedEntry.entries.length + " vouchers</div>"
+        : '<div class="sbr-pair-id"><a class="sbr-link" href="/app/' +
+            mType.toLowerCase().replace(/ /g, "-") + "/" + encodeURIComponent(matchedEntry.name) +
+            '" target="_blank" onclick="event.stopPropagation()">' + matchedEntry.name + "</a></div>";
+
+      html +=
+        '<div class="sbr-pair-cols">' +
+          // Bank side
+          '<div class="sbr-pair-side">' +
+            '<div class="sbr-pair-side-label">Bank Statement</div>' +
+            '<div class="sbr-pair-id">' + (s.bank_txn || "—") + "</div>" +
+            '<div class="sbr-pair-amt">' + bankAmtStr + "</div>" +
+            (s.date ? '<div class="sbr-pair-field">' + s.date + "</div>" : "") +
+            (s.reference_number
+              ? '<div class="sbr-pair-field sbr-pair-mono">' + s.reference_number + "</div>"
+              : "") +
+            ((s.party || s.description)
+              ? '<div class="sbr-pair-field">' + (s.party || (s.description || "").substring(0, 35)) + "</div>"
+              : "") +
+          "</div>" +
+          // Connector
+          '<div class="sbr-pair-conn">&#8596;</div>' +
+          // ERP side
+          '<div class="sbr-pair-side">' +
+            '<div class="sbr-pair-side-label">ERP ' + mType + "</div>" +
+            erpIdHtml +
+            '<div class="sbr-pair-amt">' + mAmt + "</div>" +
+            (mDate ? '<div class="sbr-pair-field">' + mDate + "</div>" : "") +
+            (mRef  ? '<div class="sbr-pair-field sbr-pair-mono">' + mRef + "</div>" : "") +
+            (mParty ? '<div class="sbr-pair-field">' + mParty + "</div>" : "") +
+          "</div>" +
+        "</div>";  // .sbr-pair-cols
+
+    } else {
+      // No ERP match — compact single-column
+      html +=
+        '<div class="sbr-pair-no-match">' +
+          '<div class="sbr-pair-side-label">Bank Statement</div>' +
+          '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+            '<div class="sbr-pair-id">' + (s.bank_txn || "—") + "</div>" +
+            '<div class="sbr-pair-amt">' + bankAmtStr + "</div>" +
+            (s.date ? '<span class="sbr-pair-field">' + s.date + "</span>" : "") +
+          "</div>" +
+          (s.reference_number
+            ? '<div class="sbr-pair-field sbr-pair-mono" style="margin-top:3px">' + s.reference_number + "</div>"
+            : "") +
+          ((s.party || s.description)
+            ? '<div class="sbr-pair-field" style="margin-top:2px">' +
+                (s.party || (s.description || "").substring(0, 60)) + "</div>"
+            : "") +
+        "</div>";
+    }
+
+    // ── Signal chips ──
+    if (signals && Object.keys(signals).length) {
+      html += '<div class="sbr-signal-row">';
+      Object.keys(signals).forEach(function (k) {
+        var v  = Math.round(signals[k]);
+        var sc = v >= 80 ? "#16a34a" : v >= 50 ? "#d97706" : "#dc2626";
+        html += '<span class="sbr-signal-chip" style="color:' + sc + ";border-color:" + sc + '">' +
+                (SIGNAL_LABEL[k] || k) + " " + v + "%</span>";
+      });
+      html += "</div>";
+    }
+
+    // ── Reasoning callout ──
+    if (matchedEntry.reasoning) {
+      html += '<div class="sbr-pair-reasoning">' + matchedEntry.reasoning + "</div>";
+    }
+
+    // ── WHT box ──
+    if (matchedEntry.wht_amount) {
+      html += '<div class="sbr-wht-box">WHT: ' + formatAmount(matchedEntry.wht_amount) +
+              " — post to WHT Receivable via JE</div>";
+    }
+
+    // ── Actions ──
+    html += '<div class="sbr-card-actions">';
+
+    if (queue === "Auto" || queue === "Review") {
+      var entryList = matchedEntry.entries
+        ? matchedEntry.entries.map(function (e) { return { name: e.name, amount: e.amount || 0 }; })
+        : (matchedEntry.name ? [{ name: matchedEntry.name, amount: matchedEntry.amount || 0 }] : []);
+      html +=
+        '<button class="sbr-btn sbr-btn-accept" data-txn="' + s.bank_txn +
+        '" data-entries=\'' + JSON.stringify(entryList) +
+        "' data-type=\"" + (matchedEntry.match_type || "") + '">&#10003; Approve Match</button>' +
+        '<button class="sbr-btn sbr-pair-view-btn sbr-pair-detail-btn" data-txn="' + s.bank_txn + '">View Details &#8250;</button>' +
+        '<button class="sbr-btn sbr-btn-update" data-txn="' + s.bank_txn + '">&#9998; Update</button>';
+    }
+    if (queue === "High-Val") {
+      html +=
+        '<button class="sbr-btn sbr-btn-hv" data-txn="' + s.bank_txn + '">Approve (Sign)</button>' +
+        '<button class="sbr-btn sbr-pair-view-btn sbr-pair-detail-btn" data-txn="' + s.bank_txn + '">View Details &#8250;</button>' +
+        '<button class="sbr-btn sbr-btn-update" data-txn="' + s.bank_txn + '">&#9998; Update</button>';
+    }
+    if (queue === "Duplicate") {
+      if (s.reasoning) {
+        html += '<div style="font-size:12px;color:#7f1d1d;background:#fef2f2;' +
+                'border:1px solid #fecaca;border-radius:5px;padding:7px 10px;' +
+                'margin-bottom:8px;line-height:1.5">&#9888; ' + s.reasoning + '</div>';
+      }
+      html +=
+        '<button class="sbr-btn sbr-btn-del-dup" data-txn="' + s.bank_txn + '" ' +
+          'style="background:#dc2626;color:#fff;border-color:#b91c1c">&#128465; Delete Duplicate</button>' +
+        '<button class="sbr-btn sbr-btn-dup" data-txn="' + s.bank_txn + '">Keep &amp; Investigate</button>' +
+        '<button class="sbr-btn sbr-btn-update" data-txn="' + s.bank_txn + '">&#9998; Update</button>';
+    }
+    if (queue === "Unmatched" || queue === "Aging") {
+      if (s.draft_payload) {
+        try {
+          var draft = typeof s.draft_payload === "string"
+            ? JSON.parse(s.draft_payload) : s.draft_payload;
+          var etype = draft.entry_type || "JE";
+          html += '<button class="sbr-btn sbr-btn-draft" data-txn="' + s.bank_txn +
+                  '" data-etype="' + etype + "' data-draft='" + JSON.stringify(draft) +
+                  "'>+ Create " + etype + "</button>";
+        } catch (e) { /* ignore */ }
+      }
+      html +=
+        '<button class="sbr-btn sbr-pair-view-btn sbr-pair-detail-btn" data-txn="' + s.bank_txn + '">View Details &#8250;</button>' +
+        '<button class="sbr-btn sbr-btn-update" data-txn="' + s.bank_txn + '">&#9998; Update</button>';
+    }
+
+    html += "</div>";  // .sbr-card-actions
+
+    return html + "</div>";  // .sbr-card
+  }
+
+  /* ── Show card in AI tab ── */
+
+  function showSuggestionCard($container, txnName) {
+    var $card = $container.find('.sbr-card[data-txn="' + txnName + '"]');
+    if (!$card.length) return;
+
+    switchTab($container, "ai");
+    $container.find(".sbr-card").removeClass("sbr-card-active");
+    $card.addClass("sbr-card-active");
+
+    setTimeout(function () {
+      $card[0].scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 60);
+  }
+
+  /* ── P2.5: Report Modal ── */
+
+  function renderReportModal(frm) {
+    var bank_account = frm.doc.bank_account;
+    var from_date    = frm.doc.bank_statement_from_date;
+    var to_date      = frm.doc.bank_statement_to_date;
+    var company      = frm.doc.company || "";
+
+    if (!bank_account || !from_date || !to_date) {
+      frappe.msgprint(__("Please set Bank Account and date range first."));
+      return;
+    }
+
+    // Format "Feb 2025" from date string
+    function _monthLabel(dateStr) {
+      var MO = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+      var d  = new Date(dateStr);
+      return isNaN(d) ? dateStr : MO[d.getMonth()] + " " + d.getFullYear();
+    }
+
+    var $modal = $(
+      '<div class="sbr-modal-overlay" role="dialog" aria-modal="true">' +
+        '<div class="sbr-modal" style="max-width:960px;width:96%;max-height:92vh;display:flex;flex-direction:column">' +
+          '<div class="sbr-modal-header">' +
+            '<div>' +
+              '<div class="sbr-modal-title">&#128202; Reconciliation Report</div>' +
+              '<div class="sbr-modal-subtitle sbr-report-subtitle">' +
+                (company ? company.toUpperCase() + " &middot; " : "") +
+                bank_account + ' &middot; ' + _monthLabel(from_date) +
+              '</div>' +
+            '</div>' +
+            '<button class="sbr-modal-close" type="button" aria-label="Close">&times;</button>' +
+          '</div>' +
+          '<div class="sbr-modal-body" style="overflow-y:auto;flex:1;padding:16px 20px 8px">' +
+            '<div style="text-align:center;padding:40px 0;color:#64748b">Loading report&hellip;</div>' +
+          '</div>' +
+          '<div class="sbr-modal-footer">' +
+            '<button class="sbr-report-export sbr-btn" type="button" ' +
+              'style="background:#0f172a;color:#fff;border-color:#0f172a" disabled>' +
+              '&#8595; Export Excel</button>' +
+            '<span style="flex:1"></span>' +
+            '<span class="sbr-report-ts" style="font-size:11px;color:#94a3b8"></span>' +
+            '<button class="sbr-modal-cancel sbr-btn" type="button">Close</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>'
+    );
+    $("body").append($modal);
+
+    function closeReport() {
+      $modal.remove();
+      $(document).off("keydown.sbrreport");
+    }
+    $modal.on("click", ".sbr-modal-close, .sbr-modal-cancel", closeReport);
+    $modal.on("click", function (e) {
+      if ($(e.target).hasClass("sbr-modal-overlay")) closeReport();
+    });
+    $(document).on("keydown.sbrreport", function (e) {
+      if (e.key === "Escape") closeReport();
+    });
+
+    // ── Tab switching ──
+    $modal.on("click", ".sbr-report-tab", function () {
+      var id = $(this).data("tab");
+      $modal.find(".sbr-report-tab").each(function () {
+        var active = $(this).data("tab") === id;
+        $(this).css({
+          "font-weight":   active ? "700" : "500",
+          "color":         active ? "#1d4ed8" : "#64748b",
+          "border-bottom": active ? "2px solid #1d4ed8" : "2px solid transparent",
+        });
+      });
+      $modal.find(".sbr-report-panel").hide();
+      $modal.find('.sbr-report-panel[data-panel="' + id + '"]').show();
+    });
+
+    // ── Helper: build a scrollable table ──
+    function _table(cols, rows, emptyMsg) {
+      if (!rows || rows.length === 0) {
+        return '<div style="text-align:center;color:#94a3b8;padding:24px 0;font-size:13px">' +
+          (emptyMsg || "No items") + "</div>";
+      }
+      var h = '<div style="overflow-x:auto;border:1px solid #e2e8f0;border-radius:6px;max-height:300px;overflow-y:auto">' +
+        '<table class="sbr-table" style="margin:0"><thead><tr>';
+      cols.forEach(function (c) {
+        h += '<th' + (c.right ? ' style="text-align:right"' : "") + ">" + c.label + "</th>";
+      });
+      h += "</tr></thead><tbody>";
+      rows.forEach(function (cells) {
+        h += "<tr>";
+        cells.forEach(function (cell, i) {
+          h += '<td' + (cols[i] && cols[i].right ? ' style="text-align:right"' : "") + ">" + (cell === null || cell === undefined ? "—" : cell) + "</td>";
+        });
+        h += "</tr>";
+      });
+      h += "</tbody></table></div>";
+      return h;
+    }
+
+    // ── Helper: confidence badge ──
+    // hasMatch = true means transaction is reconciled but was matched manually (no AI score)
+    function _confBadge(pct, hasMatch) {
+      if (!pct) {
+        if (hasMatch) {
+          return '<span style="background:#f1f5f9;color:#475569;padding:1px 7px;' +
+            'border-radius:99px;font-size:11px;font-weight:700">Manual</span>';
+        }
+        return "—";
+      }
+      var bg = pct >= 70 ? "#dcfce7" : pct >= 50 ? "#fef3c7" : "#fee2e2";
+      var cl = pct >= 70 ? "#16a34a" : pct >= 50 ? "#d97706" : "#dc2626";
+      return '<span style="background:' + bg + ";color:" + cl +
+        ';padding:1px 7px;border-radius:99px;font-size:11px;font-weight:700">' +
+        Math.round(pct) + "%</span>";
+    }
+
+    // ── Helper: monospaced blue link-style name ──
+    function _entry(name) {
+      if (!name) return "—";
+      return '<span style="font-family:ui-monospace,monospace;font-size:11px;color:#1d4ed8">' + name + "</span>";
+    }
+
+    // ── Helper: truncated description ──
+    function _desc(txt) {
+      var s = (txt || "").trim();
+      if (!s) return "—";
+      return '<span title="' + s.replace(/"/g, "&quot;") + '" style="font-size:12px">' +
+        (s.length > 45 ? s.slice(0, 42) + "…" : s) + "</span>";
+    }
+
+    frappe.call({
+      method: "smart_bank_reconciliation.reconciliation.api.get_reconciliation_report",
+      args: { bank_account: bank_account, from_date: from_date, to_date: to_date, company: company },
+      callback: function (r) {
+        if (r.exc || !r.message) {
+          $modal.find(".sbr-modal-body").html(
+            '<p style="color:#dc2626;padding:20px">Failed to load report.</p>'
+          );
+          return;
+        }
+        var d = r.message;
+        var s = d.summary;
+        var erp_um = d.erp_unmatched || [];
+
+        // Update subtitle with resolved company + bank label
+        if (d.period.company || d.period.bank_label) {
+          var sub = "";
+          if (d.period.company) sub += d.period.company.toUpperCase() + " &middot; ";
+          sub += (d.period.bank_label || bank_account) + " &middot; " + _monthLabel(from_date);
+          $modal.find(".sbr-report-subtitle").html(sub);
+        }
+
+        // ── 6 stat cards (added MANUALLY MATCHED) ──
+        // Pre-compute bank unmatched count (Unmatched + Aging + Duplicate) to match the tab
+        var bankUmCount = d.transactions.filter(function (t) {
+          return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate";
+        }).length;
+        var autoColor = s.automation_rate >= 70 ? "#16a34a" : s.automation_rate >= 40 ? "#d97706" : "#dc2626";
+        var cards = [
+          { label: "AUTO-MATCHED",      val: s.auto,                  color: "#16a34a", border: "#bbf7d0" },
+          { label: "MANUALLY MATCHED",  val: s.manual_reconciled || 0, color: "#0369a1", border: "#bae6fd" },
+          { label: "NEED REVIEW",       val: s.review,                color: "#d97706", border: "#fde68a" },
+          { label: "BANK UNMATCHED",    val: bankUmCount,             color: "#dc2626", border: "#fecaca" },
+          { label: "ERP UNMATCHED",     val: erp_um.length,           color: "#dc2626", border: "#fed7aa" },
+          { label: "AUTOMATION RATE",   val: s.automation_rate + "%", color: "#1d4ed8", border: "#bfdbfe" },
+        ];
+        var cardsHtml = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px">';
+        cards.forEach(function (c) {
+          cardsHtml +=
+            '<div style="border:1.5px solid ' + c.border + ';border-radius:8px;' +
+              'padding:14px 8px 12px;text-align:center">' +
+              '<div style="font-size:28px;font-weight:800;color:' + c.color +
+                ';font-variant-numeric:tabular-nums;line-height:1">' + c.val + '</div>' +
+              '<div style="font-size:9px;font-weight:700;color:#94a3b8;' +
+                'letter-spacing:.08em;margin-top:6px;text-transform:uppercase">' + c.label + '</div>' +
+            '</div>';
+        });
+        cardsHtml += '</div>';
+
+        // ── Automation + manual rate bar ──
+        var manualColor = (s.manual_rate || 0) > 0 ? "#0369a1" : "#94a3b8";
+        var rateHtml =
+          '<div style="padding-bottom:14px;margin-bottom:14px;border-bottom:1px solid #f1f5f9">' +
+            '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2px">' +
+              '<span style="font-size:13px;font-weight:700;color:#0f172a">Overall Automation Rate</span>' +
+              '<div style="display:flex;gap:16px">' +
+                '<span style="font-size:13px;font-weight:700;color:' + autoColor + '">' + s.automation_rate + '% auto</span>' +
+                '<span style="font-size:13px;font-weight:700;color:' + manualColor + '">' + (s.manual_rate || 0) + '% manual</span>' +
+              '</div>' +
+            '</div>' +
+            '<div style="font-size:12px;color:#94a3b8">' +
+              (s.auto_reconciled || 0) + ' auto-approved &middot; ' +
+              (s.manual_reconciled || 0) + ' manually approved &middot; ' +
+              (s.reconciled || 0) + ' total reconciled' +
+            '</div>' +
+          '</div>';
+
+        // ── Tabs ──
+        var autoMatchedTxns   = d.transactions.filter(function (t) { return t.queue === "Auto"; });
+        var manualMatchedTxns = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
+        var reviewTxns        = d.transactions.filter(function (t) { return t.queue === "Review" || t.queue === "High-Val"; });
+        var bankUmTxns        = d.transactions.filter(function (t) { return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate"; });
+
+        var tabs = [
+          { id: "matched",        icon: "✅ ", label: "Matched",           count: autoMatchedTxns.length   },
+          { id: "manual-matched", icon: "✓ ",  label: "Manually Matched",  count: manualMatchedTxns.length },
+          { id: "review",         icon: "⚠ ",  label: "Review",            count: reviewTxns.length        },
+          { id: "bank-um",        icon: "",     label: "Bank Unmatched",    count: bankUmTxns.length        },
+          { id: "erp-um",         icon: "",     label: "ERP Unmatched",     count: erp_um.length            },
+        ];
+
+        var tabBarHtml = '<div style="display:flex;border-bottom:2px solid #e2e8f0;margin-bottom:12px;overflow-x:auto">';
+        tabs.forEach(function (tab, i) {
+          var active = i === 0;
+          tabBarHtml +=
+            '<button class="sbr-report-tab" data-tab="' + tab.id + '" style="' +
+              'padding:8px 16px;border:none;background:none;cursor:pointer;white-space:nowrap;' +
+              'font-size:12px;font-weight:' + (active ? "700" : "500") + ";" +
+              'color:' + (active ? "#1d4ed8" : "#64748b") + ";" +
+              'border-bottom:' + (active ? "2px solid #1d4ed8" : "2px solid transparent") + ";" +
+              'margin-bottom:-2px">' +
+              tab.icon + tab.label + " (" + tab.count + ")" +
+            '</button>';
+        });
+        tabBarHtml += '</div>';
+
+        // ── Panel: Matched (Auto) ──
+        var matchedCols = [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "ERP ENTRY" }, { label: "CONFIDENCE", right: true }];
+        function _matchRow(t) {
+          var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
+          return [
+            _entry(t.name),
+            '<span style="white-space:nowrap;font-size:12px">' + t.date + "</span>",
+            _desc(t.description),
+            '<span style="color:' + (t.deposit > 0 ? "#16a34a" : "#dc2626") + ';font-variant-numeric:tabular-nums">' + formatAmount(amt) + "</span>",
+            _entry(t.suggested_match),
+            _confBadge(t.confidence, !!t.suggested_match),
+          ];
+        }
+        var panelMatched =
+          '<div class="sbr-report-panel" data-panel="matched">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions auto-approved by the reconciliation engine</div>' +
+            _table(matchedCols, autoMatchedTxns.map(_matchRow), "No auto-matched transactions yet") +
+          '</div>';
+
+        // ── Panel: Manually Matched ──
+        var panelManualMatched =
+          '<div class="sbr-report-panel" data-panel="manual-matched" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions reconciled manually by a user</div>' +
+            _table(matchedCols, manualMatchedTxns.map(_matchRow), "No manually matched transactions") +
+          '</div>';
+
+        // ── Panel: Review ──
+        var reviewRows = reviewTxns.map(function (t) {
+          var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
+          return [
+            _entry(t.name),
+            '<span style="white-space:nowrap;font-size:12px">' + t.date + "</span>",
+            _desc(t.description),
+            '<span style="font-variant-numeric:tabular-nums">' + formatAmount(amt) + "</span>",
+            _entry(t.suggested_match),
+            _confBadge(t.confidence),
+          ];
+        });
+        var panelReview =
+          '<div class="sbr-report-panel" data-panel="review" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions in the review queue — require human decision</div>' +
+            _table(
+              [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "SUGGESTED MATCH" }, { label: "CONFIDENCE", right: true }],
+              reviewRows,
+              "No transactions in review"
+            ) +
+          '</div>';
+
+        // ── Panel: Bank Unmatched ──
+        var bankUmRows = bankUmTxns.map(function (t) {
+          var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
+          return [
+            _entry(t.name),
+            '<span style="white-space:nowrap;font-size:12px">' + t.date + "</span>",
+            _desc(t.description),
+            '<span style="font-variant-numeric:tabular-nums">' + formatAmount(amt) + "</span>",
+            t.party || "—",
+          ];
+        });
+        var panelBankUm =
+          '<div class="sbr-report-panel" data-panel="bank-um" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Bank transactions with no matching ERP entry — action required</div>' +
+            _table(
+              [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "PARTY" }],
+              bankUmRows,
+              "No unmatched bank transactions"
+            ) +
+          '</div>';
+
+        // ── Panel: ERP Unmatched ──
+        var erpUmRows = erp_um.map(function (e) {
+          return [
+            _entry(e.name),
+            '<span style="font-size:11px;color:#475569">' + e.entry_type + "</span>",
+            '<span style="white-space:nowrap;font-size:12px">' + e.date + "</span>",
+            '<span style="font-variant-numeric:tabular-nums">' + formatAmount(e.amount) + "</span>",
+            e.party || "—",
+          ];
+        });
+        var panelErpUm =
+          '<div class="sbr-report-panel" data-panel="erp-um" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">ERP vouchers with no bank transaction — may be outstanding or errors</div>' +
+            _table(
+              [{ label: "ERP VOUCHER" }, { label: "TYPE" }, { label: "DATE" }, { label: "AMOUNT", right: true }, { label: "PARTY" }],
+              erpUmRows,
+              "No unmatched ERP entries"
+            ) +
+          '</div>';
+
+        var ts = frappe.datetime.now_datetime ? frappe.datetime.now_datetime() : new Date().toLocaleString();
+        $modal.find(".sbr-modal-body").html(
+          cardsHtml + rateHtml + tabBarHtml +
+          panelMatched + panelManualMatched + panelReview + panelBankUm + panelErpUm
+        );
+        $modal.find(".sbr-report-ts").text("Generated " + ts);
+        $modal.find(".sbr-report-export").prop("disabled", false).data("reportData", d);
+      },
+    });
+
+    // ── Export Excel (multi-sheet SpreadsheetML) ──
+    $modal.on("click", ".sbr-report-export", function () {
+      var d = $(this).data("reportData");
+      if (!d) return;
+
+      // Build SpreadsheetML XML for a single sheet
+      function xlsSheet(sheetName, headerRow, dataRows) {
+        function cell(val) {
+          var s = String(val === null || val === undefined ? "" : val);
+          var isNum = s !== "" && !isNaN(Number(s));
+          var esc = s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+          return '<Cell><Data ss:Type="' + (isNum ? "Number" : "String") + '">' + esc + "</Data></Cell>";
+        }
+        function row(cells, bold) {
+          var style = bold ? ' ss:StyleID="hdr"' : "";
+          return "<Row" + style + ">" + cells.map(cell).join("") + "</Row>\n";
+        }
+        var safeName = sheetName.replace(/[:\\\/\?\*\[\]]/g, "").slice(0, 31);
+        var xml = '<Worksheet ss:Name="' + safeName + '"><Table>\n';
+        xml += row(headerRow, true);
+        dataRows.forEach(function (r) { xml += row(r, false); });
+        xml += "</Table></Worksheet>\n";
+        return xml;
+      }
+
+      var autoMatchedX   = d.transactions.filter(function (t) { return t.queue === "Auto"; });
+      var manualMatchedX = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
+      var reviewTxns = d.transactions.filter(function (t) {
+        return t.queue === "Review" || t.queue === "High-Val";
+      });
+      var bankUmTxns = d.transactions.filter(function (t) {
+        return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate";
+      });
+      var erpUm = d.erp_unmatched || [];
+
+      var xlsHeader =
+        '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<?mso-application progid="Excel.Sheet"?>\n' +
+        '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"\n' +
+        ' xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">\n' +
+        '<Styles>' +
+          '<Style ss:ID="hdr"><Font ss:Bold="1"/></Style>' +
+        '</Styles>\n';
+
+      var xlsBody = "";
+      function _xlsMatchRow(t) {
+        var amt = t.deposit > 0 ? t.deposit : -(t.withdrawal || 0);
+        return [t.name, t.date, t.description || "", t.reference_number || "",
+          amt.toFixed(2), t.suggested_match || "",
+          t.confidence > 0 ? t.confidence.toFixed(1) : "Manual"];
+      }
+      var _xlsMatchCols = ["Bank TXN","Date","Description","Reference","Amount","ERP Entry","Confidence %"];
+
+      // Sheet 1 — Auto Matched
+      xlsBody += xlsSheet(
+        "Auto Matched (" + autoMatchedX.length + ")",
+        _xlsMatchCols,
+        autoMatchedX.map(_xlsMatchRow)
+      );
+
+      // Sheet 2 — Manually Matched
+      xlsBody += xlsSheet(
+        "Manually Matched (" + manualMatchedX.length + ")",
+        _xlsMatchCols,
+        manualMatchedX.map(_xlsMatchRow)
+      );
+
+      // Sheet 3 — Review
+      xlsBody += xlsSheet(
+        "Review (" + reviewTxns.length + ")",
+        ["Bank TXN","Date","Description","Reference","Amount","Suggested Match","Confidence %"],
+        reviewTxns.map(function (t) {
+          var amt = t.deposit > 0 ? t.deposit : -(t.withdrawal || 0);
+          return [t.name, t.date, t.description || "", t.reference_number || "",
+            amt.toFixed(2), t.suggested_match || "",
+            t.confidence > 0 ? t.confidence.toFixed(1) : ""];
+        })
+      );
+
+      // Sheet 4 — Bank Unmatched
+      xlsBody += xlsSheet(
+        "Bank Unmatched (" + bankUmTxns.length + ")",
+        ["Bank TXN","Date","Description","Reference","Deposit","Withdrawal","Party","Sub-Queue"],
+        bankUmTxns.map(function (t) {
+          return [t.name, t.date, t.description || "", t.reference_number || "",
+            t.deposit    > 0 ? t.deposit.toFixed(2)    : "",
+            t.withdrawal > 0 ? t.withdrawal.toFixed(2) : "",
+            t.party || "", t.queue];
+        })
+      );
+
+      // Sheet 5 — ERP Unmatched
+      xlsBody += xlsSheet(
+        "ERP Unmatched (" + erpUm.length + ")",
+        ["ERP Voucher","Type","Date","Amount","Party"],
+        erpUm.map(function (e) {
+          return [e.name, e.entry_type || "", e.date || "",
+            parseFloat(e.amount || 0).toFixed(2), e.party || ""];
+        })
+      );
+
+      var xlsFooter = "</Workbook>";
+      var xml  = xlsHeader + xlsBody + xlsFooter;
+      var blob = new Blob([xml], { type: "application/vnd.ms-excel;charset=utf-8" });
+      var url  = URL.createObjectURL(blob);
+      var a    = document.createElement("a");
+      a.href     = url;
+      a.download = "recon_report_" + (d.period.from_date || "").replace(/-/g, "") + ".xls";
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    });
+  }
+
+  /* ── Audit Trail tab ── */
+
+  var ACTION_META = {
+    "Accepted":     { color: "#16a34a", bg: "#dcfce7", label: "✓ Accepted" },
+    "Rejected":     { color: "#dc2626", bg: "#fee2e2", label: "✗ Rejected" },
+    "Escalated":    { color: "#ea580c", bg: "#ffedd5", label: "↑ Escalated" },
+    "Investigated": { color: "#7c3aed", bg: "#ede9fe", label: "⚑ Investigated" },
+    "Consolidated": { color: "#0891b2", bg: "#cffafe", label: "⇅ Consolidated" },
+  };
+
+  function renderAuditTab($container, actions) {
+    var $tab = $container.find('.sbr-tab-content[data-tab="audit"]');
+    var count = (actions || []).length;
+    updateTabBadge($container, "audit", count);
+
+    if (!count) {
+      $tab.html(
+        '<p class="sbr-empty" style="padding:32px 16px;color:#94a3b8">No actions recorded yet. ' +
+        'Actions appear here after you Approve transactions.</p>'
+      );
+      return;
+    }
+
+    var rows = actions.map(function (a, i) {
+      var am = ACTION_META[a.recon_user_action] || { color: "#64748b", bg: "#f1f5f9", label: a.recon_user_action };
+      var actionBadge = '<span class="sbr-audit-action-badge" style="background:' + am.bg + ';color:' + am.color + '">' + am.label + "</span>";
+      var qc = QUEUE_COLOR[a.recon_queue] || { bg: "#f1f5f9", text: "#64748b", border: "#cbd5e1" };
+      var queueBadgeHtml = a.recon_queue
+        ? '<span class="sbr-badge" style="background:' + qc.bg + ";color:" + qc.text + ";border-color:" + qc.border + '">' + a.recon_queue + "</span>"
+        : "—";
+      var pct = parseFloat(a.recon_confidence) || 0;
+      var confHtml = pct > 0
+        ? '<span style="font-family:ui-monospace,monospace;font-size:11px;font-weight:700;color:' +
+          (pct >= 90 ? "#16a34a" : pct >= 50 ? "#d97706" : "#dc2626") + '">' + pct.toFixed(1) + "%</span>"
+        : '<span style="color:#cbd5e1">—</span>';
+
+      var matchedHtml = "—";
+      if (a.recon_matched_entries) {
+        try {
+          var names = typeof a.recon_matched_entries === "string"
+            ? JSON.parse(a.recon_matched_entries) : a.recon_matched_entries;
+          if (names && names.length) {
+            matchedHtml = names.slice(0, 2).map(function (n) {
+              return '<a class="sbr-link" href="/app/' + encodeURIComponent(n) + '" target="_blank">' + n + "</a>";
+            }).join(", ") + (names.length > 2 ? " +" + (names.length - 2) + " more" : "");
+          }
+        } catch (e) {}
+      }
+
+      var amtStr = (a.deposit && parseFloat(a.deposit) > 0)
+        ? '<span style="color:#16a34a;font-weight:600">' + formatAmount(a.deposit) + " CR</span>"
+        : (a.withdrawal && parseFloat(a.withdrawal) > 0)
+          ? '<span style="color:#dc2626;font-weight:600">' + formatAmount(a.withdrawal) + " DR</span>"
+          : "—";
+
+      var modifiedBy = (a.modified_by || "").replace(/@.*/, "");
+      var modifiedAt = (a.modified || "").substring(0, 16).replace("T", " ");
+
+      return "<tr>" +
+        '<td style="color:#94a3b8;font-size:11px">' + (i + 1) + "</td>" +
+        "<td style='white-space:nowrap;font-size:12px'>" + (a.date || "") + "</td>" +
+        '<td class="sbr-ref"><a class="sbr-link" href="#Form/Bank Transaction/' +
+          encodeURIComponent(a.name) + '" target="_blank">' + a.name + "</a></td>" +
+        '<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px">' +
+          (a.description || a.party || "—").substring(0, 50) + "</td>" +
+        "<td>" + amtStr + "</td>" +
+        "<td>" + actionBadge + "</td>" +
+        "<td>" + queueBadgeHtml + "</td>" +
+        "<td>" + confHtml + "</td>" +
+        '<td style="max-width:180px">' + matchedHtml + "</td>" +
+        '<td style="font-size:11px;color:#64748b;white-space:nowrap">' + modifiedBy + "</td>" +
+        '<td style="font-size:11px;color:#94a3b8;white-space:nowrap;font-family:ui-monospace,monospace">' + modifiedAt + "</td>" +
+        "</tr>";
+    }).join("");
+
+    $tab.html(
+      '<div class="sbr-audit-toolbar">' +
+        '<span style="font-size:12px;color:#64748b;font-weight:500">' + count + " action" + (count !== 1 ? "s" : "") + " recorded</span>" +
+        '<button class="sbr-btn sbr-audit-export-btn" style="padding:4px 12px;font-size:11px">↓ Export CSV</button>' +
+      "</div>" +
+      '<div class="sbr-table-wrap" style="overflow-x:auto">' +
+      '<table class="sbr-table">' +
+      "<thead><tr>" +
+        '<th style="width:28px;color:#94a3b8">#</th>' +
+        "<th>Date</th><th>Transaction</th><th>Description</th>" +
+        "<th>Amount</th><th>Action</th><th>Queue</th>" +
+        "<th>Conf %</th><th>Matched Entry</th><th>User</th><th>Timestamp</th>" +
+      "</tr></thead>" +
+      "<tbody>" + rows + "</tbody>" +
+      "</table></div>"
+    );
+
+    // Export CSV
+    $tab.find(".sbr-audit-export-btn").on("click", function () {
+      var headers = ["#","Date","Transaction","Description","Amount","Action","Queue","Confidence","Matched Entry","User","Timestamp"];
+      var csvRows = [headers.join(",")];
+      actions.forEach(function (a, i) {
+        var amt = parseFloat(a.deposit) > 0 ? "+" + a.deposit : parseFloat(a.withdrawal) > 0 ? "-" + a.withdrawal : "";
+        var matched = "";
+        try {
+          var names = typeof a.recon_matched_entries === "string" ? JSON.parse(a.recon_matched_entries) : (a.recon_matched_entries || []);
+          matched = names.join("; ");
+        } catch (e) {}
+        csvRows.push([
+          i + 1, a.date, a.name,
+          '"' + (a.description || a.party || "").replace(/"/g, '""') + '"',
+          amt, a.recon_user_action, a.recon_queue,
+          (parseFloat(a.recon_confidence) || 0).toFixed(1) + "%",
+          matched,
+          (a.modified_by || "").replace(/@.*/, ""),
+          (a.modified || "").substring(0, 16),
+        ].join(","));
+      });
+      var blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement("a");
+      link.href = url; link.download = "audit_trail.csv"; link.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    });
+  }
+
+  /* ── Settings modal ── */
+
+  function openSettingsModal(currentSettings, onSave) {
+    var s = currentSettings || {};
+    var html =
+      '<div class="sbr-settings-grid">' +
+        // Row 1
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">Auto-match threshold</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<input class="sbr-settings-input" type="number" min="50" max="100" step="1" ' +
+              'id="sbr-s-auto" value="' + (s.auto_threshold || 90) + '">' +
+            '<span class="sbr-settings-unit">%</span>' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Matches at or above this confidence are auto-approved</div>' +
+        "</div>" +
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">Review threshold</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<input class="sbr-settings-input" type="number" min="10" max="89" step="1" ' +
+              'id="sbr-s-review" value="' + (s.review_threshold || 50) + '">' +
+            '<span class="sbr-settings-unit">%</span>' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Matches between Review and Auto thresholds go to Review queue</div>' +
+        "</div>" +
+        // Row 2
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">High-value threshold</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<span class="sbr-settings-unit sbr-settings-prefix">₦</span>' +
+            '<input class="sbr-settings-input" type="number" min="1000000" step="1000000" ' +
+              'id="sbr-s-highval" value="' + (s.high_val_threshold || 50000000) + '">' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Matched transactions above this amount require dual approval</div>' +
+        "</div>" +
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">Aging alert after</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<input class="sbr-settings-input" type="number" min="1" max="90" step="1" ' +
+              'id="sbr-s-aging" value="' + (s.aging_days || 10) + '">' +
+            '<span class="sbr-settings-unit">days</span>' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Unmatched ERP entries older than this are flagged as Aging</div>' +
+        "</div>" +
+        // Row 3
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">Amount tolerance</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<input class="sbr-settings-input" type="number" min="0" max="10" step="0.5" ' +
+              'id="sbr-s-amt-tol" value="' + (s.amount_tolerance_pct || 1) + '">' +
+            '<span class="sbr-settings-unit">%</span>' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Bank and ERP amounts within this % are treated as exact matches</div>' +
+        "</div>" +
+        '<div class="sbr-settings-group">' +
+          '<label class="sbr-settings-label">Date window</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<span class="sbr-settings-unit sbr-settings-prefix">±</span>' +
+            '<input class="sbr-settings-input" type="number" min="0" max="30" step="1" ' +
+              'id="sbr-s-date-win" value="' + (s.date_window_days || 5) + '">' +
+            '<span class="sbr-settings-unit">days</span>' +
+          '</div>' +
+          '<div class="sbr-settings-hint">ERP entries within this many days of the bank date are considered</div>' +
+        "</div>" +
+        // Row 4 — full-width suspense account
+        '<div class="sbr-settings-group" style="grid-column:1/-1">' +
+          '<label class="sbr-settings-label">Consolidation Suspense Account</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<input class="sbr-settings-input" type="text" style="flex:1;min-width:0" ' +
+              'id="sbr-s-suspense" placeholder="e.g. Bank Suspense - XYZ" ' +
+              'value="' + (s.suspense_account || "") + '">' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Account used as contra when consolidating bank transactions into a Journal Entry. Leave blank to auto-detect from chart of accounts.</div>' +
+        "</div>" +
+        // Row 5 — bank charge threshold
+        '<div class="sbr-settings-group" style="grid-column:1/-1">' +
+          '<label class="sbr-settings-label">Bank Charge Amount Threshold</label>' +
+          '<div class="sbr-settings-input-row">' +
+            '<span class="sbr-settings-unit sbr-settings-prefix">₦</span>' +
+            '<input class="sbr-settings-input" type="number" min="0" step="100" ' +
+              'id="sbr-s-chg-threshold" value="' + (s.bank_charge_amount_threshold || 2000) + '">' +
+          '</div>' +
+          '<div class="sbr-settings-hint">Any unreconciled debit transaction up to this amount is treated as a potential bank charge in Consolidate Bank Charges (default: ₦2,000).</div>' +
+        "</div>" +
+      "</div>";
+
+    var d = new frappe.ui.Dialog({
+      title: "AI Match Settings",
+      fields: [{ fieldtype: "HTML", fieldname: "settings_html", options: html }],
+      primary_action_label: "Save Settings",
+      primary_action: function () {
+        var newSettings = {
+          auto_threshold:               parseFloat(d.$wrapper.find("#sbr-s-auto").val()) || 90,
+          review_threshold:             parseFloat(d.$wrapper.find("#sbr-s-review").val()) || 50,
+          high_val_threshold:           parseFloat(d.$wrapper.find("#sbr-s-highval").val()) || 50000000,
+          aging_days:                   parseInt(d.$wrapper.find("#sbr-s-aging").val()) || 10,
+          amount_tolerance_pct:         parseFloat(d.$wrapper.find("#sbr-s-amt-tol").val()) || 1,
+          date_window_days:             parseInt(d.$wrapper.find("#sbr-s-date-win").val()) || 5,
+          suspense_account:             (d.$wrapper.find("#sbr-s-suspense").val() || "").trim(),
+          bank_charge_amount_threshold: parseFloat(d.$wrapper.find("#sbr-s-chg-threshold").val()) || 2000,
+        };
+        frappe.call({
+          method: "smart_bank_reconciliation.reconciliation.api.save_sbr_settings",
+          args: { settings_json: JSON.stringify(newSettings) },
+          callback: function (r) {
+            if (!r.exc) {
+              frappe.show_alert({ message: "Settings saved", indicator: "green" }, 3);
+              d.hide();
+              if (onSave) onSave(newSettings);
+            }
+          },
+        });
+      },
+      secondary_action_label: "Reset to Defaults",
+      secondary_action: function () {
+        d.$wrapper.find("#sbr-s-auto").val(90);
+        d.$wrapper.find("#sbr-s-review").val(50);
+        d.$wrapper.find("#sbr-s-highval").val(50000000);
+        d.$wrapper.find("#sbr-s-aging").val(10);
+        d.$wrapper.find("#sbr-s-amt-tol").val(1);
+        d.$wrapper.find("#sbr-s-date-win").val(5);
+        d.$wrapper.find("#sbr-s-chg-threshold").val(2000);
+      },
+    });
+    d.show();
+  }
+
+  /* ── Update individual suggestion cards after a selective re-run ── */
+
+  function updateSuggestionCards($container, suggestions) {
+    var $panel = $container.find(".sbr-suggestion-panel");
+    suggestions.forEach(function (s) {
+      var $existing = $panel.find('.sbr-card[data-txn="' + s.bank_txn + '"]');
+      if ($existing.length) {
+        $existing.replaceWith($(buildCard(s)));
+      }
+    });
+    // Merge updated suggestions into stored data so the Reconcile modal sees fresh state
+    var allSuggestions = $container.data("suggestions") || [];
+    suggestions.forEach(function (newSug) {
+      var idx = -1;
+      for (var i = 0; i < allSuggestions.length; i++) {
+        if (allSuggestions[i].bank_txn === newSug.bank_txn) { idx = i; break; }
+      }
+      if (idx >= 0) { allSuggestions[idx] = newSug; }
+      else { allSuggestions.push(newSug); }
+    });
+    $container.data("suggestions", allSuggestions);
+  }
+
+  /* ── Aging ERP alerts section (Gap 4) ── */
+
+  function renderAgingErpAlerts($container, entries, agingDays) {
+    if (!entries || !entries.length) return;
+    var $panel = $container.find(".sbr-suggestion-panel");
+    if (!$panel.length) return;
+
+    // Remove any previous aging section
+    $panel.find(".sbr-aging-erp-section").remove();
+
+    var days = agingDays || 10;
+    var html =
+      '<div class="sbr-aging-erp-section" style="margin-bottom:16px">' +
+        '<div class="sbr-aging-erp-header" style="display:flex;align-items:center;gap:8px;padding:10px 14px;' +
+          'background:#fff7ed;border:1.5px solid #fed7aa;border-radius:8px;' +
+          'cursor:pointer;user-select:none">' +
+          '<span style="font-size:16px">⏰</span>' +
+          '<span style="font-size:13px;font-weight:700;color:#c2410c">Aging ERP Entries (' +
+            entries.length + ')</span>' +
+          '<span style="font-size:11px;color:#92400e;margin-left:4px">ERP vouchers waiting >' +
+            days + ' days for a matching bank transaction</span>' +
+          '<span class="sbr-aging-erp-chevron" style="margin-left:auto;font-size:12px;color:#92400e;' +
+            'transition:transform 0.2s;display:inline-block">▼</span>' +
+        '</div>' +
+        '<div class="sbr-aging-erp-body" style="display:none;border:1.5px solid #fed7aa;border-top:none;' +
+          'border-radius:0 0 8px 8px;overflow:hidden">';
+
+    entries.forEach(function (e) {
+      var isOverdue = e.days_old > days * 2;
+      var badgeColor = isOverdue ? "#dc2626" : "#ea580c";
+      var badgeBg    = isOverdue ? "#fee2e2" : "#ffedd5";
+      var amt = parseFloat(e.amount || 0);
+      var amtStr = amt > 0 ? "₦" + amt.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
+      html +=
+        '<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;' +
+          'background:#fffbf5;border-top:1px solid #fed7aa;font-size:12px">' +
+          '<span style="background:' + badgeBg + ';color:' + badgeColor + ';' +
+            'padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;white-space:nowrap">' +
+            e.days_old + 'd overdue</span>' +
+          '<span style="font-size:11px;color:#475569;background:#f1f5f9;' +
+            'padding:2px 6px;border-radius:4px;font-family:ui-monospace,monospace">' +
+            (e.entry_type === "Payment Entry" ? "PE" : "JE") + '</span>' +
+          '<a href="/app/' + encodeURIComponent(e.name) + '" target="_blank" ' +
+            'style="font-family:ui-monospace,monospace;font-size:11px;color:#1d4ed8;' +
+            'text-decoration:none;font-weight:600" onclick="event.stopPropagation()">' +
+            e.name + '</a>' +
+          (e.party ? '<span style="color:#374151">' + e.party + '</span>' : '') +
+          '<span style="font-weight:700;color:#92400e;font-variant-numeric:tabular-nums">' + amtStr + '</span>' +
+          '<span style="color:#94a3b8;flex:1">' + (e.reference || '') + '</span>' +
+          '<span style="font-size:11px;color:#94a3b8">' + (e.date || '') + '</span>' +
+        '</div>';
+    });
+
+    html += '</div></div>';
+
+    // Insert at the top of the suggestions panel (before the queue tabs)
+    $panel.prepend(html);
+
+    // Wire up toggle — collapsed by default, header click expands/collapses
+    $panel.find(".sbr-aging-erp-section").on("click", ".sbr-aging-erp-header", function () {
+      var $section = $(this).closest(".sbr-aging-erp-section");
+      var $body    = $section.find(".sbr-aging-erp-body");
+      var $chevron = $section.find(".sbr-aging-erp-chevron");
+      var isOpen   = $body.is(":visible");
+      if (isOpen) {
+        $body.slideUp(160);
+        $chevron.css("transform", "rotate(0deg)");
+        $(this).css("border-radius", "8px");
+      } else {
+        $body.slideDown(160);
+        $chevron.css("transform", "rotate(180deg)");
+        $(this).css("border-radius", "8px 8px 0 0");
+      }
+    });
+  }
+
+  /* ── Public API ── */
+
+  return {
+    queueBadge:             queueBadge,
+    formatAmount:           formatAmount,
+    confidenceBar:          confidenceBar,
+    signalBadges:           signalBadges,
+    renderTabShell:         renderTabShell,
+    renderSummaryTiles:     renderSummaryTiles,
+    updateTabBadge:         updateTabBadge,
+    renderBalanceSummary:   renderBalanceSummary,
+    renderAIBanner:         renderAIBanner,
+    renderTransactionTable: renderTransactionTable,
+    updateMatchBadges:      updateMatchBadges,
+    renderSuggestionsPanel: renderSuggestionsPanel,
+    renderERPVouchersTab:   renderERPVouchersTab,
+    showSuggestionCard:     showSuggestionCard,
+    filterByQueue:          filterByQueue,
+    switchTab:              switchTab,
+    renderReconcileModal:   renderReconcileModal,
+    getSelectedTxns:        getSelectedTxns,
+    renderReportModal:      renderReportModal,
+    renderAuditTab:         renderAuditTab,
+    openSettingsModal:      openSettingsModal,
+    buildCard:              buildCard,
+    updateSuggestionCards:  updateSuggestionCards,
+    renderAgingErpAlerts:   renderAgingErpAlerts,
+  };
+
+}());
