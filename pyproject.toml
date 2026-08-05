@@ -1,5 +1,5 @@
 [project]
-name = "smart_bank_reconcilliation"
+name = "smart_bank_reconciliation"
 authors = [
     { name = "Frappe Technologies Pvt Ltd", email = "developers@frappe.io" }
 ]
