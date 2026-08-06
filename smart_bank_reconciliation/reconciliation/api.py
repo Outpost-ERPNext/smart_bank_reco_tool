@@ -1,7 +1,7 @@
 import json
 import frappe
 from frappe import _
-from frappe.utils import nowdate, getdate, flt
+from frappe.utils import nowdate, getdate, flt, add_days
 from .matching_engine import BankMatchingEngine
 
 
@@ -769,16 +769,27 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
 
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
-    """Return the GL balance of the bank account's linked account on the day before from_date."""
+    """Return the GL balance of the bank account's linked account on the day before from_date.
+    Uses direct GL Entry sum to match what the General Ledger report shows (avoids get_balance_on
+    including period-closing and revaluation vouchers that inflate/deflate the figure)."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
-        from erpnext.accounts.utils import get_balance_on
-        from frappe.utils import add_days
         account = frappe.db.get_value("Bank Account", bank_account, "account")
         if not account:
             return 0.0
-        opening = get_balance_on(account, add_days(getdate(from_date), -1))
-        return float(opening or 0)
+        cutoff = add_days(getdate(from_date), -1)
+        result = frappe.db.sql(
+            """
+            SELECT SUM(debit) - SUM(credit) AS balance
+            FROM `tabGL Entry`
+            WHERE account = %s
+              AND posting_date <= %s
+              AND is_cancelled = 0
+            """,
+            (account, cutoff),
+            as_dict=True,
+        )
+        return float((result[0].balance or 0) if result else 0)
     except Exception:
         return 0.0
 
