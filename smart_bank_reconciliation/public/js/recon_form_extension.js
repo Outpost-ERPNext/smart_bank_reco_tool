@@ -155,7 +155,7 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
     frm.set_df_property("bank_statement_closing_balance", "hidden", 0);
 
     // Clarify which side each balance represents
-    frm.set_df_property("account_opening_balance",      "label", __("Account Opening Balance (ERP)"));
+    frm.set_df_property("account_opening_balance",      "label", __("Opening Balance as per ERP (GL)"));
     frm.set_df_property("bank_statement_closing_balance", "label", __("Closing Balance (Bank)"));
 
     // Hide "Reconcile" section header — two-pass for reliability
@@ -191,17 +191,28 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
   },
 
   // Fetch opening balance and auto-reload data whenever filters change
+  company: function (frm) {
+    sbr_save_filter_state(frm);
+  },
+
   bank_account: function (frm) {
+    sbr_save_filter_state(frm);
+    // Clear stale closing balance from a previous account
+    frm.doc.bank_statement_closing_balance = 0;
+    frm.refresh_field("bank_statement_closing_balance");
+    sbr_update_balance_bar(frm);
     sbr_fetch_opening_balance(frm);
     sbr_debounce_filter_load(frm);
   },
 
   bank_statement_from_date: function (frm) {
+    sbr_save_filter_state(frm);
     sbr_fetch_opening_balance(frm);
     sbr_debounce_filter_load(frm);
   },
 
   bank_statement_to_date: function (frm) {
+    sbr_save_filter_state(frm);
     sbr_debounce_filter_load(frm);
   },
 
@@ -212,10 +223,58 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
 
 });
 
+/* ── Persist filter selections across page refreshes ── */
+var SBR_FILTER_KEY = "sbr_filter_state";
+
+function sbr_save_filter_state(frm) {
+  try {
+    localStorage.setItem(SBR_FILTER_KEY, JSON.stringify({
+      company:    frm.doc.company || "",
+      bank_account: frm.doc.bank_account || "",
+      from_date:  frm.doc.bank_statement_from_date || "",
+      to_date:    frm.doc.bank_statement_to_date || "",
+    }));
+  } catch (e) {}
+}
+
+function sbr_load_filter_state() {
+  try {
+    var raw = localStorage.getItem(SBR_FILTER_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return null;
+}
+
 /* ── Set default field values on first load ── */
 function sbr_set_defaults(frm) {
   // Write directly to frm.doc + refresh_field to avoid triggering change handlers
   // (frm.set_value triggers bank_account/date change → sbr_debounce_load → auto-loads data)
+
+  var saved = sbr_load_filter_state();
+
+  if (saved && (saved.company || saved.bank_account || saved.from_date)) {
+    // Saved state always wins — Frappe pre-populates frm.doc.company before onload,
+    // so we must unconditionally overwrite, not just fill empty fields.
+    if (saved.company) {
+      frm.doc.company = saved.company;
+      frm.refresh_field("company");
+    }
+    if (saved.bank_account) {
+      frm.doc.bank_account = saved.bank_account;
+      frm.refresh_field("bank_account");
+    }
+    if (saved.from_date) {
+      frm.doc.bank_statement_from_date = saved.from_date;
+      frm.refresh_field("bank_statement_from_date");
+    }
+    if (saved.to_date) {
+      frm.doc.bank_statement_to_date = saved.to_date;
+      frm.refresh_field("bank_statement_to_date");
+    }
+    return;
+  }
+
+  // No saved state — apply initial defaults
 
   // Dates: from = 1st of last month, to = today
   if (!frm.doc.bank_statement_from_date) {
@@ -385,13 +444,13 @@ function sbr_build_toolbar(frm) {
   });
   frm.page.add_inner_button(__("Consolidate Bank Charges"), function () {
     sbr_open_bank_charges_modal(frm);
-  }, __("Consolidate ↕"));
+  }, __("Consolidate"));
   frm.page.add_inner_button(__("Consolidate Transactions"), function () {
     sbr_open_consolidate_transactions_modal(frm);
-  }, __("Consolidate ↕"));
+  }, __("Consolidate"));
   frm.page.add_inner_button(__("Report"), function () {
     ReconUI.renderReportModal(frm);
-  });
+  }, __("More"));
   frm.page.add_inner_button(__("⚙ Settings"), function () {
     frappe.call({
       method: "smart_bank_reconciliation.reconciliation.api.get_sbr_settings",
@@ -405,7 +464,7 @@ function sbr_build_toolbar(frm) {
         });
       },
     });
-  });
+  }, __("More"));
   var _aiLabel = __("AI Match All");
   var _aiIcon  = "magic";
   if (frm._sbr_ai_running) {
@@ -459,13 +518,68 @@ function sbr_load_transactions(frm) {
       $canvas.html('<div class="sbr-panel-inner"></div>');
       sbr_bind_card_actions(frm, $canvas);
 
-      ReconUI.renderSummaryTiles($canvas, { total: data.total || 0 });
+      // Use queue_counts from API to populate tiles (includes prior AI scoring from DB)
+      var qCounts = data.queue_counts || { total: data.total || 0 };
+      ReconUI.renderSummaryTiles($canvas, qCounts);
       ReconUI.renderTabShell($canvas, data.total || 0);
       if (data.total) {
         ReconUI.renderTransactionTable($canvas, data.transactions);
         ReconUI.filterByQueue($canvas, null);
       } else {
         sbr_render_inline_upload(frm, $canvas);
+      }
+
+      // If transactions carry prior AI queue assignments, restore the banner + toolbar state
+      var hasActiveAI = (qCounts.auto || 0) + (qCounts.review || 0) + (qCounts.unmatched || 0) +
+                        (qCounts.high_val || 0) + (qCounts.duplicate || 0) + (qCounts.aging || 0);
+      if (hasActiveAI > 0) {
+        ReconUI.renderAIBanner($canvas, qCounts);
+        frm._sbr_ai_done = true;
+        frm._sbr_auto_count  = qCounts.auto   || 0;
+        frm._sbr_review_count = qCounts.review || 0;
+        sbr_build_toolbar(frm);
+        frm.page.set_indicator(__("Done"), "green");
+
+        // Rebuild the suggestions cache from DB fields so the Reconcile modal
+        // can pre-select the AI-matched ERP entry and the AI Match Pairs tab shows cards.
+        var reconstructedSuggestions = [];
+        (data.transactions || []).forEach(function (t) {
+          if (!t.recon_queue || t.recon_queue === "Reconciled") return;
+          var entryNames = [];
+          if (t.recon_matched_entries) {
+            try {
+              entryNames = typeof t.recon_matched_entries === "string"
+                ? JSON.parse(t.recon_matched_entries) : (t.recon_matched_entries || []);
+            } catch (e) { entryNames = []; }
+          }
+          var mType = t.recon_match_type || (entryNames.length > 1 ? "1:Many" : "1:1");
+          var firstName = entryNames[0] || "";
+          var nUp = firstName.toUpperCase();
+          var entryType = nUp.indexOf("-PAY-") !== -1 ? "Payment Entry"
+                        : nUp.indexOf("-JV-")  !== -1 ? "Journal Entry"
+                        : nUp.indexOf("-SI-")  !== -1 ? "Sales Invoice"
+                        : nUp.indexOf("-PI-")  !== -1 ? "Purchase Invoice"
+                        : "Entry";
+          var txnAmt = parseFloat(t.withdrawal || 0) || parseFloat(t.deposit || 0);
+          reconstructedSuggestions.push({
+            bank_txn:    t.name,
+            date:        t.date || "",
+            deposit:     t.deposit || 0,
+            withdrawal:  t.withdrawal || 0,
+            description: t.description || "",
+            party:       t.party || "",
+            queue:       t.recon_queue,
+            confidence:  parseFloat(t.recon_confidence) || 0,
+            matched: entryNames.length ? {
+              name:       firstName,
+              match_type: mType,
+              entry_type: entryType,
+              amount:     txnAmt,
+              entries:    entryNames.map(function (n) { return { name: n }; }),
+            } : null,
+          });
+        });
+        ReconUI.renderSuggestionsPanel($canvas, reconstructedSuggestions);
       }
 
       // Fetch balance summary in background (non-blocking)
@@ -502,10 +616,7 @@ function sbr_load_transactions(frm) {
         },
       });
 
-      // Auto-run AI matching immediately after transactions are loaded
-      if (data.total && data.total > 0) {
-        sbr_run_suggestions(frm);
-      }
+
     },
   });
 }
@@ -859,7 +970,7 @@ function sbr_open_create_voucher_dialog(frm, $canvas, txnName) {
             options: "Account",
             depends_on: "eval:doc.document_type=='Journal Entry'",
             mandatory_depends_on: "eval:doc.document_type=='Journal Entry'",
-            get_query: function () { return { filters: { is_group: 0, company: frm.doc.company } }; },
+            get_query: function () { return { filters: { is_group: 0, disabled: 0, company: frm.doc.company } }; },
           },
           /* ── Payment Entry only ── */
           {
@@ -2239,25 +2350,6 @@ function sbr_bind_card_actions(frm, $canvas) {
     sbr_load_file(file, function (parsed) { sbr_show_inline_preview($cv, parsed); });
   });
 
-  $canvas.off("click", ".sbr-inline-demo");
-  $canvas.on("click", ".sbr-inline-demo", function () {
-    if (!frm.doc.bank_account) {
-      frappe.msgprint(__("Please select a Bank Account before loading demo data."));
-      return;
-    }
-    frappe.call({
-      method: "smart_bank_reconciliation.reconciliation.api.reset_bank_transactions",
-      args: {
-        bank_account: frm.doc.bank_account,
-        from_date: "2025-02-01",
-        to_date: "2025-02-28",
-      },
-      callback: function () {
-        sbr_do_import(frm, $canvas, sbr_parse_csv(SBR_DEMO_CSV));
-      },
-    });
-  });
-
   $canvas.off("click", ".sbr-inline-download");
   $canvas.on("click", ".sbr-inline-download", function () {
     var blob = new Blob([SBR_DEMO_CSV], { type: "text/csv" });
@@ -2505,7 +2597,6 @@ function sbr_render_inline_upload(frm, $canvas) {
       '<input type="file" id="sbr-inline-file" accept=".csv,.txt,.xlsx,.xls,.mt940,.sta,.940" style="display:none">' +
       '<div class="sbr-inline-btns">' +
         '<button class="sbr-inline-btn-primary sbr-inline-choose" type="button">Choose File</button>' +
-        '<button class="sbr-inline-btn-outline sbr-inline-demo" type="button">Use Demo Data (MPLIFY Feb 2025)</button>' +
         '<button class="sbr-inline-btn-outline sbr-inline-download" type="button">&#8595; Download Sample CSV</button>' +
       '</div>' +
       '<div class="sbr-inline-preview" style="display:none"></div>' +
@@ -2618,7 +2709,6 @@ function sbr_open_upload_modal(frm, $canvas) {
           '<div class="sbr-upload-preview" style="display:none"></div>' +
         '</div>' +
         '<div class="sbr-modal-footer">' +
-          '<button class="sbr-btn sbr-upload-demo" type="button">Use Demo Data</button>' +
           '<div style="flex:1"></div>' +
           '<button class="sbr-btn sbr-upload-cancel" type="button">Cancel</button>' +
           '<button class="sbr-btn sbr-btn-accept sbr-upload-import" type="button" disabled>Import & Run AI</button>' +
@@ -2704,8 +2794,6 @@ function sbr_open_upload_modal(frm, $canvas) {
     sbr_load_file(file, showPreview);
   });
 
-  /* Demo data */
-  $overlay.on("click", ".sbr-upload-demo", function () { showPreview(parseCsv(DEMO_CSV)); });
 
   /* Reset to drop zone */
   $overlay.on("click", ".sbr-upload-reset", function () {

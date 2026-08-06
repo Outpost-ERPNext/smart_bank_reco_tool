@@ -1,5 +1,5 @@
 import frappe
-from frappe.utils import date_diff, getdate, nowdate
+from frappe.utils import add_days, date_diff, getdate, nowdate
 
 from .signal_calculator import SignalCalculator
 from .duplicate_detector import DuplicateDetector, ErpDuplicateDetector
@@ -58,43 +58,40 @@ class BankMatchingEngine:
                 results.append(txn)
                 continue
 
-            # Duplicate bank transaction
+            # Duplicate bank transaction check (run before ERP scoring but don't skip it)
             dup_reason = dup_detector.check(txn)
-            if dup_reason:
-                self._save(txn["name"], queue="Duplicate", confidence=0,
-                           reasoning=dup_reason, match_type="Duplicate")
-                txn["recon_queue"] = "Duplicate"
-                txn["recon_ai_reasoning"] = dup_reason
-                results.append(txn)
-                continue
 
             # Score all ERP candidates
             scored = signal_calc.score_all(txn, candidates)
             nigerian.apply(txn, scored)
 
             if not scored:
-                is_aging = self._is_aging(txn)
-                queue = "Aging" if is_aging else "Unmatched"
-                draft = draft_gen.build(txn)
+                queue = "Duplicate" if dup_reason else ("Aging" if self._is_aging(txn) else "Unmatched")
+                reasoning = dup_reason or "No matching ERP entry found"
+                draft = None if dup_reason else draft_gen.build(txn)
                 self._save(txn["name"], queue=queue, confidence=0,
-                           reasoning="No matching ERP entry found",
+                           reasoning=reasoning, match_type="Duplicate" if dup_reason else None,
                            draft_payload=draft)
                 txn["recon_queue"] = queue
-                txn["recon_draft_payload"] = draft
+                txn["recon_ai_reasoning"] = reasoning
+                if draft:
+                    txn["recon_draft_payload"] = draft
             else:
                 best = scored[0]
                 conf = best["confidence"]
                 bank_amount = float(txn.get("deposit") or txn.get("withdrawal") or 0)
 
-                # Force Review override (WHT, Reversal)
-                if best.get("_force_review"):
+                if dup_reason:
+                    # Always Duplicate queue regardless of confidence; prepend duplicate warning
+                    queue = "Duplicate"
+                    best["reasoning"] = dup_reason + (" — " + best["reasoning"] if best.get("reasoning") else "")
+                elif best.get("_force_review"):
                     queue = "Review"
                 elif conf >= self.auto_threshold:
                     queue = "High-Val" if bank_amount > self.high_val_threshold else "Auto"
                 elif conf >= self.review_threshold:
                     queue = "Review"
                 elif self._is_aging(txn):
-                    # Old transaction with no strong match → Aging, not Unmatched
                     queue = "Aging"
                 else:
                     queue = "Unmatched"
@@ -164,6 +161,10 @@ class BankMatchingEngine:
         )
 
     def _get_candidates(self):
+        # Expand search window 60 days beyond the statement range to catch late-posted entries
+        date_from = add_days(getdate(self.from_date), -60)
+        date_to   = add_days(getdate(self.to_date),   60)
+
         pe_list = frappe.db.get_all(
             "Payment Entry",
             filters={
@@ -171,6 +172,7 @@ class BankMatchingEngine:
                 "docstatus": 1,
                 "clearance_date": ["is", "not set"],
                 "payment_type": ["in", ["Receive", "Pay"]],
+                "posting_date": ["between", [date_from, date_to]],
             },
             fields=[
                 "name", "payment_type", "party_type", "party",
@@ -190,6 +192,7 @@ class BankMatchingEngine:
                 "company": self.company,
                 "docstatus": 1,
                 "clearance_date": ["is", "not set"],
+                "posting_date": ["between", [date_from, date_to]],
             },
             fields=[
                 "name", "voucher_type", "posting_date", "cheque_no",

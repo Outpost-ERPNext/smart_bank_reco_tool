@@ -19,6 +19,15 @@ window.ReconUI = (function () {
     party: "party", side: "side", history: "history",
   };
 
+  function _guessEntryRoute(name) {
+    var n = (name || "").toUpperCase();
+    if (n.indexOf("-PAY-") !== -1) return "payment-entry";
+    if (n.indexOf("-JV-")  !== -1) return "journal-entry";
+    if (n.indexOf("-SI-")  !== -1) return "sales-invoice";
+    if (n.indexOf("-PI-")  !== -1) return "purchase-invoice";
+    return null;
+  }
+
   var TILE_TO_QUEUE = {
     "AUTO": "Auto", "REVIEW": "Review", "UNMATCHED": "Unmatched",
     "HIGH-VAL": "High-Val", "DUPES": "Duplicate", "AGING": "Aging", "RECONCILED": "Reconciled",
@@ -255,7 +264,10 @@ window.ReconUI = (function () {
       var tileLabel = $(this).data("queue");
       var queueName = tileLabel === "TOTAL" ? null : (TILE_TO_QUEUE[tileLabel] || null);
       filterByQueue($container, queueName);
-      switchTab($container, "ai");
+      // Navigate to AI Match Pairs tab when a specific queue tile is clicked
+      if (queueName && $container.find(".sbr-card").length) {
+        switchTab($container, "ai");
+      }
     });
   }
 
@@ -325,7 +337,9 @@ window.ReconUI = (function () {
     $container.find(".sbr-row").each(function () {
       total++;
       var $row = $(this);
-      var queueOk  = !queueName  || $row.data("queue")       === queueName;
+      var rowQueue = $row.attr("data-queue") || "";
+      var queueOk  = !queueName || rowQueue === queueName ||
+                     (queueName === "Unmatched" && rowQueue === "");
       var ptOk     = !partyType  || $row.data("party-type")  === partyType;
       var textOk   = !txt || ($row.data("search-text") || "").indexOf(txt) !== -1;
       if (queueOk && ptOk && textOk) { $row.show(); visible++; }
@@ -420,8 +434,10 @@ window.ReconUI = (function () {
           var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
           if (entryNames && entryNames.length) {
             matchedEntryHtml = entryNames.map(function (en) {
-              return '<a class="sbr-link" href="/app/' + encodeURIComponent(en) + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
-            }).join('<br>');
+              var route = _guessEntryRoute(en);
+              var href = route ? "/app/" + route + "/" + encodeURIComponent(en) : "/app/bank-transaction";
+              return '<a class="sbr-link" href="' + href + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
+            }).join("<br>");
           }
         } catch (e) {}
       }
@@ -1379,9 +1395,9 @@ window.ReconUI = (function () {
                 'margin-bottom:8px;line-height:1.5">&#9888; ' + s.reasoning + '</div>';
       }
       html +=
+        '<button class="sbr-btn sbr-pair-view-btn sbr-pair-detail-btn" data-txn="' + s.bank_txn + '">Match Against Voucher &#8250;</button>' +
         '<button class="sbr-btn sbr-btn-del-dup" data-txn="' + s.bank_txn + '" ' +
           'style="background:#dc2626;color:#fff;border-color:#b91c1c">&#128465; Delete Duplicate</button>' +
-        '<button class="sbr-btn sbr-btn-dup" data-txn="' + s.bank_txn + '">Keep &amp; Investigate</button>' +
         '<button class="sbr-btn sbr-btn-update" data-txn="' + s.bank_txn + '">&#9998; Update</button>';
     }
     if (queue === "Unmatched" || queue === "Aging") {
@@ -1901,7 +1917,9 @@ window.ReconUI = (function () {
             ? JSON.parse(a.recon_matched_entries) : a.recon_matched_entries;
           if (names && names.length) {
             matchedHtml = names.slice(0, 2).map(function (n) {
-              return '<a class="sbr-link" href="/app/' + encodeURIComponent(n) + '" target="_blank">' + n + "</a>";
+              var route = _guessEntryRoute(n);
+              var href = route ? "/app/" + route + "/" + encodeURIComponent(n) : "/app/bank-transaction";
+              return '<a class="sbr-link" href="' + href + '" target="_blank">' + n + "</a>";
             }).join(", ") + (names.length > 2 ? " +" + (names.length - 2) + " more" : "");
           }
         } catch (e) {}
@@ -2171,7 +2189,7 @@ window.ReconUI = (function () {
           '<span style="font-size:11px;color:#475569;background:#f1f5f9;' +
             'padding:2px 6px;border-radius:4px;font-family:ui-monospace,monospace">' +
             (e.entry_type === "Payment Entry" ? "PE" : "JE") + '</span>' +
-          '<a href="/app/' + encodeURIComponent(e.name) + '" target="_blank" ' +
+          '<a href="/app/' + (e.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry") + "/" + encodeURIComponent(e.name) + '" target="_blank" ' +
             'style="font-family:ui-monospace,monospace;font-size:11px;color:#1d4ed8;' +
             'text-decoration:none;font-weight:600" onclick="event.stopPropagation()">' +
             e.name + '</a>' +

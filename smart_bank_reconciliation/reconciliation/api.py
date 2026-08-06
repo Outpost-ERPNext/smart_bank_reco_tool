@@ -26,7 +26,20 @@ def get_bank_transactions(bank_account, from_date, to_date):
                     "reference_number", "party_type", "party", "status", "unallocated_amount"],
             order_by="date desc",
         )
-    return {"transactions": rows, "total": len(rows)}
+
+    total = len(rows)
+    queue_counts = {"total": total}
+    for r in rows:
+        q = (r.get("recon_queue") or "")
+        if q == "Auto":       queue_counts["auto"]       = queue_counts.get("auto",       0) + 1
+        elif q == "Review":   queue_counts["review"]     = queue_counts.get("review",     0) + 1
+        elif q == "Unmatched":queue_counts["unmatched"]  = queue_counts.get("unmatched",  0) + 1
+        elif q == "High-Val": queue_counts["high_val"]   = queue_counts.get("high_val",   0) + 1
+        elif q == "Duplicate":queue_counts["duplicate"]  = queue_counts.get("duplicate",  0) + 1
+        elif q == "Aging":    queue_counts["aging"]      = queue_counts.get("aging",      0) + 1
+        elif q == "Reconciled":queue_counts["reconciled"]= queue_counts.get("reconciled", 0) + 1
+
+    return {"transactions": rows, "total": total, "queue_counts": queue_counts}
 
 
 @frappe.whitelist()
@@ -1289,21 +1302,25 @@ def get_erp_vouchers(bank_account, from_date, to_date):
     company    = ba_doc.get("company")
     vouchers = []
 
-    # Payment Entries in date range — scoped to the bank account's company
-    pe_filters = [
-        ["posting_date", "between", [from_date, to_date]],
-        ["docstatus", "=", 1],
-    ]
-    if company:
-        pe_filters.append(["company", "=", company])
-    pes = frappe.db.get_all(
-        "Payment Entry",
-        filters=pe_filters,
-        fields=["name", "posting_date", "payment_type", "party_type", "party",
-                "paid_amount", "received_amount", "reference_no", "clearance_date"],
-        order_by="posting_date desc",
-    )
-    for pe in pes:
+    # Payment Entries scoped to the bank GL account (paid_from OR paid_to = gl_account)
+    if gl_account:
+        company_clause = "AND pe.company = %(company)s" if company else ""
+        pe_rows = frappe.db.sql("""
+            SELECT pe.name, pe.posting_date, pe.payment_type, pe.party_type, pe.party,
+                   pe.paid_amount, pe.received_amount, pe.reference_no, pe.clearance_date
+            FROM `tabPayment Entry` pe
+            WHERE (pe.paid_from = %(gl)s OR pe.paid_to = %(gl)s)
+              AND pe.posting_date BETWEEN %(fd)s AND %(td)s
+              AND pe.docstatus = 1
+              {cc}
+            ORDER BY pe.posting_date DESC
+        """.format(cc=company_clause), {
+            "gl": gl_account, "fd": from_date, "td": to_date, "company": company or ""
+        }, as_dict=True)
+    else:
+        pe_rows = []
+
+    for pe in pe_rows:
         amount = float(pe.paid_amount or 0) or float(pe.received_amount or 0)
         vouchers.append({
             "name":         pe.name,
