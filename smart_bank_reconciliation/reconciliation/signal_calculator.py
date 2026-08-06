@@ -193,10 +193,28 @@ class SignalCalculator:
             "entries": [entry],
             "amount": entry.get("amount"),
             "party": entry.get("party"),
+            "party_type": entry.get("party_type") or "",
             "posting_date": entry.get("posting_date") or entry.get("cheque_date"),
             "payment_type": entry.get("payment_type"),
             "voucher_type": entry.get("voucher_type"),
         }
+
+    def best_for_display(self, txn, candidates):
+        """Return the single highest-scoring candidate ignoring the 10% floor.
+        Used for Duplicate cards so a best-effort ERP suggestion is always shown."""
+        if not candidates:
+            return None
+        bank_amount = float(txn.get("deposit") or txn.get("withdrawal") or 0)
+        is_credit = bool(txn.get("deposit"))
+        best = None
+        best_conf = -1.0
+        for entry in candidates:
+            signals = self._signals(txn, entry, bank_amount, is_credit)
+            confidence = self._confidence(signals)
+            if confidence > best_conf:
+                best_conf = confidence
+                best = self._build_result(entry, signals, confidence)
+        return best
 
     def _subset_sum(self, txn, bank_amount, candidates):
         if not bank_amount:

@@ -21,11 +21,12 @@ window.ReconUI = (function () {
 
   function _guessEntryRoute(name) {
     var n = (name || "").toUpperCase();
-    if (n.indexOf("-PAY-") !== -1) return "payment-entry";
-    if (n.indexOf("-JV-")  !== -1) return "journal-entry";
-    if (n.indexOf("-SI-")  !== -1) return "sales-invoice";
-    if (n.indexOf("-PI-")  !== -1) return "purchase-invoice";
-    return null;
+    if (n.indexOf("-JV-")    !== -1) return "journal-entry";
+    if (n.indexOf("-SI-")    !== -1) return "sales-invoice";
+    if (n.indexOf("-PI-")    !== -1) return "purchase-invoice";
+    // Matching engine only produces Payment Entry and Journal Entry candidates,
+    // so any non-JE entry in recon_matched_entries must be a Payment Entry.
+    return "payment-entry";
   }
 
   var TILE_TO_QUEUE = {
@@ -347,7 +348,7 @@ window.ReconUI = (function () {
     });
     if (total > 0) {
       $container.find(".sbr-txn-counter").text(
-        (queueName || txt)
+        (queueName || txt || partyType)
           ? "Showing " + visible + " of " + total + " transactions"
           : total + " transactions"
       );
@@ -357,6 +358,19 @@ window.ReconUI = (function () {
       if (!queueName || $(this).data("queue") === queueName) { $(this).show(); }
       else                                                    { $(this).hide(); }
     });
+
+    // Show/hide duplicate bulk-action toolbar whenever filter changes
+    var $dupBar = $container.find(".sbr-dup-bulk-bar");
+    if (queueName === "Duplicate") {
+      $dupBar.css("display", "flex");
+    } else {
+      if ($dupBar.is(":visible")) {
+        $container.find(".sbr-dup-chk, .sbr-dup-select-all").prop("checked", false);
+        $dupBar.find(".sbr-dup-sel-count").text("0");
+        $dupBar.find(".sbr-dup-del-selected").prop("disabled", true).css("opacity", "0.5");
+      }
+      $dupBar.hide();
+    }
 
     var $panel = $container.find(".sbr-suggestion-panel");
     $panel.find(".sbr-sp-queue-tab").removeClass("sbr-sp-queue-tab-active").css("background", "#fff");

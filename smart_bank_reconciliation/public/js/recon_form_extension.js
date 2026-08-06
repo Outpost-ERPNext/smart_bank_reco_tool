@@ -555,11 +555,7 @@ function sbr_load_transactions(frm) {
           var mType = t.recon_match_type || (entryNames.length > 1 ? "1:Many" : "1:1");
           var firstName = entryNames[0] || "";
           var nUp = firstName.toUpperCase();
-          var entryType = nUp.indexOf("-PAY-") !== -1 ? "Payment Entry"
-                        : nUp.indexOf("-JV-")  !== -1 ? "Journal Entry"
-                        : nUp.indexOf("-SI-")  !== -1 ? "Sales Invoice"
-                        : nUp.indexOf("-PI-")  !== -1 ? "Purchase Invoice"
-                        : "Entry";
+          var entryType = nUp.indexOf("-JV-") !== -1 ? "Journal Entry" : "Payment Entry";
           var txnAmt = parseFloat(t.withdrawal || 0) || parseFloat(t.deposit || 0);
           reconstructedSuggestions.push({
             bank_txn:    t.name,

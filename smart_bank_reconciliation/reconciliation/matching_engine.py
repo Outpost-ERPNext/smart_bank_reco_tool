@@ -69,13 +69,43 @@ class BankMatchingEngine:
                 queue = "Duplicate" if dup_reason else ("Aging" if self._is_aging(txn) else "Unmatched")
                 reasoning = dup_reason or "No matching ERP entry found"
                 draft = None if dup_reason else draft_gen.build(txn)
-                self._save(txn["name"], queue=queue, confidence=0,
-                           reasoning=reasoning, match_type="Duplicate" if dup_reason else None,
-                           draft_payload=draft)
+
+                # For duplicate transactions always surface the best ERP candidate
+                # for display — even when confidence is below the 10% scoring floor.
+                # This populates the two-column card view and pre-selects the entry
+                # in the "Match Against Voucher" modal without affecting reconciliation.
+                best_display = None
+                if dup_reason and candidates:
+                    best_display = signal_calc.best_for_display(txn, candidates)
+                    if best_display:
+                        best_display["reasoning"] = dup_reason + (
+                            " — " + best_display["reasoning"] if best_display.get("reasoning") else ""
+                        )
+
+                display_entry_names = (
+                    [e["name"] for e in best_display.get("entries", [best_display])]
+                    if best_display else None
+                )
+
+                self._save(
+                    txn["name"],
+                    queue=queue,
+                    confidence=best_display["confidence"] if best_display else 0,
+                    reasoning=best_display["reasoning"] if best_display else reasoning,
+                    match_type="Duplicate" if dup_reason else None,
+                    matched_entries=frappe.as_json(display_entry_names) if display_entry_names else None,
+                    signals_json=frappe.as_json(best_display["signals"]) if best_display else None,
+                    draft_payload=draft,
+                )
                 txn["recon_queue"] = queue
-                txn["recon_ai_reasoning"] = reasoning
+                txn["recon_ai_reasoning"] = best_display["reasoning"] if best_display else reasoning
                 if draft:
                     txn["recon_draft_payload"] = draft
+                if best_display:
+                    txn["matched"] = best_display
+                    txn["recon_confidence"] = best_display["confidence"]
+                    txn["recon_match_type"] = best_display.get("match_type", "")
+                    txn["recon_matched_entries"] = frappe.as_json(display_entry_names)
             else:
                 best = scored[0]
                 conf = best["confidence"]
@@ -120,6 +150,7 @@ class BankMatchingEngine:
                 txn["recon_confidence"] = conf
                 txn["recon_match_type"] = best.get("match_type")
                 txn["recon_ai_reasoning"] = best.get("reasoning")
+                txn["recon_matched_entries"] = frappe.as_json(entry_names)
                 txn["matched"] = best
 
             results.append(txn)
