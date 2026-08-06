@@ -1,0 +1,22 @@
+[project]
+name = "smart_bank_reconciliation"
+authors = [
+    { name = "Frappe Technologies Pvt Ltd", email = "developers@frappe.io" }
+]
+description = "Open Source ERP"
+requires-python = ">=3.8"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    "xlsxwriter",
+    "gspread",
+    "geopy",
+    "pandas"
+]
+ 
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+ 
+[tool.bench.frappe-dependencies]
+frappe = ">=13.0.0,<17.0.0"
