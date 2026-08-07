@@ -39,6 +39,38 @@ def get_bank_transactions(bank_account, from_date, to_date):
         elif q == "Aging":    queue_counts["aging"]      = queue_counts.get("aging",      0) + 1
         elif q == "Reconciled":queue_counts["reconciled"]= queue_counts.get("reconciled", 0) + 1
 
+    # Enrich party_type from matched Payment Entry for transactions that have no
+    # party set on the bank transaction itself (typical for imported statements).
+    # A single batch query keeps the overhead minimal.
+    import json as _json
+    entry_names_needed = set()
+    for row in rows:
+        if not row.get("party_type") and row.get("recon_matched_entries"):
+            try:
+                for n in (_json.loads(row["recon_matched_entries"]) or []):
+                    entry_names_needed.add(n)
+            except Exception:
+                pass
+    if entry_names_needed:
+        pe_party = {
+            pe["name"]: pe["party_type"]
+            for pe in frappe.db.get_all(
+                "Payment Entry",
+                filters={"name": ["in", list(entry_names_needed)]},
+                fields=["name", "party_type"],
+            )
+            if pe.get("party_type")
+        }
+        for row in rows:
+            if not row.get("party_type") and row.get("recon_matched_entries"):
+                try:
+                    for n in (_json.loads(row["recon_matched_entries"]) or []):
+                        if n in pe_party:
+                            row["party_type"] = pe_party[n]
+                            break
+                except Exception:
+                    pass
+
     return {"transactions": rows, "total": total, "queue_counts": queue_counts}
 
 
@@ -180,7 +212,7 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
                     "withdrawal": t.get("withdrawal") or 0,
                     "description": t.get("description") or "",
                     "reference_number": t.get("reference_number") or "",
-                    "party_type": t.get("party_type") or "",
+                    "party_type": t.get("party_type") or (t.get("matched") or {}).get("party_type") or "",
                     "party": t.get("party") or "",
                     "status": t.get("status") or "",
                     "unallocated_amount": t.get("unallocated_amount") or 0,
@@ -518,7 +550,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
             "withdrawal":            txn.get("withdrawal") or 0,
             "description":           txn.get("description") or "",
             "reference_number":      txn.get("reference_number") or "",
-            "party_type":            txn.get("party_type") or "",
+            "party_type":            txn.get("party_type") or (txn.get("matched") or {}).get("party_type") or "",
             "party":                 txn.get("party") or "",
             "status":                txn.get("status") or "",
             "unallocated_amount":    txn.get("unallocated_amount") or 0,
@@ -770,8 +802,10 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
     """Return the GL balance of the bank account's linked account on the day before from_date.
-    Uses direct GL Entry sum to match what the General Ledger report shows (avoids get_balance_on
-    including period-closing and revaluation vouchers that inflate/deflate the figure)."""
+    Exchange Rate Revaluation and Period Closing Voucher entries are excluded because ERPNext
+    posts these at year-end and immediately reverses them on the first day of the next period.
+    Including them (as naive SUM(debit)-SUM(credit) does) makes the year-end opening balance
+    appear massively distorted — e.g. ₦-2B instead of the real ₦-197M."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
         account = frappe.db.get_value("Bank Account", bank_account, "account")
@@ -785,6 +819,7 @@ def get_account_opening_balance(bank_account, from_date):
             WHERE account = %s
               AND posting_date <= %s
               AND is_cancelled = 0
+              AND voucher_type NOT IN ('Exchange Rate Revaluation', 'Period Closing Voucher')
             """,
             (account, cutoff),
             as_dict=True,
