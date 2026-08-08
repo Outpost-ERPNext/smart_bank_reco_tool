@@ -801,30 +801,17 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
 
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
-    """Return the GL balance of the bank account's linked account on the day before from_date.
-    Exchange Rate Revaluation and Period Closing Voucher entries are excluded because ERPNext
-    posts these at year-end and immediately reverses them on the first day of the next period.
-    Including them (as naive SUM(debit)-SUM(credit) does) makes the year-end opening balance
-    appear massively distorted — e.g. ₦-2B instead of the real ₦-197M."""
+    """Return the exact GL balance of the bank account's linked account on the day before from_date,
+    using standard ERPNext get_balance_on so it perfectly matches the General Ledger report."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
+        from erpnext.accounts.utils import get_balance_on
         account = frappe.db.get_value("Bank Account", bank_account, "account")
         if not account:
             return 0.0
         cutoff = add_days(getdate(from_date), -1)
-        result = frappe.db.sql(
-            """
-            SELECT SUM(debit) - SUM(credit) AS balance
-            FROM `tabGL Entry`
-            WHERE account = %s
-              AND posting_date <= %s
-              AND is_cancelled = 0
-              AND voucher_type NOT IN ('Exchange Rate Revaluation', 'Period Closing Voucher')
-            """,
-            (account, cutoff),
-            as_dict=True,
-        )
-        return float((result[0].balance or 0) if result else 0)
+        balance = get_balance_on(account, cutoff)
+        return float(balance or 0)
     except Exception:
         return 0.0
 
