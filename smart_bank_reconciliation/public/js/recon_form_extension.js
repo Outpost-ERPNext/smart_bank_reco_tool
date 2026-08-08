@@ -138,6 +138,13 @@ function sbr_restore_from_cache(frm, $canvas) {
 frappe.ui.form.on("Bank Reconciliation Tool", {
 
   onload: function (frm) {
+    // Completely nullify standard ERPNext fetch so it never races with our fetch
+    if (frappe.ui.form.handlers["Bank Reconciliation Tool"]) {
+        frappe.ui.form.handlers["Bank Reconciliation Tool"]["get_account_opening_balance"] = [];
+    }
+    if (frm.events) {
+        frm.events["get_account_opening_balance"] = [];
+    }
     sbr_set_defaults(frm);
     sbr_schedule_erp_default_load(frm);
   },
@@ -219,12 +226,6 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
   // When user edits the bank closing balance, refresh the balance bar immediately
   bank_statement_closing_balance: function (frm) {
     sbr_update_balance_bar(frm);
-  },
-
-  // Override standard ERPNext fetch which gets "Calculated Bank Statement Balance"
-  // This prevents it from racing and overwriting our custom pure GL balance fetch.
-  get_account_opening_balance: function(frm) {
-    // Intentionally empty. We use sbr_fetch_opening_balance instead.
   }
 
 });
