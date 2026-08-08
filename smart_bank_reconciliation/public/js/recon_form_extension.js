@@ -221,6 +221,12 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
     sbr_update_balance_bar(frm);
   },
 
+  // Override standard ERPNext fetch which gets "Calculated Bank Statement Balance"
+  // This prevents it from racing and overwriting our custom pure GL balance fetch.
+  get_account_opening_balance: function(frm) {
+    // Intentionally empty. We use sbr_fetch_opening_balance instead.
+  }
+
 });
 
 /* ── Persist filter selections across page refreshes ── */
