@@ -211,7 +211,6 @@ class BankMatchingEngine:
                 "reference_no", "paid_to", "paid_from", "remarks",
             ],
             order_by="posting_date desc",
-            limit=500,
         )
         for pe in pe_list:
             pe["entry_type"] = "Payment Entry"
@@ -230,7 +229,6 @@ class BankMatchingEngine:
                 "cheque_date", "total_debit", "total_credit", "remark",
             ],
             order_by="posting_date desc",
-            limit=300,
         )
         for je in je_list:
             je["entry_type"] = "Journal Entry"

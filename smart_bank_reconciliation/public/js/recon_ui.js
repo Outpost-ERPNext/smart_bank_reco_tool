@@ -408,6 +408,22 @@ window.ReconUI = (function () {
 
   /* ── Transaction table ── */
 
+  function _matchedEntryHtml(t) {
+    var rawEntries = t.recon_matched_entries;
+    if (!rawEntries) return "—";
+    try {
+      var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
+      if (entryNames && entryNames.length) {
+        return entryNames.map(function (en) {
+          var route = _guessEntryRoute(en);
+          var href = route ? "/app/" + route + "/" + encodeURIComponent(en) : "/app/bank-transaction";
+          return '<a class="sbr-link" href="' + href + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
+        }).join("<br>");
+      }
+    } catch (e) {}
+    return "—";
+  }
+
   function renderTransactionTable($container, transactions) {
     if (!transactions || !transactions.length) {
       $container.find(".sbr-table-wrap").html(
@@ -440,21 +456,7 @@ window.ReconUI = (function () {
       var matchCell = confidenceBadge(pct, queue);
       var isReconciled = queue === "Reconciled";
 
-      // Parse matched ERP entry names from JSON
-      var matchedEntryHtml = "—";
-      var rawEntries = t.recon_matched_entries;
-      if (rawEntries) {
-        try {
-          var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
-          if (entryNames && entryNames.length) {
-            matchedEntryHtml = entryNames.map(function (en) {
-              var route = _guessEntryRoute(en);
-              var href = route ? "/app/" + route + "/" + encodeURIComponent(en) : "/app/bank-transaction";
-              return '<a class="sbr-link" href="' + href + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
-            }).join("<br>");
-          }
-        } catch (e) {}
-      }
+      var matchedEntryHtml = _matchedEntryHtml(t);
 
       var searchText = [t.description, t.reference_number, t.party]
         .filter(Boolean).join(" ").toLowerCase().replace(/"/g, "");
@@ -478,7 +480,7 @@ window.ReconUI = (function () {
                   ? formatAmount(t.unallocated_amount) : "—") + "</td>" +
               "<td class='sbr-ref'>" + (t.reference_number || "—") + "</td>" +
               '<td class="sbr-match-cell">' + matchCell + "</td>" +
-              '<td class="sbr-ref" style="max-width:160px">' + matchedEntryHtml + "</td>" +
+              '<td class="sbr-ref sbr-matched-entry-cell" style="max-width:160px">' + matchedEntryHtml + "</td>" +
               "<td>" + (isReconciled
                 ? '<span style="font-size:11px;color:#16a34a;font-weight:500">&#10003; Reconciled</span>' +
                   ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
@@ -519,6 +521,7 @@ window.ReconUI = (function () {
       $row.attr("data-queue", queue);
       if (queue === "Reconciled") $row.addClass("sbr-row-done");
       $row.find(".sbr-match-cell").html(confidenceBadge(pct, queue));
+      $row.find(".sbr-matched-entry-cell").html(_matchedEntryHtml(t));
       if (queue === "Reconciled") {
         $row.find(".sbr-row-action-btn").replaceWith(
           '<span style="font-size:11px;color:#16a34a;font-weight:500">&#10003; Reconciled</span>' +

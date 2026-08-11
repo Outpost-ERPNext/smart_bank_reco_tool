@@ -4,6 +4,29 @@ from frappe import _
 from frappe.utils import nowdate, getdate, flt, add_days
 from .matching_engine import BankMatchingEngine
 
+# The Select field also allows "Pending" (its default/unscored state) and blank/NULL for
+# transactions never run through the matching engine. Any value outside this known-outcome
+# set must fold into "Unmatched" so tile counts always sum to the total record count.
+_KNOWN_RECON_QUEUES = {"Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"}
+
+
+def _tally_queue_counts(rows, queue_field="recon_queue"):
+    from collections import Counter
+    counts = Counter(
+        r.get(queue_field) if r.get(queue_field) in _KNOWN_RECON_QUEUES else "Unmatched"
+        for r in rows
+    )
+    return {
+        "total":      len(rows),
+        "auto":       counts.get("Auto", 0),
+        "review":     counts.get("Review", 0),
+        "unmatched":  counts.get("Unmatched", 0),
+        "high_val":   counts.get("High-Val", 0),
+        "duplicate":  counts.get("Duplicate", 0),
+        "aging":      counts.get("Aging", 0),
+        "reconciled": counts.get("Reconciled", 0),
+    }
+
 
 @frappe.whitelist()
 def get_bank_transactions(bank_account, from_date, to_date):
@@ -28,16 +51,7 @@ def get_bank_transactions(bank_account, from_date, to_date):
         )
 
     total = len(rows)
-    queue_counts = {"total": total}
-    for r in rows:
-        q = (r.get("recon_queue") or "")
-        if q == "Auto":       queue_counts["auto"]       = queue_counts.get("auto",       0) + 1
-        elif q == "Review":   queue_counts["review"]     = queue_counts.get("review",     0) + 1
-        elif q == "Unmatched":queue_counts["unmatched"]  = queue_counts.get("unmatched",  0) + 1
-        elif q == "High-Val": queue_counts["high_val"]   = queue_counts.get("high_val",   0) + 1
-        elif q == "Duplicate":queue_counts["duplicate"]  = queue_counts.get("duplicate",  0) + 1
-        elif q == "Aging":    queue_counts["aging"]      = queue_counts.get("aging",      0) + 1
-        elif q == "Reconciled":queue_counts["reconciled"]= queue_counts.get("reconciled", 0) + 1
+    queue_counts = _tally_queue_counts(rows)
 
     # Enrich party_type from matched Payment Entry for transactions that have no
     # party set on the bank transaction itself (typical for imported statements).
@@ -391,7 +405,7 @@ def bulk_approve_auto(bank_account, from_date, to_date):
                              f"Bulk approve failed for {txn['name']}")
 
     # Return updated counts
-    queue_counts = frappe.db.get_all(
+    all_txns = frappe.db.get_all(
         "Bank Transaction",
         filters={
             "bank_account": bank_account,
@@ -400,22 +414,11 @@ def bulk_approve_auto(bank_account, from_date, to_date):
         },
         fields=["recon_queue"],
     )
-    from collections import Counter
-    counts = Counter(t.get("recon_queue") or "Unmatched" for t in queue_counts)
 
     return {
         "count": len(approved),
         "approved_transactions": approved,
-        "new_counts": {
-            "total": len(queue_counts),
-            "auto": counts.get("Auto", 0),
-            "review": counts.get("Review", 0),
-            "unmatched": counts.get("Unmatched", 0),
-            "high_val": counts.get("High-Val", 0),
-            "duplicate": counts.get("Duplicate", 0),
-            "aging": counts.get("Aging", 0),
-            "reconciled": counts.get("Reconciled", 0),
-        },
+        "new_counts": _tally_queue_counts(all_txns),
     }
 
 
@@ -443,7 +446,7 @@ def bulk_reject_review(bank_account, from_date, to_date):
         })
         rejected.append(txn["name"])
 
-    queue_counts = frappe.db.get_all(
+    all_txns = frappe.db.get_all(
         "Bank Transaction",
         filters={
             "bank_account": bank_account,
@@ -452,22 +455,11 @@ def bulk_reject_review(bank_account, from_date, to_date):
         },
         fields=["recon_queue"],
     )
-    from collections import Counter
-    counts = Counter(t.get("recon_queue") or "Unmatched" for t in queue_counts)
 
     return {
         "count": len(rejected),
         "rejected_transactions": rejected,
-        "new_counts": {
-            "total": len(queue_counts),
-            "auto": counts.get("Auto", 0),
-            "review": counts.get("Review", 0),
-            "unmatched": counts.get("Unmatched", 0),
-            "high_val": counts.get("High-Val", 0),
-            "duplicate": counts.get("Duplicate", 0),
-            "aging": counts.get("Aging", 0),
-            "reconciled": counts.get("Reconciled", 0),
-        },
+        "new_counts": _tally_queue_counts(all_txns),
     }
 
 
@@ -510,18 +502,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
         },
         fields=["recon_queue"],
     )
-    from collections import Counter
-    counts = Counter(t.get("recon_queue") or "Unmatched" for t in all_txns)
-    queue_counts = {
-        "total": len(all_txns),
-        "auto":        counts.get("Auto", 0),
-        "review":      counts.get("Review", 0),
-        "unmatched":   counts.get("Unmatched", 0),
-        "high_val":    counts.get("High-Val", 0),
-        "duplicate":   counts.get("Duplicate", 0),
-        "aging":       counts.get("Aging", 0),
-        "reconciled":  counts.get("Reconciled", 0),
-    }
+    queue_counts = _tally_queue_counts(all_txns)
 
     suggestions = []
     transactions_out = []
@@ -799,33 +780,55 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
     return {"doctype": doc.doctype, "name": doc.name}
 
 
+def _gl_report_rows(account, company, from_date, to_date):
+    """Run the actual General Ledger report engine for a single account so results are always
+    byte-identical to what the General Ledger report shows — get_balance_on() alone is NOT
+    equivalent: the GL report also folds in is_opening='Yes' entries regardless of date and
+    applies row-level User Permission restrictions (build_match_conditions), neither of which
+    get_balance_on applies."""
+    from erpnext.accounts.report.general_ledger.general_ledger import execute as gl_execute
+
+    filters = frappe._dict({
+        "company": company,
+        "account": [account],
+        "from_date": getdate(from_date),
+        "to_date": getdate(to_date),
+        "group_by": "Group by Voucher (Consolidated)",
+    })
+    _, rows = gl_execute(filters)
+    return rows
+
+
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
-    """Return the exact GL balance of the bank account's linked account on the day before from_date,
-    using standard ERPNext get_balance_on so it perfectly matches the General Ledger report."""
+    """Return the bank account's linked GL account balance exactly as the General Ledger
+    report's 'Opening' row would show it for from_date."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
-        from erpnext.accounts.utils import get_balance_on
         account = frappe.db.get_value("Bank Account", bank_account, "account")
         if not account:
             return 0.0
-        cutoff = add_days(getdate(from_date), -1)
-        balance = get_balance_on(account, cutoff)
-        return float(balance or 0)
+        company = frappe.db.get_value("Account", account, "company")
+        if not company:
+            return 0.0
+        rows = _gl_report_rows(account, company, from_date, from_date)
+        return float((rows[0].get("balance") if rows else 0) or 0)
     except Exception:
         return 0.0
 
 
 @frappe.whitelist()
 def get_balance_summary(bank_account, from_date, to_date, company=None):
-    """Return ERP GL closing balance at to_date (actual account balance, not net movement)."""
+    """Return ERP GL closing balance at to_date exactly as the General Ledger report's
+    'Closing (Opening + Total)' row would show it."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
-        from erpnext.accounts.utils import get_balance_on
         gl_account = frappe.db.get_value("Bank Account", bank_account, "account")
         erp_closing = 0.0
         if gl_account:
-            erp_closing = float(get_balance_on(gl_account, getdate(to_date)) or 0)
+            gl_company = company or frappe.db.get_value("Account", gl_account, "company")
+            rows = _gl_report_rows(gl_account, gl_company, from_date, to_date)
+            erp_closing = float((rows[-1].get("balance") if rows else 0) or 0)
         return {"erp_closing": erp_closing}
     except Exception:
         return {"erp_closing": 0.0}
@@ -1512,14 +1515,14 @@ def import_bank_statement(bank_account, rows, company=None):
                 skipped += 1
                 continue
 
-            row_key = (str(getdate(date_val)), float(credit), float(debit), desc)
+            row_key = (str(getdate(date_val, parse_day_first=True)), float(credit), float(debit), desc)
             if row_key in existing_set:
                 skipped += 1
                 continue
 
             bt = frappe.new_doc("Bank Transaction")
             bt.bank_account     = bank_account
-            bt.date             = getdate(date_val)
+            bt.date             = getdate(date_val, parse_day_first=True)
             bt.deposit          = credit
             bt.withdrawal       = debit
             bt.description      = desc
@@ -1710,7 +1713,10 @@ def get_reconciliation_report(bank_account, from_date, to_date, company=None):
     import json as _json
     from collections import Counter
     total        = len(txns)
-    queue_counts = Counter(t.get("recon_queue") or "Unmatched" for t in txns)
+    queue_counts = Counter(
+        t.get("recon_queue") if t.get("recon_queue") in _KNOWN_RECON_QUEUES else "Unmatched"
+        for t in txns
+    )
 
     reconciled  = queue_counts.get("Reconciled", 0)
     auto        = queue_counts.get("Auto", 0)
@@ -1951,18 +1957,7 @@ def get_queue_summary(bank_account, from_date, to_date):
         },
         fields=["recon_queue"],
     )
-    from collections import Counter
-    counts = Counter(r.get("recon_queue") or "Unmatched" for r in rows)
-    return {
-        "total": len(rows),
-        "auto": counts.get("Auto", 0),
-        "review": counts.get("Review", 0),
-        "unmatched": counts.get("Unmatched", 0),
-        "high_val": counts.get("High-Val", 0),
-        "duplicate": counts.get("Duplicate", 0),
-        "aging": counts.get("Aging", 0),
-        "reconciled": counts.get("Reconciled", 0),
-    }
+    return _tally_queue_counts(rows)
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────

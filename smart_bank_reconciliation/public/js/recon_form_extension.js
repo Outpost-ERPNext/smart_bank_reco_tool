@@ -2480,6 +2480,13 @@ function sbr_norm_date(s) {
   // "2022-12-31 00:00:00" → "2022-12-31"
   var iso = str.match(/^(\d{4}-\d{2}-\d{2})/);
   if (iso) return iso[1];
+  // Bank statements use dd-mm-yyyy (or dd/mm/yyyy) — always day-first, never mm-dd-yyyy.
+  var dmy = str.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (dmy) {
+    var dd = dmy[1].length < 2 ? "0" + dmy[1] : dmy[1];
+    var mm = dmy[2].length < 2 ? "0" + dmy[2] : dmy[2];
+    return dmy[3] + "-" + mm + "-" + dd;
+  }
   return str;
 }
 
@@ -2511,8 +2518,14 @@ function sbr_do_import(frm, $canvas, parsed) {
     };
   });
 
-  // Derive date range from the imported rows and update form fields
-  var csvDates = rows.map(function (r) { return r.date; }).filter(Boolean).sort();
+  // Derive date range from the imported rows and update form fields.
+  // Only trust strictly valid ISO dates here — a stray unparseable value (blank cell,
+  // footer/summary row, unrecognized format) would otherwise sort to position 0 or
+  // the last slot and get fed straight into the date field, which Frappe's Date
+  // control then rejects with a confusing "Invalid date must be in format..." popup.
+  var csvDates = rows.map(function (r) { return r.date; })
+    .filter(function (d) { return /^\d{4}-\d{2}-\d{2}$/.test(d); })
+    .sort();
   var fromDate = csvDates.length ? csvDates[0] : frm.doc.bank_statement_from_date;
   var toDate   = csvDates.length ? csvDates[csvDates.length - 1] : frm.doc.bank_statement_to_date;
   frm.doc.bank_statement_from_date = sbr_norm_date(fromDate);
