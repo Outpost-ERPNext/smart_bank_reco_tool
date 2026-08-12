@@ -196,40 +196,94 @@ class BankMatchingEngine:
         date_from = add_days(getdate(self.from_date), -60)
         date_to   = add_days(getdate(self.to_date),   60)
 
-        pe_list = frappe.db.get_all(
-            "Payment Entry",
-            filters={
-                "company": self.company,
-                "docstatus": 1,
-                "clearance_date": ["is", "not set"],
-                "payment_type": ["in", ["Receive", "Pay"]],
-                "posting_date": ["between", [date_from, date_to]],
-            },
-            fields=[
-                "name", "payment_type", "party_type", "party",
-                "paid_amount", "received_amount", "posting_date",
-                "reference_no", "paid_to", "paid_from", "remarks",
-            ],
-            order_by="posting_date desc",
-        )
+        # Resolve the GL account linked to the selected bank account so we can
+        # restrict candidates to entries that actually touched this bank account.
+        gl_account = frappe.db.get_value("Bank Account", self.bank_account, "account") or ""
+
+        # Payment Entries — only those where money moved through this bank's GL account.
+        # "Receive" payments: paid_to = company bank GL; "Pay" payments: paid_from = company bank GL.
+        if gl_account:
+            pe_rows = frappe.db.sql(
+                """
+                SELECT name, payment_type, party_type, party,
+                       paid_amount, received_amount, posting_date,
+                       reference_no, paid_to, paid_from, remarks
+                FROM `tabPayment Entry`
+                WHERE company = %s
+                  AND docstatus = 1
+                  AND (clearance_date IS NULL OR clearance_date = '')
+                  AND payment_type IN ('Receive', 'Pay')
+                  AND posting_date BETWEEN %s AND %s
+                  AND (paid_to = %s OR paid_from = %s)
+                ORDER BY posting_date DESC
+                LIMIT 500
+                """,
+                (self.company, date_from, date_to, gl_account, gl_account),
+                as_dict=True,
+            )
+        else:
+            pe_rows = frappe.db.get_all(
+                "Payment Entry",
+                filters={
+                    "company": self.company,
+                    "docstatus": 1,
+                    "clearance_date": ["is", "not set"],
+                    "payment_type": ["in", ["Receive", "Pay"]],
+                    "posting_date": ["between", [date_from, date_to]],
+                },
+                fields=[
+                    "name", "payment_type", "party_type", "party",
+                    "paid_amount", "received_amount", "posting_date",
+                    "reference_no", "paid_to", "paid_from", "remarks",
+                ],
+                order_by="posting_date desc",
+                limit=500,
+            )
+
+        pe_list = list(pe_rows)
         for pe in pe_list:
             pe["entry_type"] = "Payment Entry"
             pe["amount"] = float(pe.get("received_amount") or pe.get("paid_amount") or 0)
 
-        je_list = frappe.db.get_all(
-            "Journal Entry",
-            filters={
-                "company": self.company,
-                "docstatus": 1,
-                "clearance_date": ["is", "not set"],
-                "posting_date": ["between", [date_from, date_to]],
-            },
-            fields=[
-                "name", "voucher_type", "posting_date", "cheque_no",
-                "cheque_date", "total_debit", "total_credit", "remark",
-            ],
-            order_by="posting_date desc",
-        )
+        # Journal Entries — only those that have at least one account row touching
+        # this bank's GL account (e.g. bank charges, salary JEs, petty cash).
+        if gl_account:
+            je_list = frappe.db.sql(
+                """
+                SELECT je.name, je.voucher_type, je.posting_date, je.cheque_no,
+                       je.cheque_date, je.total_debit, je.total_credit, je.remark
+                FROM `tabJournal Entry` je
+                INNER JOIN `tabJournal Entry Account` jea ON jea.parent = je.name
+                WHERE je.company = %s
+                  AND je.docstatus = 1
+                  AND (je.clearance_date IS NULL OR je.clearance_date = '')
+                  AND je.posting_date BETWEEN %s AND %s
+                  AND jea.account = %s
+                GROUP BY je.name
+                ORDER BY je.posting_date DESC
+                LIMIT 300
+                """,
+                (self.company, date_from, date_to, gl_account),
+                as_dict=True,
+            )
+        else:
+            je_list = frappe.db.get_all(
+                "Journal Entry",
+                filters={
+                    "company": self.company,
+                    "docstatus": 1,
+                    "clearance_date": ["is", "not set"],
+                    "posting_date": ["between", [date_from, date_to]],
+                },
+                fields=[
+                    "name", "voucher_type", "posting_date", "cheque_no",
+                    "cheque_date", "total_debit", "total_credit", "remark",
+                ],
+                order_by="posting_date desc",
+                limit=300,
+            )
+
+        je_list = list(je_list)
         for je in je_list:
             je["entry_type"] = "Journal Entry"
             je["amount"] = float(je.get("total_debit") or je.get("total_credit") or 0)

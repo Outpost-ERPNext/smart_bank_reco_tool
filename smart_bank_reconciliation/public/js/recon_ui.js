@@ -355,8 +355,11 @@ window.ReconUI = (function () {
     }
 
     $container.find(".sbr-card").each(function () {
-      if (!queueName || $(this).data("queue") === queueName) { $(this).show(); }
-      else                                                    { $(this).hide(); }
+      var cardQueue = $(this).data("queue") || "";
+      var cardOk = !queueName
+        || cardQueue === queueName
+        || (queueName === "Unmatched" && cardQueue === "");
+      if (cardOk) { $(this).show(); } else { $(this).hide(); }
     });
 
     // Show/hide duplicate bulk-action toolbar whenever filter changes
@@ -1235,7 +1238,7 @@ window.ReconUI = (function () {
     var signals = matchedEntry.signals || null;
     var pct = parseFloat(s.confidence) || 0;
     var confColor = pct >= 90 ? "#16a34a" : pct >= 50 ? "#d97706" : "#dc2626";
-    var queue = s.queue || "";
+    var queue = s.queue || "Unmatched";
     var hasMatch = !!(matchedEntry.name);
 
     var qc = QUEUE_COLOR[queue] || { bg: "#F1F5F9", text: "#64748B", border: "#CBD5E1" };

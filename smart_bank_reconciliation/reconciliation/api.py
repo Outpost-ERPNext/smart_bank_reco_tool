@@ -780,59 +780,55 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
     return {"doctype": doc.doctype, "name": doc.name}
 
 
-def _gl_report_rows(account, company, from_date, to_date):
-    """Run the actual General Ledger report engine (the same function "Custom General Ledger"
-    itself calls) so results always match it exactly, including its Finance Book and
-    is_opening handling."""
-    from erpnext.accounts.report.general_ledger.general_ledger import execute as gl_execute
-
-    filters = frappe._dict({
-        "company": company,
-        "account": [account],
-        "from_date": getdate(from_date),
-        "to_date": getdate(to_date),
-        "group_by": "Group by Voucher (Consolidated)",
-        # Must be sent explicitly as 0 — omitting this key does NOT reproduce the
-        # report page's unchecked "Include Default Book Entries" checkbox. Without
-        # it, gl_execute() includes non-blank Finance Book entries (e.g. the
-        # "MPLIFY" book) that the report screen excludes by default.
-        "include_default_book_entries": 0,
-        "show_cancelled_entries": 0,
-    })
-    _, rows = gl_execute(filters)
-    return rows
+def _gl_balance(account, cutoff_date):
+    """
+    Return SUM(debit) - SUM(credit) for the GL account up to and including
+    cutoff_date.  Mirrors the Custom General Ledger report with
+    'Include Default Book Entries' UNCHECKED:
+      - Only entries with finance_book = '' or NULL (excludes Finance-Book-only
+        entries such as Exchange Rate Revaluation posted under the company's
+        default Finance Book).
+      - Cancelled entries excluded.
+    """
+    result = frappe.db.sql(
+        """
+        SELECT IFNULL(SUM(debit), 0) - IFNULL(SUM(credit), 0)
+        FROM `tabGL Entry`
+        WHERE account = %s
+          AND is_cancelled = 0
+          AND posting_date <= %s
+          AND (finance_book IS NULL OR finance_book = '')
+        """,
+        (account, getdate(cutoff_date)),
+    )
+    return float(result[0][0] or 0)
 
 
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
-    """Return the bank account's linked GL account balance exactly as the General Ledger
-    report's 'Opening' row would show it for from_date."""
+    """Return the GL balance for the day before from_date — matches the
+    'Opening' row of the General Ledger report."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
         account = frappe.db.get_value("Bank Account", bank_account, "account")
         if not account:
             return 0.0
-        company = frappe.db.get_value("Account", account, "company")
-        if not company:
-            return 0.0
-        rows = _gl_report_rows(account, company, from_date, from_date)
-        return float((rows[0].get("balance") if rows else 0) or 0)
+        cutoff = add_days(getdate(from_date), -1)
+        return _gl_balance(account, cutoff)
     except Exception:
         return 0.0
 
 
 @frappe.whitelist()
 def get_balance_summary(bank_account, from_date, to_date, company=None):
-    """Return ERP GL closing balance at to_date exactly as the General Ledger report's
-    'Closing (Opening + Total)' row would show it."""
+    """Return ERP GL closing balance at to_date — matches the
+    'Closing (Opening + Total)' row of the General Ledger report."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
         gl_account = frappe.db.get_value("Bank Account", bank_account, "account")
-        erp_closing = 0.0
-        if gl_account:
-            gl_company = company or frappe.db.get_value("Account", gl_account, "company")
-            rows = _gl_report_rows(gl_account, gl_company, from_date, to_date)
-            erp_closing = float((rows[-1].get("balance") if rows else 0) or 0)
+        if not gl_account:
+            return {"erp_closing": 0.0}
+        erp_closing = _gl_balance(gl_account, to_date)
         return {"erp_closing": erp_closing}
     except Exception:
         return {"erp_closing": 0.0}
@@ -1461,6 +1457,46 @@ def reset_ai_suggestions(bank_account, from_date, to_date):
     return {"reset": True}
 
 
+def _parse_flexible_date(date_str):
+    """Parse bank statement dates that may use YYYY-DD-MM or other non-standard formats.
+
+    Some Nigerian bank exports produce YYYY-DD-MM (e.g. 2026-13-01 meaning Jan 13).
+    We try standard ISO / dayfirst formats first; if the 'month' slot > 12 we swap
+    day and month.  Raises ValueError (not frappe.throw) so callers can silently skip.
+    """
+    import re as _re
+    from datetime import date as _date
+    import dateutil.parser as _dup
+
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+
+    # Standard ISO (YYYY-MM-DD) and unambiguous formats
+    try:
+        return _dup.parse(date_str, dayfirst=False).date()
+    except Exception:
+        pass
+
+    # Day-first formats: DD/MM/YYYY, DD-MM-YYYY
+    try:
+        return _dup.parse(date_str, dayfirst=True).date()
+    except Exception:
+        pass
+
+    # YYYY-DD-MM: "month" slot > 12 means day and month are swapped
+    m = _re.match(r'^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$', date_str)
+    if m:
+        y, part2, part3 = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if part2 > 12 and 1 <= part3 <= 12:
+            try:
+                return _date(y, part3, part2)
+            except ValueError:
+                pass
+
+    raise ValueError('Cannot parse date: {0}'.format(date_str))
+
+
 @frappe.whitelist()
 def import_bank_statement(bank_account, rows, company=None):
     """Parse JSON rows (from CSV import) and create submitted Bank Transactions."""
@@ -1482,7 +1518,7 @@ def import_bank_statement(bank_account, rows, company=None):
         d = (row.get("date") or row.get("Date") or "").strip()
         if d:
             try:
-                all_dates.append(getdate(d))
+                all_dates.append(_parse_flexible_date(d))
             except Exception:
                 pass
 
@@ -1519,14 +1555,14 @@ def import_bank_statement(bank_account, rows, company=None):
                 skipped += 1
                 continue
 
-            row_key = (str(getdate(date_val, parse_day_first=True)), float(credit), float(debit), desc)
+            row_key = (str(_parse_flexible_date(date_val)), float(credit), float(debit), desc)
             if row_key in existing_set:
                 skipped += 1
                 continue
 
             bt = frappe.new_doc("Bank Transaction")
             bt.bank_account     = bank_account
-            bt.date             = getdate(date_val, parse_day_first=True)
+            bt.date             = _parse_flexible_date(date_val)
             bt.deposit          = credit
             bt.withdrawal       = debit
             bt.description      = desc

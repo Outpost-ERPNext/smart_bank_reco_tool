@@ -551,7 +551,11 @@ function sbr_load_transactions(frm) {
         // can pre-select the AI-matched ERP entry and the AI Match Pairs tab shows cards.
         var reconstructedSuggestions = [];
         (data.transactions || []).forEach(function (t) {
-          if (!t.recon_queue || t.recon_queue === "Reconciled") return;
+          // Include ALL non-Reconciled transactions — null/empty recon_queue means
+          // the transaction was never processed by AI; treat it as Unmatched so it
+          // appears in the AI Match Pairs tab with the correct count.
+          if (t.recon_queue === "Reconciled") return;
+          var queue = t.recon_queue || "Unmatched";
           var entryNames = [];
           if (t.recon_matched_entries) {
             try {
@@ -571,7 +575,7 @@ function sbr_load_transactions(frm) {
             withdrawal:  t.withdrawal || 0,
             description: t.description || "",
             party:       t.party || "",
-            queue:       t.recon_queue,
+            queue:       queue,
             confidence:  parseFloat(t.recon_confidence) || 0,
             matched: entryNames.length ? {
               name:       firstName,
