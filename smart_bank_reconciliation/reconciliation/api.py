@@ -780,29 +780,46 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
     return {"doctype": doc.doctype, "name": doc.name}
 
 
-def _gl_report_rows(account, company, from_date, to_date):
-    """Run the actual General Ledger report engine for a single account so results are always
-    byte-identical to what the General Ledger report shows — get_balance_on() alone is NOT
-    equivalent: the GL report also folds in is_opening='Yes' entries regardless of date and
-    applies row-level User Permission restrictions (build_match_conditions), neither of which
-    get_balance_on applies."""
-    from erpnext.accounts.report.general_ledger.general_ledger import execute as gl_execute
+def _gl_balance(account, company, cutoff_date, inclusive):
+    """Sum of debit-credit for this account/company as of cutoff_date.
 
-    filters = frappe._dict({
-        "company": company,
-        "account": [account],
-        "from_date": getdate(from_date),
-        "to_date": getdate(to_date),
-        "group_by": "Group by Voucher (Consolidated)",
-    })
-    _, rows = gl_execute(filters)
-    return rows
+    Deliberately NOT implemented via erpnext's general_ledger report execute(): that report
+    defaults to excluding any GL Entry tagged with a non-default Finance Book (real production
+    data hit this — a large chunk of an account's history was tagged to an unrelated Finance
+    Book, causing the report to silently omit it). A bank account's real cash balance can't
+    exclude real entries just because they're also tagged for a parallel/alternate reporting
+    book, so this counts every book.
+
+    Two things from the report ARE preserved here since they're genuinely correct behavior:
+    - is_opening='Yes' entries always count, regardless of their posting_date.
+    - Row-level User Permission restrictions (build_match_conditions) are respected, so this
+      matches what a permission-restricted user would actually be allowed to see.
+    """
+    from frappe.desk.reportview import build_match_conditions
+
+    op = "<=" if inclusive else "<"
+    conditions = [
+        "account = %(account)s",
+        "company = %(company)s",
+        "is_cancelled = 0",
+        f"(posting_date {op} %(cutoff)s OR is_opening = 'Yes')",
+    ]
+    match_conditions = build_match_conditions("GL Entry")
+    if match_conditions:
+        conditions.append(match_conditions)
+
+    balance = frappe.db.sql(
+        "SELECT IFNULL(SUM(debit), 0) - IFNULL(SUM(credit), 0) FROM `tabGL Entry` WHERE "
+        + " AND ".join(conditions),
+        {"account": account, "company": company, "cutoff": getdate(cutoff_date)},
+    )
+    return float(balance[0][0] or 0)
 
 
 @frappe.whitelist()
 def get_account_opening_balance(bank_account, from_date):
-    """Return the bank account's linked GL account balance exactly as the General Ledger
-    report's 'Opening' row would show it for from_date."""
+    """Return the bank account's linked GL account balance as of the day before from_date —
+    every GL Entry against the account, regardless of Finance Book."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
         account = frappe.db.get_value("Bank Account", bank_account, "account")
@@ -811,24 +828,22 @@ def get_account_opening_balance(bank_account, from_date):
         company = frappe.db.get_value("Account", account, "company")
         if not company:
             return 0.0
-        rows = _gl_report_rows(account, company, from_date, from_date)
-        return float((rows[0].get("balance") if rows else 0) or 0)
+        return _gl_balance(account, company, from_date, inclusive=False)
     except Exception:
         return 0.0
 
 
 @frappe.whitelist()
 def get_balance_summary(bank_account, from_date, to_date, company=None):
-    """Return ERP GL closing balance at to_date exactly as the General Ledger report's
-    'Closing (Opening + Total)' row would show it."""
+    """Return ERP GL closing balance at to_date — every GL Entry against the account,
+    regardless of Finance Book."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
         gl_account = frappe.db.get_value("Bank Account", bank_account, "account")
         erp_closing = 0.0
         if gl_account:
             gl_company = company or frappe.db.get_value("Account", gl_account, "company")
-            rows = _gl_report_rows(gl_account, gl_company, from_date, to_date)
-            erp_closing = float((rows[-1].get("balance") if rows else 0) or 0)
+            erp_closing = _gl_balance(gl_account, gl_company, to_date, inclusive=True)
         return {"erp_closing": erp_closing}
     except Exception:
         return {"erp_closing": 0.0}
