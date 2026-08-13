@@ -109,7 +109,7 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
     # Build suggestion payload for each non-reconciled transaction
     suggestions = []
     for txn in results:
-        if txn.get("recon_queue") == "Reconciled":
+        if txn.get("recon_queue") in ("Reconciled", "Unmatched") or not txn.get("recon_queue"):
             continue
         suggestions.append({
             "bank_txn": txn["name"],
@@ -198,7 +198,7 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
 
         suggestions = []
         for txn in results:
-            if txn.get("recon_queue") == "Reconciled":
+            if txn.get("recon_queue") in ("Reconciled", "Unmatched") or not txn.get("recon_queue"):
                 continue
             suggestions.append({
                 "bank_txn": txn["name"],
@@ -507,7 +507,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
     suggestions = []
     transactions_out = []
     for txn in results:
-        if txn.get("recon_queue") == "Reconciled":
+        if txn.get("recon_queue") in ("Reconciled", "Unmatched") or not txn.get("recon_queue"):
             continue
         suggestions.append({
             "bank_txn":        txn["name"],
@@ -782,26 +782,12 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
 
 def _gl_balance(account, cutoff_date):
     """
-    Return SUM(debit) - SUM(credit) for the GL account up to and including
-    cutoff_date.  Mirrors the Custom General Ledger report with
-    'Include Default Book Entries' UNCHECKED:
-      - Only entries with finance_book = '' or NULL (excludes Finance-Book-only
-        entries such as Exchange Rate Revaluation posted under the company's
-        default Finance Book).
-      - Cancelled entries excluded.
+    Return the exact GL balance for the account up to and including cutoff_date,
+    using standard ERPNext get_balance_on so it perfectly matches the General Ledger report.
     """
-    result = frappe.db.sql(
-        """
-        SELECT IFNULL(SUM(debit), 0) - IFNULL(SUM(credit), 0)
-        FROM `tabGL Entry`
-        WHERE account = %s
-          AND is_cancelled = 0
-          AND posting_date <= %s
-          AND (finance_book IS NULL OR finance_book = '')
-        """,
-        (account, getdate(cutoff_date)),
-    )
-    return float(result[0][0] or 0)
+    from erpnext.accounts.utils import get_balance_on
+    balance = get_balance_on(account, getdate(cutoff_date))
+    return float(balance or 0)
 
 
 @frappe.whitelist()

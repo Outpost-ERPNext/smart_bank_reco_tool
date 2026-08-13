@@ -9,25 +9,27 @@ _DESC_STRIP = re.compile(r'[^a-zA-Z ]')
 class PatternStore:
     def __init__(self):
         self._patterns_cache = None   # loaded once per engine run
-        self._recurring_cache = {}    # party -> bool, avoids repeated DB counts
-
+        self._recurring_cache = None  # populated lazily in is_recurring
     def is_recurring(self, party, amount, months=6):
         if not party or not amount:
             return False
-        if party in self._recurring_cache:
-            return self._recurring_cache[party]
-        since = add_months(nowdate(), -months)
-        count = frappe.db.count(
-            "Bank Transaction",
-            {
-                "party": party,
-                "status": "Reconciled",
-                "date": [">=", since],
-            },
-        )
-        result = count >= 3
-        self._recurring_cache[party] = result
-        return result
+
+        # Load all recurring parties in a single query to avoid N+1 full table scans
+        if self._recurring_cache is None:
+            since = add_months(nowdate(), -months)
+            parties = frappe.db.sql("""
+                SELECT party
+                FROM `tabBank Transaction`
+                WHERE status = 'Reconciled'
+                  AND date >= %s
+                  AND party IS NOT NULL
+                  AND party != ''
+                GROUP BY party
+                HAVING count(name) >= 3
+            """, (since,), pluck=True)
+            self._recurring_cache = {p: True for p in parties}
+
+        return self._recurring_cache.get(party, False)
 
     # ------------------------------------------------------------------
     # Pattern learning helpers

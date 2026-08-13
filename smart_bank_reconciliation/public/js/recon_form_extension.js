@@ -51,6 +51,54 @@ function sbr_clear_ai_cache(frm) {
   if (key) localStorage.removeItem(key);
 }
 
+function sbr_inject_unmatched_suggestions(data) {
+  if (!data || !data.transactions) return;
+  data.suggestions = data.suggestions || [];
+  
+  var suggMap = {};
+  data.suggestions.forEach(function(s) {
+    if (s.bank_txn) suggMap[s.bank_txn] = true;
+  });
+  
+  data.transactions.forEach(function(t) {
+    if (t.recon_queue === "Reconciled") return;
+    if (suggMap[t.name]) return; // Already present
+    
+    var q_raw = t.recon_queue || "Unmatched";
+    var queue = (["Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"].indexOf(q_raw) === -1) ? "Unmatched" : q_raw;
+    var entryNames = [];
+    if (t.recon_matched_entries) {
+      try {
+        entryNames = typeof t.recon_matched_entries === "string"
+          ? JSON.parse(t.recon_matched_entries) : (t.recon_matched_entries || []);
+      } catch (e) { entryNames = []; }
+    }
+    var mType = t.recon_match_type || (entryNames.length > 1 ? "1:Many" : "1:1");
+    var firstName = entryNames[0] || "";
+    var nUp = firstName.toUpperCase();
+    var entryType = nUp.indexOf("-JV-") !== -1 ? "Journal Entry" : "Payment Entry";
+    var txnAmt = parseFloat(t.withdrawal || 0) || parseFloat(t.deposit || 0);
+
+    data.suggestions.push({
+      bank_txn:    t.name,
+      date:        t.date || "",
+      deposit:     t.deposit || 0,
+      withdrawal:  t.withdrawal || 0,
+      description: t.description || "",
+      party:       t.party || "",
+      queue:       queue,
+      confidence:  parseFloat(t.recon_confidence) || 0,
+      matched: entryNames.length ? {
+        name:       firstName,
+        match_type: mType,
+        entry_type: entryType,
+        amount:     txnAmt,
+        entries:    entryNames.map(function (n) { return { name: n }; }),
+      } : null,
+    });
+  });
+}
+
 var _sbr_filter_timer = null;
 function sbr_debounce_filter_load(frm) {
   if (_sbr_filter_timer) clearTimeout(_sbr_filter_timer);
@@ -86,6 +134,7 @@ function sbr_restore_from_cache(frm, $canvas) {
   ReconUI.renderTabShell($canvas, (data.transactions || []).length);
   ReconUI.renderTransactionTable($canvas, data.transactions);
   ReconUI.updateTabBadge($canvas, "bank", (data.transactions || []).length);
+  sbr_inject_unmatched_suggestions(data);
   ReconUI.renderSuggestionsPanel($canvas, data.suggestions);
   ReconUI.renderAIBanner($canvas, data.queue_counts);
   ReconUI.filterByQueue($canvas, null);
@@ -555,7 +604,8 @@ function sbr_load_transactions(frm) {
           // the transaction was never processed by AI; treat it as Unmatched so it
           // appears in the AI Match Pairs tab with the correct count.
           if (t.recon_queue === "Reconciled") return;
-          var queue = t.recon_queue || "Unmatched";
+          var q_raw = t.recon_queue || "Unmatched";
+          var queue = (["Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"].indexOf(q_raw) === -1) ? "Unmatched" : q_raw;
           var entryNames = [];
           if (t.recon_matched_entries) {
             try {
@@ -725,6 +775,7 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
         }
 
         ReconUI.renderSummaryTiles($canvas, data.queue_counts);
+        sbr_inject_unmatched_suggestions(data);
         ReconUI.renderSuggestionsPanel($canvas, data.suggestions);
         ReconUI.renderAIBanner($canvas, data.queue_counts);
         ReconUI.filterByQueue($canvas, null);
@@ -2570,6 +2621,7 @@ function sbr_do_import(frm, $canvas, parsed) {
       ReconUI.renderTransactionTable($canvas, data.transactions);
       ReconUI.updateTabBadge($canvas, "bank", data.transactions.length);
       ReconUI.renderSummaryTiles($canvas, data.queue_counts);
+      sbr_inject_unmatched_suggestions(data);
       ReconUI.renderSuggestionsPanel($canvas, data.suggestions);
       ReconUI.renderAIBanner($canvas, data.queue_counts);
       ReconUI.filterByQueue($canvas, null);
