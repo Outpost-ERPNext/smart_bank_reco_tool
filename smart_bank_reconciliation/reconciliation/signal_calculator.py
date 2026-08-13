@@ -65,7 +65,7 @@ class SignalCalculator:
 
     def _signals(self, txn, entry, bank_amount, is_credit):
         return {
-            "amount": self._amount(bank_amount, float(entry.get("amount") or 0)),
+            "amount": self._amount(bank_amount, float(entry.get("amount") or 0), entry.get("entry_type")),
             "reference": self._reference(txn.get("reference_number") or "", entry),
             "date": self._date(txn.get("date"), entry.get("posting_date") or entry.get("cheque_date")),
             "party": self._party(txn, entry),
@@ -76,11 +76,13 @@ class SignalCalculator:
     def _confidence(self, signals):
         return sum(signals[s] * WEIGHTS[s] for s in WEIGHTS)
 
-    def _amount(self, bank, erp):
+    def _amount(self, bank, erp, entry_type=None):
         if not bank or not erp:
             return 0
         if abs(bank - erp) < 0.01:
             return 100
+        if entry_type in ("Sales Invoice", "Purchase Invoice") and bank < erp:
+            return 70  # Partial payment gives a solid baseline, but needs reference/party to push to Auto/Review
         pct = abs(bank - erp) / max(bank, erp)
         if pct <= self.amount_tolerance_pct:
             return 95

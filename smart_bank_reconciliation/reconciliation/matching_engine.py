@@ -136,18 +136,24 @@ class BankMatchingEngine:
                     if queue not in ("Review", "High-Val", "Duplicate"):
                         queue = "Review"
 
+                is_invoice = best.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
+                draft = draft_gen.build(txn, best_invoice=best) if is_invoice else None
+
                 self._save(
                     txn["name"],
                     queue=queue,
                     confidence=conf,
-                    matched_entries=frappe.as_json(entry_names),
-                    match_type=best.get("match_type"),
+                    matched_entries=frappe.as_json(entry_names) if not is_invoice else None,
+                    match_type=best.get("match_type") or ("Partial Invoice Payment" if is_invoice else None),
                     reasoning=best.get("reasoning"),
                     signals_json=frappe.as_json(best.get("signals", {})),
                     wht_amount=best.get("wht_amount"),
+                    draft_payload=draft,
                 )
                 txn["recon_queue"] = queue
                 txn["recon_confidence"] = conf
+                if draft:
+                    txn["recon_draft_payload"] = draft
                 txn["recon_match_type"] = best.get("match_type")
                 txn["recon_ai_reasoning"] = best.get("reasoning")
                 txn["recon_matched_entries"] = frappe.as_json(entry_names)
@@ -155,6 +161,7 @@ class BankMatchingEngine:
 
             results.append(txn)
 
+        self._process_many_to_one(results, candidates)
         self._flush_saves()
         return results
 
@@ -171,6 +178,72 @@ class BankMatchingEngine:
             "aging": counts.get("Aging", 0),
             "reconciled": counts.get("Reconciled", 0),
         }
+
+    def _process_many_to_one(self, results, candidates):
+        from itertools import combinations
+        from frappe.utils import getdate, date_diff
+
+        unmatched_txns = [t for t in results if t.get("recon_queue") in ("Unmatched", "Aging")]
+        if not unmatched_txns:
+            return
+
+        for entry in candidates:
+            erp_amount = float(entry.get("amount") or 0)
+            if not erp_amount:
+                continue
+
+            erp_date = getdate(entry.get("posting_date") or entry.get("cheque_date"))
+            if not erp_date:
+                continue
+
+            valid_txns = []
+            for t in unmatched_txns:
+                t_date = getdate(t.get("date"))
+                if t_date and abs(date_diff(erp_date, t_date)) <= 7:
+                    valid_txns.append(t)
+
+            if len(valid_txns) < 2:
+                continue
+
+            match_found = False
+            for r in (2, 3):
+                for combo in combinations(valid_txns, r):
+                    is_credit = bool(combo[0].get("deposit"))
+                    if not all(bool(t.get("deposit")) == is_credit for t in combo):
+                        continue
+                    
+                    sum_amount = sum(float(t.get("deposit") or t.get("withdrawal") or 0) for t in combo)
+                    if abs(sum_amount - erp_amount) < 0.01:
+                        for t in combo:
+                            t["recon_queue"] = "Review"
+                            t["recon_match_type"] = "Many:1"
+                            t["recon_ai_reasoning"] = f"Part of a {r}-transaction group matching {entry.get('entry_type')} {entry.get('reference_no', entry.get('name'))}"
+                            t["recon_confidence"] = 85.0
+                            
+                            is_invoice = entry.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
+                            draft = None
+                            if is_invoice:
+                                # We need to build a draft Payment Entry for this specific bank transaction
+                                # against the matched Invoice.
+                                from .draft_generator import DraftGenerator
+                                draft = DraftGenerator().build(t, best_invoice=entry)
+                                t["recon_draft_payload"] = draft
+                            
+                            self._save(
+                                t["name"],
+                                queue="Review",
+                                confidence=85.0,
+                                matched_entries=frappe.as_json([entry["name"]]) if not is_invoice else None,
+                                match_type="Many:1",
+                                reasoning=t["recon_ai_reasoning"],
+                                draft_payload=draft
+                            )
+                            if t in unmatched_txns:
+                                unmatched_txns.remove(t)
+                        match_found = True
+                        break
+                if match_found:
+                    break
 
     def _get_transactions(self):
         filters = {
@@ -211,9 +284,9 @@ class BankMatchingEngine:
                    paid_amount, received_amount, posting_date,
                    reference_no, paid_to, paid_from, remarks
             FROM `tabPayment Entry`
-            WHERE company = %s
+              WHERE company = %s
               AND docstatus = 1
-              AND (clearance_date IS NULL OR clearance_date = '')
+              AND (clearance_date IS NULL OR clearance_date = '0000-00-00')
               AND payment_type IN ('Receive', 'Pay')
               AND posting_date BETWEEN %s AND %s
               AND (paid_to = %s OR paid_from = %s)
@@ -238,7 +311,7 @@ class BankMatchingEngine:
             INNER JOIN `tabJournal Entry Account` jea ON jea.parent = je.name
             WHERE je.company = %s
               AND je.docstatus = 1
-              AND (je.clearance_date IS NULL OR je.clearance_date = '')
+              AND (je.clearance_date IS NULL OR je.clearance_date = '0000-00-00')
               AND je.posting_date BETWEEN %s AND %s
               AND jea.account = %s
             GROUP BY je.name
@@ -253,7 +326,46 @@ class BankMatchingEngine:
             je["entry_type"] = "Journal Entry"
             je["amount"] = float(je.get("total_debit") or je.get("total_credit") or 0)
 
-        return pe_list + je_list
+        return pe_list + je_list + self._get_invoice_candidates(date_from, date_to)
+
+    def _get_invoice_candidates(self, date_from, date_to):
+        si_list = frappe.db.sql(
+            """
+            SELECT name as reference_no, posting_date, customer as party,
+                   outstanding_amount as amount, grand_total, title, po_no as secondary_ref, remarks
+            FROM `tabSales Invoice`
+            WHERE company = %s
+              AND docstatus = 1
+              AND outstanding_amount > 0
+              AND posting_date BETWEEN %s AND %s
+            ORDER BY posting_date DESC
+            """,
+            (self.company, date_from, date_to),
+            as_dict=True,
+        )
+        for si in si_list:
+            si["entry_type"] = "Sales Invoice"
+            si["party_type"] = "Customer"
+
+        pi_list = frappe.db.sql(
+            """
+            SELECT name as reference_no, posting_date, supplier as party,
+                   outstanding_amount as amount, grand_total, title, bill_no as secondary_ref, remarks
+            FROM `tabPurchase Invoice`
+            WHERE company = %s
+              AND docstatus = 1
+              AND outstanding_amount > 0
+              AND posting_date BETWEEN %s AND %s
+            ORDER BY posting_date DESC
+            """,
+            (self.company, date_from, date_to),
+            as_dict=True,
+        )
+        for pi in pi_list:
+            pi["entry_type"] = "Purchase Invoice"
+            pi["party_type"] = "Supplier"
+
+        return list(si_list) + list(pi_list)
 
     def _is_aging(self, txn):
         days = date_diff(nowdate(), getdate(txn["date"]))
