@@ -26,8 +26,8 @@ class PatternStore:
                   AND party != ''
                 GROUP BY party
                 HAVING count(name) >= 3
-            """, (since,), pluck=True)
-            self._recurring_cache = {p: True for p in parties}
+            """, (since,))
+            self._recurring_cache = {p[0]: True for p in parties}
 
         return self._recurring_cache.get(party, False)
 
