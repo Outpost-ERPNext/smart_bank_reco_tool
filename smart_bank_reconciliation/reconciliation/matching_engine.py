@@ -198,12 +198,20 @@ class BankMatchingEngine:
 
             valid_txns = []
             for t in unmatched_txns:
+                amt = float(t.get("deposit") or t.get("withdrawal") or 0)
+                if amt > erp_amount:
+                    continue
                 t_date = getdate(t.get("date"))
                 if t_date and abs(date_diff(erp_date, t_date)) <= 7:
                     valid_txns.append(t)
 
             if len(valid_txns) < 2:
                 continue
+
+            # Prevent combinatorial explosion timeouts on large un-reconciled datasets
+            if len(valid_txns) > 40:
+                valid_txns.sort(key=lambda x: abs(date_diff(erp_date, getdate(x.get("date")))))
+                valid_txns = valid_txns[:40]
 
             match_found = False
             for r in (2, 3):

@@ -637,6 +637,9 @@ function sbr_load_transactions(frm) {
           });
         });
         ReconUI.renderSuggestionsPanel($canvas, reconstructedSuggestions);
+      } else if (data.total > 0 && !frm._sbr_ai_running) {
+        // Auto-run AI matching immediately if no prior AI state exists
+        setTimeout(function() { sbr_run_suggestions(frm); }, 300);
       }
 
       // Fetch balance summary in background (non-blocking)
