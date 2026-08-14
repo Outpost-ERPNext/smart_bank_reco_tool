@@ -246,9 +246,11 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
             expires_in_sec=3600,
         )
     except Exception:
+        traceback_str = frappe.get_traceback()
+        frappe.log_error(title="AI Matching Job Failed", message=traceback_str)
         frappe.cache().set_value(
             job_key,
-            {"status": "error", "message": frappe.get_traceback()},
+            {"status": "error", "message": traceback_str},
             expires_in_sec=600,
         )
 

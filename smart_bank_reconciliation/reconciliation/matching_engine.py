@@ -339,7 +339,7 @@ class BankMatchingEngine:
     def _get_invoice_candidates(self, date_from, date_to):
         si_list = frappe.db.sql(
             """
-            SELECT name as reference_no, posting_date, customer as party,
+            SELECT name, name as reference_no, posting_date, customer as party,
                    outstanding_amount as amount, grand_total, title, po_no as secondary_ref, remarks
             FROM `tabSales Invoice`
             WHERE company = %s
@@ -354,10 +354,11 @@ class BankMatchingEngine:
         for si in si_list:
             si["entry_type"] = "Sales Invoice"
             si["party_type"] = "Customer"
+            si["name"] = si["reference_no"]
 
         pi_list = frappe.db.sql(
             """
-            SELECT name as reference_no, posting_date, supplier as party,
+            SELECT name, name as reference_no, posting_date, supplier as party,
                    outstanding_amount as amount, grand_total, title, bill_no as secondary_ref, remarks
             FROM `tabPurchase Invoice`
             WHERE company = %s
@@ -372,6 +373,7 @@ class BankMatchingEngine:
         for pi in pi_list:
             pi["entry_type"] = "Purchase Invoice"
             pi["party_type"] = "Supplier"
+            pi["name"] = pi["reference_no"]
 
         return list(si_list) + list(pi_list)
 

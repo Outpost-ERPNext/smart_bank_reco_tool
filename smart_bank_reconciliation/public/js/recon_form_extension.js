@@ -762,7 +762,15 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
           frm._sbr_ai_running = false;
           sbr_build_toolbar(frm);
           frm.page.set_indicator(__("Error"), "red");
-          frappe.msgprint(__("AI matching failed. Check the error log and try again."));
+          var detail = result.message
+            ? "<pre style=\"white-space:pre-wrap;max-height:300px;overflow:auto;\">" +
+              frappe.utils.escape_html(result.message) + "</pre>"
+            : "";
+          frappe.msgprint({
+            title: __("AI Matching Failed"),
+            indicator: "red",
+            message: __("AI matching failed. This has been logged to the Error Log.") + detail,
+          });
           return;
         }
 
