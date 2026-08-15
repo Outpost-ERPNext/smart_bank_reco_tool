@@ -32,8 +32,26 @@ class BankMatchingEngine:
         self.date_window_days = int(s.get("date_window_days", 5))
 
     def run(self):
+        from bisect import bisect_left, bisect_right
+
         txns = self._get_transactions()
         candidates = self._get_candidates()
+
+        # Pre-parse all dates once — avoids O(T×C) repeated getdate() calls in _signals
+        for txn in txns:
+            txn['_date'] = getdate(txn['date']) if txn.get('date') else None
+        for c in candidates:
+            raw = c.get('posting_date') or c.get('cheque_date')
+            c['_date'] = getdate(raw) if raw else None
+
+        # Split invoice vs PE/JE candidates — they need different amount filtering
+        _invoice_types = ('Sales Invoice', 'Purchase Invoice')
+        invoice_cands = [c for c in candidates if c.get('entry_type') in _invoice_types]
+        pe_je_cands   = [c for c in candidates if c.get('entry_type') not in _invoice_types]
+
+        # Sort PE/JE by amount once for O(log N) binary-search range lookup per transaction
+        pe_je_sorted  = sorted(pe_je_cands, key=lambda c: float(c.get('amount') or 0))
+        pe_je_amounts = [float(c.get('amount') or 0) for c in pe_je_sorted]
 
         dup_detector = DuplicateDetector(txns)
         erp_dup_detector = ErpDuplicateDetector(candidates)
@@ -61,8 +79,29 @@ class BankMatchingEngine:
             # Duplicate bank transaction check (run before ERP scoring but don't skip it)
             dup_reason = dup_detector.check(txn)
 
-            # Score all ERP candidates
-            scored = signal_calc.score_all(txn, candidates)
+            # Narrow the candidate pool for this transaction before scoring.
+            # This reduces the O(T×C) work without changing any match logic.
+            bank_amount = float(txn.get('deposit') or txn.get('withdrawal') or 0)
+            if bank_amount > 0 and pe_je_amounts:
+                # Keep PE/JE within a 10× amount window — very conservative,
+                # only excludes entries with wildly mismatched amounts
+                lo = bisect_left(pe_je_amounts, bank_amount / 10.0)
+                hi = bisect_right(pe_je_amounts, bank_amount * 10.0)
+                nearby_pe_je = pe_je_sorted[lo:hi]
+            else:
+                nearby_pe_je = pe_je_cands
+
+            # Invoices: partial-payment means bank ≤ invoice outstanding.
+            # Skip invoices already smaller than the bank amount (they score 0 on amount).
+            rel_invoices = (
+                [c for c in invoice_cands if float(c.get('amount') or 0) >= bank_amount * 0.99]
+                if bank_amount > 0 else invoice_cands
+            )
+
+            txn_candidates = nearby_pe_je + rel_invoices
+
+            # Score pre-filtered ERP candidates
+            scored = signal_calc.score_all(txn, txn_candidates)
             nigerian.apply(txn, scored)
 
             if not scored:

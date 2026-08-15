@@ -67,7 +67,11 @@ class SignalCalculator:
         return {
             "amount": self._amount(bank_amount, float(entry.get("amount") or 0), entry.get("entry_type")),
             "reference": self._reference(txn.get("reference_number") or "", entry),
-            "date": self._date(txn.get("date"), entry.get("posting_date") or entry.get("cheque_date")),
+            # Use pre-parsed _date objects when available (set by matching_engine.run())
+            "date": self._date(
+                txn.get("_date") or txn.get("date"),
+                entry.get("_date") or entry.get("posting_date") or entry.get("cheque_date"),
+            ),
             "party": self._party(txn, entry),
             "side": self._side(is_credit, entry),
             "history": self._history(txn, entry),
@@ -112,7 +116,8 @@ class SignalCalculator:
     def _date(self, bank_date, erp_date):
         if not bank_date or not erp_date:
             return 50
-        diff = abs(date_diff(getdate(bank_date), getdate(erp_date)))
+        # Accept pre-parsed date objects (set by matching_engine) or raw strings
+        diff = abs(date_diff(bank_date, erp_date))
         if diff == 0:
             return 100
         if diff == 1:
@@ -126,6 +131,8 @@ class SignalCalculator:
         b = (entry.get("party") or entry.get("pay_to_recd_from") or "").strip().upper()
         if not a or not b:
             return 50
+        if a == b:
+            return 100  # exact match — skip expensive fuzzy
         return _fuzzy(a, b)
 
     def _side(self, is_credit, entry):
