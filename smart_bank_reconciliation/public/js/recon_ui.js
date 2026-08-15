@@ -22,11 +22,29 @@ window.ReconUI = (function () {
   function _guessEntryRoute(name) {
     var n = (name || "").toUpperCase();
     if (n.indexOf("-JV-")    !== -1) return "journal-entry";
+    if (n.indexOf("-PINV-")  !== -1) return "purchase-invoice";
     if (n.indexOf("-SI-")    !== -1) return "sales-invoice";
     if (n.indexOf("-PI-")    !== -1) return "purchase-invoice";
-    // Matching engine only produces Payment Entry and Journal Entry candidates,
-    // so any non-JE entry in recon_matched_entries must be a Payment Entry.
+    if (n.indexOf("SINV-")   !== -1) return "sales-invoice";
+    if (/^INV-/.test(n))             return "sales-invoice";
+    if (/^PINV-/.test(n))            return "purchase-invoice";
     return "payment-entry";
+  }
+
+  function _entryRoute(entryType, name) {
+    if (entryType === "Payment Entry")    return "payment-entry";
+    if (entryType === "Journal Entry")    return "journal-entry";
+    if (entryType === "Sales Invoice")    return "sales-invoice";
+    if (entryType === "Purchase Invoice") return "purchase-invoice";
+    return _guessEntryRoute(name);
+  }
+
+  function _entryTypeShort(entryType) {
+    if (entryType === "Payment Entry")    return "PE";
+    if (entryType === "Journal Entry")    return "JE";
+    if (entryType === "Sales Invoice")    return "SI";
+    if (entryType === "Purchase Invoice") return "PI";
+    return "ERP";
   }
 
   var TILE_TO_QUEUE = {
@@ -1427,8 +1445,8 @@ window.ReconUI = (function () {
             ? JSON.parse(s.draft_payload) : s.draft_payload;
           var etype = draft.entry_type || "JE";
           html += '<button class="sbr-btn sbr-btn-draft" data-txn="' + s.bank_txn +
-                  '" data-etype="' + etype + "' data-draft='" + JSON.stringify(draft) +
-                  "'>+ Create " + etype + "</button>";
+                  '" data-etype="' + etype + '" data-draft="' + JSON.stringify(draft).replace(/"/g, '&quot;') +
+                  '">+ Create ' + etype + '</button>';
         } catch (e) { /* ignore */ }
       }
       html +=
@@ -2170,7 +2188,7 @@ window.ReconUI = (function () {
   /* ── Aging ERP alerts section (Gap 4) ── */
 
   function renderAgingErpAlerts($container, entries, agingDays) {
-    if (!entries || !entries.length) return;
+    return; // section hidden per user preference
     var $panel = $container.find(".sbr-suggestion-panel");
     if (!$panel.length) return;
 
@@ -2208,8 +2226,8 @@ window.ReconUI = (function () {
             e.days_old + 'd overdue</span>' +
           '<span style="font-size:11px;color:#475569;background:#f1f5f9;' +
             'padding:2px 6px;border-radius:4px;font-family:ui-monospace,monospace">' +
-            (e.entry_type === "Payment Entry" ? "PE" : "JE") + '</span>' +
-          '<a href="/app/' + (e.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry") + "/" + encodeURIComponent(e.name) + '" target="_blank" ' +
+            _entryTypeShort(e.entry_type) + '</span>' +
+          '<a href="/app/' + _entryRoute(e.entry_type, e.name) + "/" + encodeURIComponent(e.name) + '" target="_blank" ' +
             'style="font-family:ui-monospace,monospace;font-size:11px;color:#1d4ed8;' +
             'text-decoration:none;font-weight:600" onclick="event.stopPropagation()">' +
             e.name + '</a>' +

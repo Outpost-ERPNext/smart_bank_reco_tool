@@ -31,7 +31,7 @@ class DraftGenerator:
                 "references": [
                     {
                         "reference_doctype": doctype,
-                        "reference_name": best_invoice.get("reference_no"),
+                        "reference_name": best_invoice.get("name"),
                         "allocated_amount": amount
                     }
                 ]

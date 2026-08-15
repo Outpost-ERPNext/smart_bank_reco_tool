@@ -637,8 +637,10 @@ function sbr_load_transactions(frm) {
           });
         });
         ReconUI.renderSuggestionsPanel($canvas, reconstructedSuggestions);
-      } else if (data.total > 0 && !frm._sbr_ai_running) {
-        // Auto-run AI matching immediately if no prior AI state exists
+      }
+      // Always auto-run fresh AI so counts are never stale DB values from a prior run.
+      // If hasActiveAI restored DB data above, the fresh run overwrites it with correct counts.
+      if (data.total > 0 && !frm._sbr_ai_running) {
         setTimeout(function() { sbr_run_suggestions(frm); }, 300);
       }
 

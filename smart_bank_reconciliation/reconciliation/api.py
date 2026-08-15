@@ -743,6 +743,13 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
             doc.paid_to = gl_account
         else:
             doc.paid_from = gl_account
+        for ref in prefill.get("references") or []:
+            if ref.get("reference_doctype") and ref.get("reference_name"):
+                doc.append("references", {
+                    "reference_doctype": ref["reference_doctype"],
+                    "reference_name":    ref["reference_name"],
+                    "allocated_amount":  float(ref.get("allocated_amount") or paid_amount),
+                })
         doc.insert(ignore_permissions=True)
     else:
         dep = float(bt_data.get("deposit") or 0)
