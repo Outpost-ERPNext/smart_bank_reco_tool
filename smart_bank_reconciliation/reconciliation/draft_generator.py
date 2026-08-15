@@ -26,6 +26,7 @@ class DraftGenerator:
                 "party": best_invoice.get("party"),
                 "paid_to" if is_sales else "paid_from": txn.get("bank_account"),
                 "reference_no": ref,
+                "reference_date": date_str,
                 "posting_date": date_str,
                 "remarks": f"Partial payment for {best_invoice.get('reference_no')} - {desc}",
                 "references": [
@@ -90,6 +91,7 @@ class DraftGenerator:
                 "party": txn.get("party") or "Suspense",
                 "paid_to": txn.get("bank_account"),
                 "reference_no": ref,
+                "reference_date": date_str,
                 "posting_date": date_str,
                 "remarks": desc,
             })
@@ -103,6 +105,7 @@ class DraftGenerator:
             "party": txn.get("party") or "Suspense",
             "paid_from": txn.get("bank_account"),
             "reference_no": ref,
+            "reference_date": date_str,
             "posting_date": date_str,
             "remarks": desc,
         })
