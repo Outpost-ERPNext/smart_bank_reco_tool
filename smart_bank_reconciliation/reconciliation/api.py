@@ -752,7 +752,7 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
                     "reference_name":    ref["reference_name"],
                     "allocated_amount":  float(ref.get("allocated_amount") or paid_amount),
                 })
-        doc.insert(ignore_permissions=True)
+        doc.insert(ignore_permissions=True, ignore_mandatory=True)
     else:
         dep = float(bt_data.get("deposit") or 0)
         wit = float(bt_data.get("withdrawal") or 0)
@@ -786,7 +786,7 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
             amount = prefill.get("amount", 0)
             doc.append("accounts", {"account": prefill.get("debit_account", ""), "debit_in_account_currency": amount})
             doc.append("accounts", {"account": prefill.get("credit_account", ""), "credit_in_account_currency": amount})
-        doc.insert(ignore_permissions=True)
+        doc.insert(ignore_permissions=True, ignore_mandatory=True)
 
     return {"doctype": doc.doctype, "name": doc.name}
 
