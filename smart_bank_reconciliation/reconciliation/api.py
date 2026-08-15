@@ -730,8 +730,10 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
         doc.party           = prefill.get("party", "")
         doc.paid_amount     = paid_amount
         doc.received_amount = paid_amount
-        doc.reference_no    = prefill.get("reference_no", "")
-        doc.reference_date  = prefill.get("reference_date", "")
+        doc.reference_no    = prefill.get("reference_no", "") or \
+                              frappe.db.get_value("Bank Transaction", bank_transaction, "reference_number") or \
+                              str(prefill.get("posting_date", nowdate()))
+        doc.reference_date  = prefill.get("reference_date", "") or prefill.get("posting_date", "") or nowdate()
         doc.remarks         = prefill.get("remarks", "")
         if prefill.get("mode_of_payment"):
             doc.mode_of_payment = prefill["mode_of_payment"]

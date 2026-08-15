@@ -486,6 +486,7 @@ function sbr_build_toolbar(frm) {
             frm._sbr_ai_done = false;
             sbr_clear_ai_cache(frm); // remove persisted results for this period
             sbr_build_toolbar(frm);
+            frm._sbr_no_auto_ai = true; // reset should never trigger auto AI
             sbr_load_transactions(frm);
             frappe.show_alert({ message: __("AI suggestions cleared. Run AI Match All to re-analyse."), indicator: "orange" });
           },
@@ -585,64 +586,11 @@ function sbr_load_transactions(frm) {
         sbr_render_inline_upload(frm, $canvas);
       }
 
-      // If transactions carry prior AI queue assignments, restore the banner + toolbar state
-      var hasActiveAI = (qCounts.auto || 0) + (qCounts.review || 0) + (qCounts.unmatched || 0) +
-                        (qCounts.high_val || 0) + (qCounts.duplicate || 0) + (qCounts.aging || 0);
-      if (hasActiveAI > 0) {
-        ReconUI.renderAIBanner($canvas, qCounts);
-        frm._sbr_ai_done = true;
-        frm._sbr_auto_count  = qCounts.auto   || 0;
-        frm._sbr_review_count = qCounts.review || 0;
-        sbr_build_toolbar(frm);
-        frm.page.set_indicator(__("Done"), "green");
-
-        // Rebuild the suggestions cache from DB fields so the Reconcile modal
-        // can pre-select the AI-matched ERP entry and the AI Match Pairs tab shows cards.
-        var reconstructedSuggestions = [];
-        (data.transactions || []).forEach(function (t) {
-          // Include ALL non-Reconciled transactions — null/empty recon_queue means
-          // the transaction was never processed by AI; treat it as Unmatched so it
-          // appears in the AI Match Pairs tab with the correct count.
-          if (t.recon_queue === "Reconciled") return;
-          var q_raw = t.recon_queue || "Unmatched";
-          var queue = (["Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"].indexOf(q_raw) === -1) ? "Unmatched" : q_raw;
-          var entryNames = [];
-          if (t.recon_matched_entries) {
-            try {
-              entryNames = typeof t.recon_matched_entries === "string"
-                ? JSON.parse(t.recon_matched_entries) : (t.recon_matched_entries || []);
-            } catch (e) { entryNames = []; }
-          }
-          var mType = t.recon_match_type || (entryNames.length > 1 ? "1:Many" : "1:1");
-          var firstName = entryNames[0] || "";
-          var nUp = firstName.toUpperCase();
-          var entryType = nUp.indexOf("-JV-") !== -1 ? "Journal Entry" : "Payment Entry";
-          var txnAmt = parseFloat(t.withdrawal || 0) || parseFloat(t.deposit || 0);
-          reconstructedSuggestions.push({
-            bank_txn:    t.name,
-            date:        t.date || "",
-            deposit:     t.deposit || 0,
-            withdrawal:  t.withdrawal || 0,
-            description: t.description || "",
-            party:       t.party || "",
-            queue:       queue,
-            confidence:  parseFloat(t.recon_confidence) || 0,
-            matched: entryNames.length ? {
-              name:       firstName,
-              match_type: mType,
-              entry_type: entryType,
-              amount:     txnAmt,
-              entries:    entryNames.map(function (n) { return { name: n }; }),
-            } : null,
-          });
-        });
-        ReconUI.renderSuggestionsPanel($canvas, reconstructedSuggestions);
-      }
-      // Always auto-run fresh AI so counts are never stale DB values from a prior run.
-      // If hasActiveAI restored DB data above, the fresh run overwrites it with correct counts.
-      if (data.total > 0 && !frm._sbr_ai_running) {
+      // Auto-run fresh AI on every load; skip only after manual Reset AI.
+      if (data.total > 0 && !frm._sbr_ai_running && !frm._sbr_no_auto_ai) {
         setTimeout(function() { sbr_run_suggestions(frm); }, 300);
       }
+      frm._sbr_no_auto_ai = false;
 
       // Fetch balance summary in background (non-blocking)
       frappe.call({
