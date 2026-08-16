@@ -223,34 +223,46 @@ class BankMatchingEngine:
         from frappe.utils import getdate, date_diff
 
         unmatched_txns = [t for t in results if t.get("recon_queue") in ("Unmatched", "Aging")]
-        if not unmatched_txns:
+        if len(unmatched_txns) < 2:
             return
 
-        for entry in candidates:
+        # Pre-compute total so we can skip ERP entries that exceed what the
+        # bank transactions could ever sum to — cheap O(U) guard.
+        total_unmatched = sum(
+            float(t.get("deposit") or t.get("withdrawal") or 0) for t in unmatched_txns
+        )
+
+        # Invoices are matched in the main scoring loop; only PE/JE can be
+        # split across multiple bank transactions as Many:1.
+        _inv_types = ("Sales Invoice", "Purchase Invoice")
+        pe_je_candidates = [c for c in candidates if c.get("entry_type") not in _inv_types]
+
+        for entry in pe_je_candidates:
             erp_amount = float(entry.get("amount") or 0)
-            if not erp_amount:
+            if not erp_amount or erp_amount > total_unmatched:
                 continue
 
-            erp_date = getdate(entry.get("posting_date") or entry.get("cheque_date"))
+            # Use pre-parsed _date when available (set by run()) to avoid repeated getdate()
+            erp_date = entry.get("_date") or getdate(entry.get("posting_date") or entry.get("cheque_date"))
             if not erp_date:
                 continue
 
             valid_txns = []
             for t in unmatched_txns:
                 amt = float(t.get("deposit") or t.get("withdrawal") or 0)
-                if amt > erp_amount:
+                if amt >= erp_amount:
                     continue
-                t_date = getdate(t.get("date"))
+                t_date = t.get("_date") or getdate(t.get("date"))
                 if t_date and abs(date_diff(erp_date, t_date)) <= 7:
                     valid_txns.append(t)
 
             if len(valid_txns) < 2:
                 continue
 
-            # Prevent combinatorial explosion timeouts on large un-reconciled datasets
-            if len(valid_txns) > 40:
-                valid_txns.sort(key=lambda x: abs(date_diff(erp_date, getdate(x.get("date")))))
-                valid_txns = valid_txns[:40]
+            # Cap at 15: C(15,2)+C(15,3)=560 vs C(40,2)+C(40,3)=10,660 — 19× reduction
+            if len(valid_txns) > 15:
+                valid_txns.sort(key=lambda x: abs(date_diff(erp_date, x.get("_date") or getdate(x.get("date")))))
+                valid_txns = valid_txns[:15]
 
             match_found = False
             for r in (2, 3):
@@ -266,24 +278,13 @@ class BankMatchingEngine:
                             t["recon_match_type"] = "Many:1"
                             t["recon_ai_reasoning"] = f"Part of a {r}-transaction group matching {entry.get('entry_type')} {entry.get('reference_no', entry.get('name'))}"
                             t["recon_confidence"] = 85.0
-                            
-                            is_invoice = entry.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
-                            draft = None
-                            if is_invoice:
-                                # We need to build a draft Payment Entry for this specific bank transaction
-                                # against the matched Invoice.
-                                from .draft_generator import DraftGenerator
-                                draft = DraftGenerator().build(t, best_invoice=entry)
-                                t["recon_draft_payload"] = draft
-                            
                             self._save(
                                 t["name"],
                                 queue="Review",
                                 confidence=85.0,
-                                matched_entries=frappe.as_json([entry["name"]]) if not is_invoice else None,
+                                matched_entries=frappe.as_json([entry["name"]]),
                                 match_type="Many:1",
                                 reasoning=t["recon_ai_reasoning"],
-                                draft_payload=draft
                             )
                             if t in unmatched_txns:
                                 unmatched_txns.remove(t)
@@ -312,9 +313,9 @@ class BankMatchingEngine:
         )
 
     def _get_candidates(self):
-        # Expand search window 60 days beyond the statement range to catch late-posted entries
-        date_from = add_days(getdate(self.from_date), -60)
-        date_to   = add_days(getdate(self.to_date),   60)
+        # Expand search window 30 days beyond the statement range to catch late-posted entries
+        date_from = add_days(getdate(self.from_date), -30)
+        date_to   = add_days(getdate(self.to_date),   30)
 
         # Resolve the GL account linked to the selected bank account so we can
         # restrict candidates to entries that actually touched this bank account.

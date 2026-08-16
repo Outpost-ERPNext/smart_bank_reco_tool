@@ -44,23 +44,28 @@ class SignalCalculator:
                 continue
             scored.append(self._build_result(entry, signals, confidence))
 
-        # Try 1:Many subset-sum
-        subset = self._subset_sum(txn, bank_amount, candidates)
-        if subset and len(subset) > 1:
-            sig = self._subset_signals(txn, subset, is_credit)
-            conf = self._confidence(sig)
-            scored.append({
-                "name": f"1:Many({len(subset)})",
-                "entry_type": "Payment Entry",
-                "confidence": round(conf, 1),
-                "signals": sig,
-                "match_type": "1:Many",
-                "reasoning": f"Sum of {len(subset)} Payment Entries equals bank amount",
-                "entries": subset,
-                "amount": bank_amount,
-            })
-
         scored.sort(key=lambda x: x["confidence"], reverse=True)
+
+        # Try 1:Many subset-sum only when no strong 1:1 match exists.
+        # Skip when best confidence is already >= 90 — the combinations search
+        # is expensive and can't improve on an already-auto match.
+        if not (scored and scored[0]["confidence"] >= 90):
+            subset = self._subset_sum(txn, bank_amount, candidates)
+            if subset and len(subset) > 1:
+                sig = self._subset_signals(txn, subset, is_credit)
+                conf = self._confidence(sig)
+                scored.append({
+                    "name": f"1:Many({len(subset)})",
+                    "entry_type": "Payment Entry",
+                    "confidence": round(conf, 1),
+                    "signals": sig,
+                    "match_type": "1:Many",
+                    "reasoning": f"Sum of {len(subset)} Payment Entries equals bank amount",
+                    "entries": subset,
+                    "amount": bank_amount,
+                })
+            scored.sort(key=lambda x: x["confidence"], reverse=True)
+
         return scored
 
     def _signals(self, txn, entry, bank_amount, is_credit):

@@ -686,9 +686,10 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
 
   var elapsed = 0;
   var MAX_WAIT = 600; // 10 minutes
+  var POLL_INTERVAL = 3000; // ms between polls
 
-  frm._sbr_poll_timer = setInterval(function () {
-    elapsed += 4;
+  function doPoll() {
+    elapsed += POLL_INTERVAL / 1000;
     if (elapsed > MAX_WAIT) {
       clearInterval(frm._sbr_poll_timer);
       frm._sbr_ai_running = false;
@@ -769,7 +770,12 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
         });
       },
     });
-  }, 4000); // poll every 4 seconds
+  }
+
+  // First quick check at 1.5 s (fast for small batches), then steady 3 s poll
+  if (frm._sbr_first_poll) { clearTimeout(frm._sbr_first_poll); }
+  frm._sbr_first_poll = setTimeout(doPoll, 1500);
+  frm._sbr_poll_timer = setInterval(doPoll, POLL_INTERVAL);
 }
 
 /* ── Bulk Approve Auto ── */
