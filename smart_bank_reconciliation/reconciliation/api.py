@@ -328,6 +328,11 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
         elif frappe.db.exists("Journal Entry", entry_name):
             _update_with_retry("tabJournal Entry", entry_name, clearance_date)
             payment_document = "Journal Entry"
+        elif frappe.db.exists("Sales Invoice", entry_name) or frappe.db.exists("Purchase Invoice", entry_name):
+            frappe.throw(
+                "Cannot reconcile bank transaction directly against invoice {0}. "
+                "Create a Payment Entry for the invoice first, then reconcile against the Payment Entry.".format(entry_name)
+            )
         else:
             continue
 
@@ -870,7 +875,6 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         fields=["name", "posting_date", "payment_type", "party",
                 "paid_amount", "received_amount", "reference_no"],
         order_by="posting_date desc",
-        limit=200,
     )
     for pe in pes:
         pe_amount = float(pe.paid_amount or 0) or float(pe.received_amount or 0)
@@ -897,7 +901,6 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         filters=je_filters,
         fields=["name", "posting_date", "total_debit", "total_credit", "cheque_no", "remark"],
         order_by="posting_date desc",
-        limit=200,
     )
     for je in jes:
         je_amount = float(je.total_debit or 0) or float(je.total_credit or 0)
@@ -924,7 +927,6 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         filters=pi_filters,
         fields=["name", "posting_date", "supplier", "grand_total", "bill_no"],
         order_by="posting_date desc",
-        limit=200,
     )
     for pi in pis:
         vouchers.append({
@@ -950,7 +952,6 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         filters=si_filters,
         fields=["name", "posting_date", "customer", "grand_total"],
         order_by="posting_date desc",
-        limit=200,
     )
     for si in sis:
         vouchers.append({
@@ -983,7 +984,9 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
 
 
 def _inject_preselected(entry_name, vouchers):
-    """Fetch a specific ERP entry by name and prepend it to the voucher list."""
+    """Fetch a specific ERP entry by name and prepend it to the voucher list.
+    Handles PE, JE, Sales Invoice, and Purchase Invoice — covers all entry types
+    the AI can suggest so the preselected match is always visible in the modal."""
     # Try Payment Entry
     pe = frappe.db.get_value(
         "Payment Entry", entry_name,
@@ -1016,6 +1019,40 @@ def _inject_preselected(entry_name, vouchers):
             "amount":       float(je.total_debit or 0) or float(je.total_credit or 0),
             "reference":    je.cheque_no or "",
             "payment_type": je.voucher_type or "",
+        })
+        return
+    # Try Sales Invoice
+    si = frappe.db.get_value(
+        "Sales Invoice", entry_name,
+        ["name", "posting_date", "customer", "grand_total"],
+        as_dict=True,
+    )
+    if si:
+        vouchers.insert(0, {
+            "name":         si.name,
+            "type":         "Sales Invoice",
+            "date":         str(si.posting_date or ""),
+            "party":        si.customer or "",
+            "amount":       float(si.grand_total or 0),
+            "reference":    "",
+            "payment_type": "",
+        })
+        return
+    # Try Purchase Invoice
+    pi = frappe.db.get_value(
+        "Purchase Invoice", entry_name,
+        ["name", "posting_date", "supplier", "grand_total", "bill_no"],
+        as_dict=True,
+    )
+    if pi:
+        vouchers.insert(0, {
+            "name":         pi.name,
+            "type":         "Purchase Invoice",
+            "date":         str(pi.posting_date or ""),
+            "party":        pi.supplier or "",
+            "amount":       float(pi.grand_total or 0),
+            "reference":    pi.bill_no or "",
+            "payment_type": "",
         })
 
 

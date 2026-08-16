@@ -993,6 +993,30 @@ window.ReconUI = (function () {
         frappe.msgprint(__("Please select a voucher to reconcile against."));
         return;
       }
+
+      // Block direct reconciliation against invoices — bank transactions must be
+      // linked to a Payment Entry or Journal Entry, not to an invoice directly.
+      if (action === "match" && selectedVoucher) {
+        var selType = "";
+        for (var k = 0; k < allVouchers.length; k++) {
+          if (allVouchers[k].name === selectedVoucher) { selType = allVouchers[k].type; break; }
+        }
+        if (selType === "Sales Invoice" || selType === "Purchase Invoice") {
+          frappe.msgprint({
+            title: __("Cannot Reconcile Against Invoice"),
+            indicator: "orange",
+            message: __(
+              "<b>{0}</b> is a {1}. Bank transactions must be reconciled against a " +
+              "<b>Payment Entry</b> or <b>Journal Entry</b>.<br><br>" +
+              "Use the <b>Create PE</b> button on this transaction to create a Payment Entry " +
+              "for the invoice, then reconcile against that Payment Entry.",
+              [selectedVoucher, selType]
+            ),
+          });
+          return;
+        }
+      }
+
       if (typeof onConfirm === "function") {
         onConfirm({ pane: action, selectedVoucher: selectedVoucher, note: "" }, $modal);
       }
