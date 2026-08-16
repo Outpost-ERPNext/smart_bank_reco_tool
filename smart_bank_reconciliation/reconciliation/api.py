@@ -752,10 +752,18 @@ def create_draft_entry(bank_transaction, entry_type, prefill):
             doc.paid_from = gl_account
         for ref in prefill.get("references") or []:
             if ref.get("reference_doctype") and ref.get("reference_name"):
+                inv_data = frappe.db.get_value(
+                    ref["reference_doctype"], ref["reference_name"],
+                    ["outstanding_amount", "grand_total", "due_date"],
+                    as_dict=True,
+                ) or {}
                 doc.append("references", {
-                    "reference_doctype": ref["reference_doctype"],
-                    "reference_name":    ref["reference_name"],
-                    "allocated_amount":  float(ref.get("allocated_amount") or paid_amount),
+                    "reference_doctype":  ref["reference_doctype"],
+                    "reference_name":     ref["reference_name"],
+                    "allocated_amount":   float(ref.get("allocated_amount") or paid_amount),
+                    "outstanding_amount": float(inv_data.get("outstanding_amount") or 0),
+                    "total_amount":       float(inv_data.get("grand_total") or 0),
+                    "due_date":           inv_data.get("due_date"),
                 })
         doc.insert(ignore_permissions=True, ignore_mandatory=True)
     else:
@@ -963,6 +971,22 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             "reference":    "",
             "payment_type": "",
         })
+
+    # If the AI suggested an invoice and a submitted PE already references it, surface that PE instead.
+    # This covers the case where user created the PE (via "+ Create PE"), submitted it, and came back.
+    if preselected_entry and (
+        frappe.db.exists("Sales Invoice", preselected_entry) or
+        frappe.db.exists("Purchase Invoice", preselected_entry)
+    ):
+        pe_refs = frappe.db.get_all(
+            "Payment Entry Reference",
+            filters={"reference_name": preselected_entry},
+            fields=["parent"],
+        )
+        for per in pe_refs:
+            if frappe.db.get_value("Payment Entry", per.parent, "docstatus") == 1:
+                preselected_entry = per.parent
+                break
 
     # If an AI-suggested entry was specified but isn't in the ±60-day window, fetch and inject it.
     if preselected_entry:
