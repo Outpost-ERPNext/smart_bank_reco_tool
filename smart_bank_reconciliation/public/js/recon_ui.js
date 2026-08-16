@@ -1035,6 +1035,14 @@ window.ReconUI = (function () {
           return;
         }
         allVouchers = r.message;
+        // If AI matched an invoice but backend resolved it to a submitted PE (returned at position 0),
+        // promote that PE to preselectedName so its radio gets pre-checked.
+        var aiMatchedInvoice = suggestion && suggestion.matched &&
+            (suggestion.matched.entry_type === "Sales Invoice" ||
+             suggestion.matched.entry_type === "Purchase Invoice");
+        if (aiMatchedInvoice && allVouchers.length > 0 && allVouchers[0].type === "Payment Entry") {
+          preselectedName = allVouchers[0].name;
+        }
         applyFilters();
       },
     });
