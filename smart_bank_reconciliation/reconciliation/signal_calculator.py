@@ -69,29 +69,14 @@ class SignalCalculator:
         return scored
 
     def _signals(self, txn, entry, bank_amount, is_credit):
-        amount_score = self._amount(bank_amount, float(entry.get("amount") or 0), entry.get("entry_type"))
-        date_score = self._date(
-            txn.get("_date") or txn.get("date"),
-            entry.get("_date") or entry.get("posting_date") or entry.get("cheque_date"),
-        )
-        
-        # Fast exit optimization: if amount and date are both totally wrong, it is statistically
-        # impossible to reach the 60% Review threshold (max possible score is ~45).
-        # We skip expensive fuzzy string matching (difflib) which causes timeouts on huge datasets.
-        if amount_score == 0 and date_score == 0:
-            return {
-                "amount": 0,
-                "date": 0,
-                "reference": 0,
-                "party": 0,
-                "side": self._side(is_credit, entry),
-                "history": 0,
-            }
-
         return {
-            "amount": amount_score,
+            "amount": self._amount(bank_amount, float(entry.get("amount") or 0), entry.get("entry_type")),
             "reference": self._reference(txn.get("reference_number") or "", entry),
-            "date": date_score,
+            # Use pre-parsed _date objects when available (set by matching_engine.run())
+            "date": self._date(
+                txn.get("_date") or txn.get("date"),
+                entry.get("_date") or entry.get("posting_date") or entry.get("cheque_date"),
+            ),
             "party": self._party(txn, entry),
             "side": self._side(is_credit, entry),
             "history": self._history(txn, entry),
