@@ -53,6 +53,11 @@ class BankMatchingEngine:
         pe_je_sorted  = sorted(pe_je_cands, key=lambda c: float(c.get('amount') or 0))
         pe_je_amounts = [float(c.get('amount') or 0) for c in pe_je_sorted]
 
+        # Same treatment for invoices, so a tiny transaction doesn't get scored
+        # (incl. fuzzy party match) against every outstanding invoice in the range.
+        invoice_sorted  = sorted(invoice_cands, key=lambda c: float(c.get('amount') or 0))
+        invoice_amounts = [float(c.get('amount') or 0) for c in invoice_sorted]
+
         dup_detector = DuplicateDetector(txns)
         erp_dup_detector = ErpDuplicateDetector(candidates)
         signal_calc = SignalCalculator(
@@ -91,12 +96,18 @@ class BankMatchingEngine:
             else:
                 nearby_pe_je = pe_je_cands
 
-            # Invoices: partial-payment means bank ≤ invoice outstanding.
-            # Skip invoices already smaller than the bank amount (they score 0 on amount).
-            rel_invoices = (
-                [c for c in invoice_cands if float(c.get('amount') or 0) >= bank_amount * 0.99]
-                if bank_amount > 0 else invoice_cands
-            )
+            # Invoices: partial-payment means bank <= invoice outstanding, so the lower
+            # bound stays at bank_amount (no partial payment can exceed the invoice).
+            # Upper bound mirrors the PE/JE 10x window — a real partial payment is
+            # never a tiny fraction of a wildly larger invoice, and without this bound
+            # a small transaction (e.g. a bank charge) was scoring against every
+            # outstanding invoice in the whole date range.
+            if bank_amount > 0 and invoice_amounts:
+                lo_inv = bisect_left(invoice_amounts, bank_amount * 0.99)
+                hi_inv = bisect_right(invoice_amounts, bank_amount * 10.0)
+                rel_invoices = invoice_sorted[lo_inv:hi_inv]
+            else:
+                rel_invoices = invoice_cands
 
             txn_candidates = nearby_pe_je + rel_invoices
 

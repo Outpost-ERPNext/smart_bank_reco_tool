@@ -31,6 +31,7 @@ class SignalCalculator:
         self.pattern_store = pattern_store
         self.amount_tolerance_pct = (amount_tolerance_pct or AMOUNT_TOLERANCE_PCT) / 100.0 if amount_tolerance_pct else AMOUNT_TOLERANCE_PCT
         self.date_window = date_window or DATE_WINDOW
+        self._fuzzy_cache = {}
 
     def score_all(self, txn, candidates):
         bank_amount = float(txn.get("deposit") or txn.get("withdrawal") or 0)
@@ -138,7 +139,17 @@ class SignalCalculator:
             return 50
         if a == b:
             return 100  # exact match — skip expensive fuzzy
-        return _fuzzy(a, b)
+
+        # Bank narrations and party names repeat heavily across a statement
+        # (e.g. hundreds of identical "TRANSFER PYMT ..." rows) — cache by the
+        # order-independent pair so repeats are a dict lookup, not a re-score.
+        key = (a, b) if a <= b else (b, a)
+        cached = self._fuzzy_cache.get(key)
+        if cached is not None:
+            return cached
+        score = _fuzzy(a, b)
+        self._fuzzy_cache[key] = score
+        return score
 
     def _side(self, is_credit, entry):
         if entry.get("entry_type") == "Payment Entry":
