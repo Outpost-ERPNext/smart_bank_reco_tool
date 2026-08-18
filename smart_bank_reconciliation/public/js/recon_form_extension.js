@@ -201,8 +201,15 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
   refresh: function (frm) {
     frm.disable_save();
 
-    // Hide only the native reconciliation tool widgets; keep balance fields visible
+    // Hide only the native reconciliation tool widgets; keep balance fields visible.
+    // filter_by_reference_date / from_reference_date / to_reference_date / account_currency
+    // don't exist pre-v14 — set_df_property no-ops safely when the field is absent,
+    // so this list is safe to run unconditionally on v13.
+    // filter_by_reference_date in particular must be hidden, not just cosmetic: its
+    // native v15 handler clears bank_statement_from_date/to_date when checked, which
+    // are the two fields SBR's own data loading depends on.
     ["reconciliation_tool_cards", "reconciliation_tool_dt", "no_bank_transactions",
+     "filter_by_reference_date", "from_reference_date", "to_reference_date",
     ].forEach(function (f) { frm.set_df_property(f, "hidden", 1); });
 
     // Make account_opening_balance read-only (auto-fetched from GL)
@@ -226,6 +233,11 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
       });
     }, 300);
     frm.upload_statement_button && frm.upload_statement_button.hide();
+
+    // Resolve currency early (covers page reload where bank_account is already
+    // set, e.g. restored filter state) so cached-result rendering below uses
+    // the right symbol instead of the fallback.
+    sbr_resolve_currency(frm);
 
     // Fetch opening balance if both bank_account and from_date are set
     sbr_fetch_opening_balance(frm);
@@ -256,6 +268,7 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
     // Clear stale closing balance from a previous account
     frm.doc.bank_statement_closing_balance = 0;
     frm.refresh_field("bank_statement_closing_balance");
+    sbr_resolve_currency(frm);
     sbr_update_balance_bar(frm);
     sbr_fetch_opening_balance(frm);
     sbr_debounce_filter_load(frm);
@@ -278,6 +291,24 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
   }
 
 });
+
+/* ── Resolve the selected bank account's actual currency (not hardcoded Naira) ──
+   Same Bank Account -> Account -> account_currency chain ERPNext's own stock
+   bank_reconciliation_tool.js uses in both v13 (frm.currency) and v15
+   (frm.doc.account_currency) — but resolved independently here so SBR doesn't
+   depend on which of those two version-specific properties actually got set. */
+function sbr_resolve_currency(frm, cb) {
+  if (!frm.doc.bank_account) return;
+  if (frm._sbr_currency_account === frm.doc.bank_account) { if (cb) cb(); return; }
+  frappe.db.get_value("Bank Account", frm.doc.bank_account, "account", function (r) {
+    if (!r || !r.account) { if (cb) cb(); return; }
+    frappe.db.get_value("Account", r.account, "account_currency", function (r2) {
+      frm._sbr_currency_account = frm.doc.bank_account;
+      ReconUI.setCurrency(r2 && r2.account_currency);
+      if (cb) cb();
+    });
+  });
+}
 
 /* ── Persist filter selections across page refreshes ── */
 var SBR_FILTER_KEY = "sbr_filter_state";
@@ -1154,8 +1185,7 @@ function sbr_open_update_transaction_dialog(txnName) {
 
       var amtColor = bt.deposit ? "#16a34a" : "#dc2626";
       var rawAmt   = parseFloat(bt.deposit || bt.withdrawal || 0);
-      var amtText  = "₦" + rawAmt.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",") +
-                     (bt.deposit ? " CR" : " DR");
+      var amtText  = ReconUI.fmtCurrency(rawAmt) + (bt.deposit ? " CR" : " DR");
       var infoHtml =
         '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;' +
         'padding:8px 12px;margin-bottom:2px;font-size:12px;font-variant-numeric:tabular-nums;' +
@@ -1309,8 +1339,7 @@ function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
           var isCredit = parseFloat(bt.deposit || 0) > 0;
           var rawAmt   = parseFloat(bt.deposit || bt.withdrawal || 0);
           var amtColor = isCredit ? "#16a34a" : "#dc2626";
-          var amtText  = "₦" + rawAmt.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",") +
-                         (isCredit ? " CR" : " DR");
+          var amtText  = ReconUI.fmtCurrency(rawAmt) + (isCredit ? " CR" : " DR");
 
           var bannerHtml =
             '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;' +
@@ -1330,8 +1359,7 @@ function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
             '<div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden">';
 
           entries.forEach(function (e, i) {
-            var entryAmt = parseFloat(e.allocated_amount || 0)
-              .toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+            var entryAmt = ReconUI.fmtCurrency(parseFloat(e.allocated_amount || 0));
             var docRoute = (e.payment_document || "").toLowerCase().replace(/ /g, "-");
             listHtml +=
               '<label style="display:flex;align-items:center;gap:10px;padding:10px 12px;cursor:pointer;' +
@@ -1349,7 +1377,7 @@ function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
                 '<span style="font-size:11px;color:#64748b">' + (e.payment_document || "") + '</span>' +
               '</span>' +
               '<span style="font-variant-numeric:tabular-nums;font-weight:600;color:#0f172a">' +
-                '₦' + entryAmt +
+                entryAmt +
               '</span>' +
               '</label>';
           });
@@ -1410,7 +1438,7 @@ function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
                   $row.find("td").eq(6).html(
                     unal > 0
                       ? '<span style="color:#64748b;font-variant-numeric:tabular-nums">' +
-                        "₦" + unal.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",") + "</span>"
+                        ReconUI.fmtCurrency(unal) + "</span>"
                       : "—"
                   );
 
@@ -1498,7 +1526,7 @@ function sbr_open_bank_charges_modal(frm) {
   function fmtAmt(v) {
     v = parseFloat(v) || 0;
     if (!v) return "—";
-    return "₦" + v.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return ReconUI.fmtCurrency(v);
   }
   function truncate(str, n) {
     str = str || "";
@@ -1617,7 +1645,7 @@ function sbr_open_bank_charges_modal(frm) {
           '<table style="width:100%;border-collapse:collapse;table-layout:fixed">' +
             '<thead style="position:sticky;top:0;z-index:1;background:#f9fafb;border-bottom:1px solid #e5e7eb"><tr>' +
               '<th style="width:36px"></th>' +
-              TH("Date") + TH("Description") + TH("Charge Type") + TH("Amount (₦)", "right") + TH("Matched By", "center") +
+              TH("Date") + TH("Description") + TH("Charge Type") + TH("Amount (" + ReconUI.currencySymbol() + ")", "right") + TH("Matched By", "center") +
             "</tr></thead>" +
             '<tbody class="sbr-chg-left-body">' + buildLeftRows(charges) + "</tbody>" +
           "</table>" +
@@ -1633,7 +1661,7 @@ function sbr_open_bank_charges_modal(frm) {
         '<div style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">' +
           '<table style="width:100%;border-collapse:collapse">' +
             '<thead style="background:#f9fafb;border-bottom:1px solid #e5e7eb"><tr>' +
-              TH("Name") + TH("Date") + TH("Description") + TH("Charge Type") + TH("Amount (₦)", "right") +
+              TH("Name") + TH("Date") + TH("Description") + TH("Charge Type") + TH("Amount (" + ReconUI.currencySymbol() + ")", "right") +
             "</tr></thead>" +
             '<tbody class="sbr-chg-right-body" style="max-height:240px;overflow-y:auto">' +
               '<tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:28px 0;font-size:12px">No charges selected yet</td></tr>' +
@@ -1725,8 +1753,8 @@ function sbr_open_bank_charges_modal(frm) {
 
     var confirmMsg =
       "Selected transactions: " + selArr.length + "\n" +
-      (totalWit > 0 ? "Total charges (debit): ₦" + totalWit.toLocaleString("en-NG", { minimumFractionDigits: 2 }) + "\n" : "") +
-      (totalDep > 0 ? "Total credits: ₦"        + totalDep.toLocaleString("en-NG", { minimumFractionDigits: 2 }) + "\n" : "") +
+      (totalWit > 0 ? "Total charges (debit): " + ReconUI.fmtCurrency(totalWit) + "\n" : "") +
+      (totalDep > 0 ? "Total credits: "        + ReconUI.fmtCurrency(totalDep) + "\n" : "") +
       "Categories:\n" + catLines + "\n\n" +
       "Original transactions will be marked Reconciled.\n" +
       "The consolidated transaction remains Unreconciled for manual Journal Entry creation.";
@@ -1813,7 +1841,7 @@ function sbr_open_consolidate_transactions_modal(frm) {
   function fmt(v) {
     v = parseFloat(v) || 0;
     if (!v) return "—";
-    return "₦ " + v.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return ReconUI.fmtCurrency(v);
   }
 
   /* ─── update right panel + button (cheap, no full re-render) ─── */
@@ -2657,7 +2685,7 @@ function sbr_show_inline_preview($canvas, data) {
   var debitCol = sbr_detect_col(h, ["debit", "Debit", "DEBIT", "withdrawal", "Withdrawals"]);
   var credCol  = sbr_detect_col(h, ["credit", "Credit", "CREDIT", "deposit", "Deposits"]);
   var refCol   = sbr_detect_col(h, ["reference", "Reference", "REF", "Cheque No", "Transaction ID"]);
-  function fmtN(n) { var v = parseFloat(n) || 0; return v > 0 ? "₦" + v.toLocaleString("en-NG", { minimumFractionDigits: 0 }) : ""; }
+  function fmtN(n) { var v = parseFloat(n) || 0; return v > 0 ? ReconUI.fmtCurrency(v) : ""; }
   var previewRows = data.rows.slice(0, 5).map(function (r) {
     return "<tr>" +
       "<td style='white-space:nowrap'>" + (r[dateCol] || "") + "</td>" +
@@ -2675,7 +2703,7 @@ function sbr_show_inline_preview($canvas, data) {
       data.rows.length + " rows ready to import" +
     '</div>' +
     '<div style="overflow-x:auto"><table class="sbr-table" style="margin:0"><thead><tr>' +
-      "<th>Date</th><th>Description</th><th>Debit (₦)</th><th>Credit (₦)</th><th>Reference</th>" +
+      "<th>Date</th><th>Description</th><th>Debit (" + ReconUI.currencySymbol() + ")</th><th>Credit (" + ReconUI.currencySymbol() + ")</th><th>Reference</th>" +
     "</tr></thead><tbody>" + previewRows + "</tbody></table></div>" + extra
   ).show();
   $up.find(".sbr-inline-import-row").show();
@@ -2761,7 +2789,7 @@ function sbr_open_upload_modal(frm, $canvas) {
 
   function fmt(n) {
     var v = parseFloat(n) || 0;
-    return v > 0 ? "₦" + v.toLocaleString("en-NG", { minimumFractionDigits: 0 }) : "";
+    return v > 0 ? ReconUI.fmtCurrency(v) : "";
   }
 
   function showPreview(data) {
@@ -2804,7 +2832,7 @@ function sbr_open_upload_modal(frm, $canvas) {
       "</div>" +
       '<div style="overflow-x:auto;margin-top:10px">' +
       '<table class="sbr-table" style="margin:0"><thead><tr>' +
-        "<th>Date</th><th>Description</th><th>Debit (₦)</th><th>Credit (₦)</th><th>Reference</th>" +
+        "<th>Date</th><th>Description</th><th>Debit (" + ReconUI.currencySymbol() + ")</th><th>Credit (" + ReconUI.currencySymbol() + ")</th><th>Reference</th>" +
       "</tr></thead><tbody>" + previewRows + "</tbody></table></div>" +
       extraNote
     ).show();

@@ -52,6 +52,35 @@ window.ReconUI = (function () {
     "HIGH-VAL": "High-Val", "DUPES": "Duplicate", "AGING": "Aging", "RECONCILED": "Reconciled",
   };
 
+  /* ── Currency (resolved per bank account — NOT hardcoded to Naira) ── */
+  // Set once recon_form_extension.js resolves the selected bank account's
+  // currency (Bank Account -> Account -> account_currency). Falls back to
+  // the system default currency (via frappe's own format_currency/
+  // get_currency_symbol) until then, so behavior is unchanged for sites
+  // that never call setCurrency.
+  var _currencyCode = null;
+
+  function setCurrency(code) {
+    _currencyCode = code || null;
+  }
+
+  function currencySymbol() {
+    if (typeof get_currency_symbol === "function") {
+      return get_currency_symbol(_currencyCode) || "";
+    }
+    return "₦"; // pre-fix fallback, only hit if core helper is unavailable
+  }
+
+  function fmtCurrency(val) {
+    var v = parseFloat(val) || 0;
+    if (typeof format_currency === "function") {
+      return format_currency(v, _currencyCode, 2);
+    }
+    return "₦" + v.toLocaleString("en-NG", {
+      minimumFractionDigits: 2, maximumFractionDigits: 2,
+    });
+  }
+
   /* ── Simple helpers ── */
 
   function queueBadge(queue) {
@@ -63,9 +92,7 @@ window.ReconUI = (function () {
 
   function formatAmount(val) {
     if (!val) return "—";
-    return "₦" + parseFloat(val).toLocaleString("en-NG", {
-      minimumFractionDigits: 2, maximumFractionDigits: 2,
-    });
+    return fmtCurrency(val);
   }
 
   function confidenceBar(pct) {
@@ -314,7 +341,7 @@ window.ReconUI = (function () {
       '<div class="sbr-balance-item">' +
         '<div class="sbr-balance-label">Difference</div>' +
         '<div class="sbr-balance-val" style="' + diffStyle + '">' +
-          (Math.abs(diff) < 0.01 ? "₦0.00" : diffSign + formatAmount(Math.abs(diff))) +
+          (Math.abs(diff) < 0.01 ? fmtCurrency(0) : diffSign + formatAmount(Math.abs(diff))) +
         "</div>" +
       "</div>"
     );
@@ -462,9 +489,9 @@ window.ReconUI = (function () {
       '<th style="width:36px;color:#94a3b8;font-weight:600">#</th>' +
       "<th>Date</th>" +
       "<th>Description / Narration</th>" +
-      "<th>Deposit (₦)</th>" +
-      "<th>Withdrawal (₦)</th>" +
-      "<th>Unallocated (₦)</th>" +
+      "<th>Deposit (" + currencySymbol() + ")</th>" +
+      "<th>Withdrawal (" + currencySymbol() + ")</th>" +
+      "<th>Unallocated (" + currencySymbol() + ")</th>" +
       "<th>Reference No.</th>" +
       "<th>AI Match</th>" +
       "<th>Matched ERP Entry</th>" +
@@ -1253,7 +1280,7 @@ window.ReconUI = (function () {
       '<div class="sbr-table-wrap">' +
       '<table class="sbr-table"><thead><tr>' +
         '<th style="width:44px">Type</th><th>Voucher</th><th>Date</th>' +
-        '<th>Party / Remark</th><th>Amount (₦)</th><th>Reference</th><th>Status</th>' +
+        '<th>Party / Remark</th><th>Amount (' + currencySymbol() + ')</th><th>Reference</th><th>Status</th>' +
       "</tr></thead><tbody>" + buildRows(vouchers) + "</tbody></table></div>";
 
     $tab.html(toolbarHtml + tableHtml);
@@ -2096,7 +2123,7 @@ window.ReconUI = (function () {
         '<div class="sbr-settings-group">' +
           '<label class="sbr-settings-label">High-value threshold</label>' +
           '<div class="sbr-settings-input-row">' +
-            '<span class="sbr-settings-unit sbr-settings-prefix">₦</span>' +
+            '<span class="sbr-settings-unit sbr-settings-prefix">' + currencySymbol() + '</span>' +
             '<input class="sbr-settings-input" type="number" min="1000000" step="1000000" ' +
               'id="sbr-s-highval" value="' + (s.high_val_threshold || 50000000) + '">' +
           '</div>' +
@@ -2145,11 +2172,11 @@ window.ReconUI = (function () {
         '<div class="sbr-settings-group" style="grid-column:1/-1">' +
           '<label class="sbr-settings-label">Bank Charge Amount Threshold</label>' +
           '<div class="sbr-settings-input-row">' +
-            '<span class="sbr-settings-unit sbr-settings-prefix">₦</span>' +
+            '<span class="sbr-settings-unit sbr-settings-prefix">' + currencySymbol() + '</span>' +
             '<input class="sbr-settings-input" type="number" min="0" step="100" ' +
               'id="sbr-s-chg-threshold" value="' + (s.bank_charge_amount_threshold || 2000) + '">' +
           '</div>' +
-          '<div class="sbr-settings-hint">Any unreconciled debit transaction up to this amount is treated as a potential bank charge in Consolidate Bank Charges (default: ₦2,000).</div>' +
+          '<div class="sbr-settings-hint">Any unreconciled debit transaction up to this amount is treated as a potential bank charge in Consolidate Bank Charges (default: ' + currencySymbol() + '2,000).</div>' +
         "</div>" +
       "</div>";
 
@@ -2249,7 +2276,7 @@ window.ReconUI = (function () {
       var badgeColor = isOverdue ? "#dc2626" : "#ea580c";
       var badgeBg    = isOverdue ? "#fee2e2" : "#ffedd5";
       var amt = parseFloat(e.amount || 0);
-      var amtStr = amt > 0 ? "₦" + amt.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—";
+      var amtStr = formatAmount(amt);
       html +=
         '<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;' +
           'background:#fffbf5;border-top:1px solid #fed7aa;font-size:12px">' +
@@ -2296,6 +2323,9 @@ window.ReconUI = (function () {
   /* ── Public API ── */
 
   return {
+    setCurrency:            setCurrency,
+    currencySymbol:         currencySymbol,
+    fmtCurrency:            fmtCurrency,
     queueBadge:             queueBadge,
     formatAmount:           formatAmount,
     confidenceBar:          confidenceBar,
