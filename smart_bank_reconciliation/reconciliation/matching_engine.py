@@ -22,6 +22,10 @@ class BankMatchingEngine:
         self.only_names = only_names
         self.pattern_store = PatternStore()
         self._save_batch = []
+        self._save_index = {}  # txn_name -> values dict, so a later _save() for the
+                                # same txn (e.g. the Many:1 pass overriding the main
+                                # scoring pass) merges instead of appending a second,
+                                # never-applied entry (see _flush_saves).
         # Apply configurable thresholds (fall back to module-level defaults)
         s = settings or {}
         self.auto_threshold  = float(s.get("auto_threshold",  AUTO_THRESHOLD))
@@ -454,7 +458,20 @@ class BankMatchingEngine:
             values["recon_signals_json"] = signals_json
         if wht_amount is not None:
             values["recon_wht_amount"] = wht_amount
-        self._save_batch.append((txn_name, values))
+
+        # A transaction can be saved more than once in a single run (e.g. the
+        # main scoring pass, then re-classified by _process_many_to_one). The
+        # CASE-WHEN built in _flush_saves only honors the FIRST matching WHEN
+        # for a given name, so a second append would be silently ignored on
+        # write even though it correctly overwrote the in-memory result —
+        # merge into the existing entry instead so the last call always wins.
+        existing = self._save_index.get(txn_name)
+        if existing is not None:
+            existing.update(values)
+        else:
+            entry = dict(values)
+            self._save_batch.append((txn_name, entry))
+            self._save_index[txn_name] = entry
 
     def _flush_saves(self):
         """Write all accumulated saves in one bulk SQL query instead of N set_value calls."""
