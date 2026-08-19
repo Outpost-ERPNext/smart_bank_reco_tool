@@ -89,6 +89,36 @@ def get_bank_transactions(bank_account, from_date, to_date):
 
 
 @frappe.whitelist()
+def resolve_entry_doctypes(names):
+    """Bulk-resolve which doctype each matched ERP entry name belongs to, for
+    building correct navigation links. recon_matched_entries only stores bare
+    names, and a company's custom naming series (e.g. "SUM-INV-1160") can't be
+    reliably guessed from the string alone — so this looks the names up directly
+    instead of pattern-matching on them."""
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+    if isinstance(names, str):
+        names = json.loads(names)
+    remaining = {n for n in (names or []) if n}
+    if not remaining:
+        return {}
+
+    result = {}
+    for doctype, route in (
+        ("Journal Entry", "journal-entry"),
+        ("Payment Entry", "payment-entry"),
+        ("Sales Invoice", "sales-invoice"),
+        ("Purchase Invoice", "purchase-invoice"),
+    ):
+        if not remaining:
+            break
+        found = frappe.db.get_all(doctype, filters={"name": ["in", list(remaining)]}, pluck="name")
+        for n in found:
+            result[n] = route
+            remaining.discard(n)
+    return result
+
+
+@frappe.whitelist()
 def get_suggestions(bank_account, from_date, to_date, company, settings_json=None):
     """Run the matching engine and return suggestions for the UI."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])

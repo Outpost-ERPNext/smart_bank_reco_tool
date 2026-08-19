@@ -523,11 +523,48 @@ window.ReconUI = (function () {
         return entryNames.map(function (en) {
           var route = _guessEntryRoute(en);
           var href = route ? "/app/" + route + "/" + encodeURIComponent(en) : "/app/bank-transaction";
-          return '<a class="sbr-link" href="' + href + '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
+          return '<a class="sbr-link" data-erp-entry="' + encodeURIComponent(en) + '" href="' + href +
+                 '" target="_blank" onclick="event.stopPropagation()">' + en + "</a>";
         }).join("<br>");
       }
     } catch (e) {}
     return "—";
+  }
+
+  // recon_matched_entries only ever stores bare names (no doctype), so the
+  // route above is a guess from the name string — reliable for this app's own
+  // JE/PE naming but wrong whenever a company's Sales/Purchase Invoice naming
+  // series doesn't contain "SINV"/"PINV"/"SI"/"PI" (e.g. "SUM-INV-1160"),
+  // silently falling back to "payment-entry" and producing a dead link. This
+  // asks the server which doctype each name actually belongs to and corrects
+  // any wrong hrefs in place, without blocking the initial render.
+  var _entryRouteCache = {};
+  function _resolveEntryLinks($scope) {
+    var names = [];
+    $scope.find(".sbr-link[data-erp-entry]").each(function () {
+      var n = decodeURIComponent($(this).attr("data-erp-entry"));
+      if (!(n in _entryRouteCache) && names.indexOf(n) === -1) names.push(n);
+    });
+    function applyCache() {
+      $scope.find(".sbr-link[data-erp-entry]").each(function () {
+        var n = decodeURIComponent($(this).attr("data-erp-entry"));
+        var route = _entryRouteCache[n];
+        if (route) $(this).attr("href", "/app/" + route + "/" + encodeURIComponent(n));
+      });
+    }
+    if (!names.length) {
+      applyCache();
+      return;
+    }
+    frappe.call({
+      method: "smart_bank_reconciliation.reconciliation.api.resolve_entry_doctypes",
+      args: { names: names },
+      callback: function (r) {
+        var map = (r && r.message) || {};
+        Object.keys(map).forEach(function (n) { _entryRouteCache[n] = map[n]; });
+        applyCache();
+      },
+    });
   }
 
   function renderTransactionTable($container, transactions) {
@@ -601,6 +638,7 @@ window.ReconUI = (function () {
 
     $container.find(".sbr-table-wrap").html(html);
     $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
+    _resolveEntryLinks($container);
 
     // Select-all: only affects visible rows
     $container.find(".sbr-select-all").on("change", function () {
@@ -638,6 +676,7 @@ window.ReconUI = (function () {
         );
       }
     });
+    _resolveEntryLinks($container);
   }
 
   /* ── Reconcile Modal ── */
@@ -2139,7 +2178,8 @@ window.ReconUI = (function () {
             matchedHtml = names.slice(0, 2).map(function (n) {
               var route = _guessEntryRoute(n);
               var href = route ? "/app/" + route + "/" + encodeURIComponent(n) : "/app/bank-transaction";
-              return '<a class="sbr-link" href="' + href + '" target="_blank">' + n + "</a>";
+              return '<a class="sbr-link" data-erp-entry="' + encodeURIComponent(n) + '" href="' + href +
+                     '" target="_blank">' + n + "</a>";
             }).join(", ") + (names.length > 2 ? " +" + (names.length - 2) + " more" : "");
           }
         } catch (e) {}
@@ -2187,6 +2227,7 @@ window.ReconUI = (function () {
       "<tbody>" + rows + "</tbody>" +
       "</table></div>"
     );
+    _resolveEntryLinks($tab);
 
     // Export CSV
     $tab.find(".sbr-audit-export-btn").on("click", function () {
