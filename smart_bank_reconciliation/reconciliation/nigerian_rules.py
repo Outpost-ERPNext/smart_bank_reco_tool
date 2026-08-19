@@ -1,7 +1,13 @@
 import re
 
 WHT_RATES = [0.05, 0.10]
-WHT_TOLERANCE = 500  # NGN rounding buffer
+# Tolerance scales with the expected WHT amount instead of a flat NGN figure —
+# a flat buffer that's fine for a six-figure invoice (rounding noise) swamps a
+# small transaction entirely, making an exact 1:1 match (diff=0) look like a
+# "5% WHT deducted" match purely because 0 falls within the flat window.
+WHT_REL_TOLERANCE_PCT = 0.02   # accept rounding noise up to 2% of the expected WHT
+WHT_MIN_TOLERANCE = 5          # floor, so tiny WHT amounts still allow for kobo rounding
+WHT_MAX_TOLERANCE = 500        # cap, matching the old flat buffer for large invoices
 
 _COT = re.compile(r"\bZ?COT\b|\bCOMMISSION ON TURNOVER\b", re.I)
 _FIRS = re.compile(r"\bFIRS\b|\bFEDERAL INLAND REVENUE\b|\bTIN\b", re.I)
@@ -56,9 +62,12 @@ class NigerianRules:
         if not erp_amount or not bank_amount:
             return
         diff = abs(erp_amount - bank_amount)
+        if diff < 0.01:
+            return  # exact amount match — nothing was withheld, not a WHT case
         for rate in WHT_RATES:
             expected_wht = erp_amount * rate
-            if abs(diff - expected_wht) <= WHT_TOLERANCE:
+            tolerance = min(WHT_MAX_TOLERANCE, max(WHT_MIN_TOLERANCE, expected_wht * WHT_REL_TOLERANCE_PCT))
+            if abs(diff - expected_wht) <= tolerance:
                 best["match_type"] = f"Partial (WHT {int(rate * 100)}%)"
                 best["wht_amount"] = expected_wht
                 best["reasoning"] = (

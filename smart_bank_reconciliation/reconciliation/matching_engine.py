@@ -9,7 +9,7 @@ from .pattern_store import PatternStore
 
 HIGH_VALUE_THRESHOLD = 50_000_000  # NGN 50 million
 AGING_DAYS = 10
-AUTO_THRESHOLD = 90.0
+AUTO_THRESHOLD = 80.0
 REVIEW_THRESHOLD = 50.0
 
 
@@ -82,7 +82,7 @@ class BankMatchingEngine:
                 continue
 
             # Duplicate bank transaction check (run before ERP scoring but don't skip it)
-            dup_reason = dup_detector.check(txn)
+            dup_reason, dup_names = dup_detector.check(txn)
 
             # Narrow the candidate pool for this transaction before scoring.
             # This reduces the O(T×C) work without changing any match logic.
@@ -149,6 +149,8 @@ class BankMatchingEngine:
                 )
                 txn["recon_queue"] = queue
                 txn["recon_ai_reasoning"] = best_display["reasoning"] if best_display else reasoning
+                if dup_names:
+                    txn["recon_duplicate_of"] = dup_names
                 if draft:
                     txn["recon_draft_payload"] = draft
                 if best_display:
@@ -202,6 +204,8 @@ class BankMatchingEngine:
                 )
                 txn["recon_queue"] = queue
                 txn["recon_confidence"] = conf
+                if dup_names:
+                    txn["recon_duplicate_of"] = dup_names
                 if draft:
                     txn["recon_draft_payload"] = draft
                 txn["recon_match_type"] = best.get("match_type")

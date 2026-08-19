@@ -90,6 +90,30 @@ window.ReconUI = (function () {
            (queue || "—") + "</span>";
   }
 
+  function _agingBucketMatch(days, bucket) {
+    if (!bucket) return true;
+    if (days < 0) return false; // unknown date — exclude from a specific range, not "All"
+    switch (bucket) {
+      case "0-30":   return days >= 0   && days <= 30;
+      case "31-60":  return days >= 31  && days <= 60;
+      case "61-90":  return days >= 61  && days <= 90;
+      case "91-120": return days >= 91  && days <= 120;
+      case "120+":   return days > 120;
+      default:       return true;
+    }
+  }
+
+  function _confBucketMatch(pct, bucket) {
+    if (!bucket) return true;
+    switch (bucket) {
+      case "0-10":  return pct >= 0  && pct <= 10;
+      case "11-50": return pct >= 11 && pct <= 50;
+      case "51-79": return pct >= 51 && pct <= 79;
+      case "80+":   return pct >= 80;
+      default:      return true;
+    }
+  }
+
   function formatAmount(val) {
     if (!val) return "—";
     return fmtCurrency(val);
@@ -180,6 +204,13 @@ window.ReconUI = (function () {
             '<option value="Supplier">Supplier</option>' +
             '<option value="Employee">Employee</option>' +
           "</select>" +
+          '<select class="sbr-confidence-filter" style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151;background:#fff">' +
+            '<option value="">All Confidence</option>' +
+            '<option value="0-10">0–10%</option>' +
+            '<option value="11-50">11–50%</option>' +
+            '<option value="51-79">51–79%</option>' +
+            '<option value="80+">80%+</option>' +
+          "</select>" +
           '<input type="text" class="sbr-search-input" placeholder="Search description, reference, party…" ' +
             'style="flex:1;min-width:180px;max-width:340px;padding:5px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151">' +
           '<span class="sbr-txn-counter"></span>' +
@@ -218,6 +249,22 @@ window.ReconUI = (function () {
     // Party Type dropdown change
     $container.on("change", ".sbr-party-type-filter", function () {
       $container.data("sbr-party-type-filter", $(this).val() || null);
+      applyFilters($container);
+    });
+
+    // Confidence dropdown change (Bank Transactions table)
+    $container.on("change", ".sbr-confidence-filter", function () {
+      $container.data("sbr-confidence-filter", $(this).val() || null);
+      applyFilters($container);
+    });
+
+    // Aging / Confidence sub-filter dropdowns (AI Match Pairs cards)
+    $container.on("change", ".sbr-aging-range-filter", function () {
+      $container.data("sbr-aging-range-filter", $(this).val() || null);
+      applyFilters($container);
+    });
+    $container.on("change", ".sbr-conf-range-filter", function () {
+      $container.data("sbr-conf-range-filter", $(this).val() || null);
       applyFilters($container);
     });
 
@@ -378,6 +425,9 @@ window.ReconUI = (function () {
     var queueName  = $container.data("sbr-queue-filter") || null;
     var partyType  = $container.data("sbr-party-type-filter") || null;
     var txt = ($container.data("sbr-text-filter") || "").toLowerCase().trim();
+    var confRangeTable = $container.data("sbr-confidence-filter") || null;
+    var agingRange = queueName === "Aging" ? ($container.data("sbr-aging-range-filter") || null) : null;
+    var confRange  = queueName === "Review" ? ($container.data("sbr-conf-range-filter") || null) : null;
 
     var total = 0, visible = 0;
     $container.find(".sbr-row").each(function () {
@@ -388,24 +438,32 @@ window.ReconUI = (function () {
                      (queueName === "Unmatched" && rowQueue === "");
       var ptOk     = !partyType  || $row.data("party-type")  === partyType;
       var textOk   = !txt || ($row.data("search-text") || "").indexOf(txt) !== -1;
-      if (queueOk && ptOk && textOk) { $row.show(); visible++; }
-      else                            { $row.hide(); }
+      var confOk   = _confBucketMatch(parseFloat($row.data("confidence")) || 0, confRangeTable);
+      if (queueOk && ptOk && textOk && confOk) { $row.show(); visible++; }
+      else                                      { $row.hide(); }
     });
     if (total > 0) {
       $container.find(".sbr-txn-counter").text(
-        (queueName || txt || partyType)
+        (queueName || txt || partyType || confRangeTable)
           ? "Showing " + visible + " of " + total + " transactions"
           : total + " transactions"
       );
     }
 
     $container.find(".sbr-card").each(function () {
-      var cardQueue = $(this).data("queue") || "";
+      var $card = $(this);
+      var cardQueue = $card.data("queue") || "";
       var cardOk = !queueName
         || cardQueue === queueName
         || (queueName === "Unmatched" && cardQueue === "");
-      if (cardOk) { $(this).show(); } else { $(this).hide(); }
+      var agingOk = _agingBucketMatch(parseInt($card.data("aging-days"), 10), agingRange);
+      var confOk  = _confBucketMatch(parseFloat($card.data("confidence")) || 0, confRange);
+      if (cardOk && agingOk && confOk) { $card.show(); } else { $card.hide(); }
     });
+
+    // Show/hide the Aging / Confidence sub-filter bars alongside their queue tab
+    $container.find(".sbr-aging-filter-bar").css("display", queueName === "Aging" ? "flex" : "none");
+    $container.find(".sbr-conf-filter-bar").css("display", queueName === "Review" ? "flex" : "none");
 
     // Show/hide duplicate bulk-action toolbar whenever filter changes
     var $dupBar = $container.find(".sbr-dup-bulk-bar");
@@ -511,6 +569,7 @@ window.ReconUI = (function () {
       html += '<tr class="sbr-row' + (isReconciled ? " sbr-row-done" : "") + '"' +
               ' data-txn="' + t.name + '" data-queue="' + queue + '"' +
               ' data-party-type="' + (t.party_type || "") + '"' +
+              ' data-confidence="' + Math.round(pct) + '"' +
               ' data-search-text="' + searchText + '">' +
               '<td class="sbr-check-col">' +
                 (isReconciled ? "" :
@@ -567,6 +626,7 @@ window.ReconUI = (function () {
       var queue = t.recon_queue || "";
       var pct   = parseFloat(t.recon_confidence) || 0;
       $row.attr("data-queue", queue);
+      $row.attr("data-confidence", Math.round(pct));
       if (queue === "Reconciled") $row.addClass("sbr-row-done");
       $row.find(".sbr-match-cell").html(confidenceBadge(pct, queue));
       $row.find(".sbr-matched-entry-cell").html(_matchedEntryHtml(t));
@@ -1093,6 +1153,29 @@ window.ReconUI = (function () {
 
   /* ── AI Suggestion Panel (AI Match Pairs tab) ── */
 
+  /* Reorders suggestions so a detected duplicate pair renders back-to-back,
+     instead of wherever plain chronological order happens to place each side.
+     Stable: everything else keeps its original relative order. */
+  function _groupDuplicatePairs(suggestions) {
+    var byTxn = {};
+    suggestions.forEach(function (s) { if (s.bank_txn) byTxn[s.bank_txn] = s; });
+    var placed = {};
+    var out = [];
+    suggestions.forEach(function (s) {
+      if (placed[s.bank_txn]) return; // already emitted alongside an earlier pair
+      out.push(s);
+      placed[s.bank_txn] = true;
+      (s.duplicate_of || []).forEach(function (name) {
+        var partner = byTxn[name];
+        if (partner && !placed[name]) {
+          out.push(partner);
+          placed[name] = true;
+        }
+      });
+    });
+    return out;
+  }
+
   function renderSuggestionsPanel($container, suggestions) {
     $container.data("suggestions", suggestions || []);
 
@@ -1151,6 +1234,39 @@ window.ReconUI = (function () {
               (autoCount > 1 ? "es" : "") + " ready</div>";
     }
 
+    // Aging sub-filter — shown only when the Aging queue filter is active
+    html +=
+      '<div class="sbr-aging-filter-bar" style="display:none;align-items:center;gap:8px;' +
+        'padding:8px 12px;background:#fff7ed;border:1px solid #fed7aa;' +
+        'border-radius:6px;margin-bottom:10px;font-size:12px;color:#9a3412">' +
+        '<span style="font-weight:600">Aging (days unreconciled):</span>' +
+        '<select class="sbr-aging-range-filter" style="padding:4px 8px;border:1px solid #fed7aa;' +
+          'border-radius:5px;font-size:12px;color:#9a3412;background:#fff">' +
+          '<option value="">All</option>' +
+          '<option value="0-30">0–30</option>' +
+          '<option value="31-60">31–60</option>' +
+          '<option value="61-90">61–90</option>' +
+          '<option value="91-120">91–120</option>' +
+          '<option value="120+">120+</option>' +
+        '</select>' +
+      '</div>';
+
+    // Confidence sub-filter — shown only when the Review queue filter is active
+    html +=
+      '<div class="sbr-conf-filter-bar" style="display:none;align-items:center;gap:8px;' +
+        'padding:8px 12px;background:#fffbeb;border:1px solid #fde68a;' +
+        'border-radius:6px;margin-bottom:10px;font-size:12px;color:#92400e">' +
+        '<span style="font-weight:600">Confidence score:</span>' +
+        '<select class="sbr-conf-range-filter" style="padding:4px 8px;border:1px solid #fde68a;' +
+          'border-radius:5px;font-size:12px;color:#92400e;background:#fff">' +
+          '<option value="">All</option>' +
+          '<option value="0-10">0–10%</option>' +
+          '<option value="11-50">11–50%</option>' +
+          '<option value="51-79">51–79%</option>' +
+          '<option value="80+">80%+</option>' +
+        '</select>' +
+      '</div>';
+
     // Duplicate bulk-action toolbar — shown only when Duplicate queue filter is active
     html +=
       '<div class="sbr-dup-bulk-bar" style="display:none;align-items:center;gap:10px;' +
@@ -1166,7 +1282,7 @@ window.ReconUI = (function () {
         '</button>' +
       '</div>';
 
-    suggestions.forEach(function (s) { html += buildCard(s); });
+    _groupDuplicatePairs(suggestions).forEach(function (s) { html += buildCard(s); });
 
     // Sticky-bottom ↑ FAB — positioned after all cards, no position:fixed needed
     html += '<div class="sbr-scroll-fab-wrap">' +
@@ -1326,8 +1442,16 @@ window.ReconUI = (function () {
           ? '<span style="color:#dc2626;font-weight:700">' + formatAmount(s.withdrawal) + " DR</span>"
           : '<span style="color:#94a3b8">—</span>');
 
+    // Days unreconciled — computed regardless of queue so it's available as a
+    // filter attribute even when the visual badge below only shows it for Aging.
+    var daysOld = -1;
+    if (s.date) {
+      daysOld = Math.floor((Date.now() - new Date(s.date).getTime()) / 86400000);
+    }
+
     var html = '<div class="sbr-card sbr-pair-card" data-txn="' + (s.bank_txn || "") +
-               '" data-queue="' + queue + '">';
+               '" data-queue="' + queue + '" data-confidence="' + Math.round(pct) +
+               '" data-aging-days="' + daysOld + '">';
 
     // ── Header: queue badge + match type + confidence bar ──
     var mtypePill = (hasMatch && matchedEntry.match_type)
@@ -1347,19 +1471,14 @@ window.ReconUI = (function () {
 
     // Aging days badge — how long this transaction has been unreconciled
     var agingDaysBadge = "";
-    if (queue === "Aging" && s.date) {
-      var txnMs  = new Date(s.date).getTime();
-      var nowMs  = Date.now();
-      var daysOld = Math.floor((nowMs - txnMs) / 86400000);
-      if (daysOld > 0) {
-        var agBg    = daysOld > 30 ? "#fee2e2" : "#ffedd5";
-        var agColor = daysOld > 30 ? "#dc2626" : "#ea580c";
-        agingDaysBadge =
-          '<span style="background:' + agBg + ';color:' + agColor + ';border:1px solid ' + agColor + ';' +
-            'padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700;white-space:nowrap">' +
-            daysOld + 'd unreconciled' +
-          '</span>';
-      }
+    if (queue === "Aging" && daysOld > 0) {
+      var agBg    = daysOld > 30 ? "#fee2e2" : "#ffedd5";
+      var agColor = daysOld > 30 ? "#dc2626" : "#ea580c";
+      agingDaysBadge =
+        '<span style="background:' + agBg + ';color:' + agColor + ';border:1px solid ' + agColor + ';' +
+          'padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700;white-space:nowrap">' +
+          daysOld + 'd unreconciled' +
+        '</span>';
     }
 
     var dupChk = queue === "Duplicate"
@@ -1455,7 +1574,11 @@ window.ReconUI = (function () {
     }
 
     // ── Reasoning callout ──
-    if (matchedEntry.reasoning) {
+    // Skipped for Duplicate queue: matchedEntry.reasoning and s.reasoning are the
+    // same string there (the dup warning is prepended to the match reasoning in
+    // matching_engine.py), and the Duplicate block below already shows it — with
+    // more appropriate ⚠ styling right above the destructive Delete action.
+    if (matchedEntry.reasoning && queue !== "Duplicate") {
       html += '<div class="sbr-pair-reasoning">' + matchedEntry.reasoning + "</div>";
     }
 
@@ -2105,7 +2228,7 @@ window.ReconUI = (function () {
           '<label class="sbr-settings-label">Auto-match threshold</label>' +
           '<div class="sbr-settings-input-row">' +
             '<input class="sbr-settings-input" type="number" min="50" max="100" step="1" ' +
-              'id="sbr-s-auto" value="' + (s.auto_threshold || 90) + '">' +
+              'id="sbr-s-auto" value="' + (s.auto_threshold || 80) + '">' +
             '<span class="sbr-settings-unit">%</span>' +
           '</div>' +
           '<div class="sbr-settings-hint">Matches at or above this confidence are auto-approved</div>' +
@@ -2186,7 +2309,7 @@ window.ReconUI = (function () {
       primary_action_label: "Save Settings",
       primary_action: function () {
         var newSettings = {
-          auto_threshold:               parseFloat(d.$wrapper.find("#sbr-s-auto").val()) || 90,
+          auto_threshold:               parseFloat(d.$wrapper.find("#sbr-s-auto").val()) || 80,
           review_threshold:             parseFloat(d.$wrapper.find("#sbr-s-review").val()) || 50,
           high_val_threshold:           parseFloat(d.$wrapper.find("#sbr-s-highval").val()) || 50000000,
           aging_days:                   parseInt(d.$wrapper.find("#sbr-s-aging").val()) || 10,

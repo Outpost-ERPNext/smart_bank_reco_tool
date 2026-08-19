@@ -28,13 +28,18 @@ class DuplicateDetector:
         return (party, str(amount), str(txn.get("date") or ""))
 
     def check(self, txn):
+        """Returns (reasoning, duplicate_names) — (None, []) when no duplicate found.
+        duplicate_names is the raw list of other Bank Transaction names this txn
+        duplicates, so callers can group/link a pair in the UI instead of relying
+        on parsing the reasoning text."""
         # 1. Exact match (same ref + amount + date)
         exact_key = self._exact_key(txn)
         others = [n for n in self.seen_exact.get(exact_key, []) if n != txn["name"]]
         if others:
             return (
                 f"Possible duplicate of {', '.join(others)} — "
-                "same amount, reference, and date"
+                "same amount, reference, and date",
+                others,
             )
 
         # 2. Soft match (same party + amount + date, different reference)
@@ -44,9 +49,10 @@ class DuplicateDetector:
             if soft_others:
                 return (
                     f"Possible duplicate of {', '.join(soft_others)} — "
-                    "same party, amount, and date (reference numbers differ — likely bank error)"
+                    "same party, amount, and date (reference numbers differ — likely bank error)",
+                    soft_others,
                 )
-        return None
+        return None, []
 
 
 class ErpDuplicateDetector:

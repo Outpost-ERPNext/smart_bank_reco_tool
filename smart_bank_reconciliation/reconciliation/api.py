@@ -125,6 +125,7 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
             "reasoning": txn.get("recon_ai_reasoning") or "",
             "matched": txn.get("matched"),
             "draft_payload": txn.get("recon_draft_payload"),
+            "duplicate_of": txn.get("recon_duplicate_of") or [],
         })
 
     return {
@@ -145,6 +146,7 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
                 "recon_confidence": t.get("recon_confidence") or 0,
                 "recon_matched_entries": t.get("recon_matched_entries") or "",
                 "recon_match_type": t.get("recon_match_type") or "",
+                "recon_duplicate_of": t.get("recon_duplicate_of") or [],
             }
             for t in results
         ],
@@ -214,6 +216,7 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
                 "reasoning": txn.get("recon_ai_reasoning") or "",
                 "matched": txn.get("matched"),
                 "draft_payload": txn.get("recon_draft_payload"),
+                "duplicate_of": txn.get("recon_duplicate_of") or [],
             })
 
         data = {
@@ -234,6 +237,7 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
                     "recon_confidence": t.get("recon_confidence") or 0,
                     "recon_matched_entries": t.get("recon_matched_entries") or "",
                     "recon_match_type": t.get("recon_match_type") or "",
+                    "recon_duplicate_of": t.get("recon_duplicate_of") or [],
                 }
                 for t in results
             ],
@@ -530,6 +534,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
             "reasoning":       txn.get("recon_ai_reasoning") or "",
             "matched":         txn.get("matched"),
             "draft_payload":   txn.get("recon_draft_payload"),
+            "duplicate_of":    txn.get("recon_duplicate_of") or [],
         })
         transactions_out.append({
             "name":                  txn["name"],
@@ -546,6 +551,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
             "recon_confidence":      txn.get("recon_confidence") or 0,
             "recon_matched_entries": txn.get("recon_matched_entries") or "",
             "recon_match_type":      txn.get("recon_match_type") or "",
+            "recon_duplicate_of":    txn.get("recon_duplicate_of") or [],
         })
 
     return {
@@ -1158,7 +1164,14 @@ def consolidate_transactions(transaction_names, company=None):
 
 @frappe.whitelist()
 def get_consolidatable_transactions(bank_account, from_date, to_date):
-    """Return submitted, unreconciled bank transactions available for consolidation."""
+    """Return submitted, unreconciled bank transactions with no existing ERP match.
+
+    A transaction the AI already matched (Auto/Review/High-Val, or Duplicate with
+    a best-effort match) is still "unreconciled" at the raw status/unallocated_amount
+    level until someone approves it — but it already has a specific entry to
+    reconcile against, so it shouldn't be offered here. Consolidate is for genuine
+    orphans (no ERP entry found at all), not transactions that already have one.
+    """
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     txns = frappe.db.get_all(
         "Bank Transaction",
@@ -1169,9 +1182,13 @@ def get_consolidatable_transactions(bank_account, from_date, to_date):
             "status": ["!=", "Reconciled"],
             "unallocated_amount": [">", 0],
         },
-        fields=["name", "date", "deposit", "withdrawal", "description", "reference_number", "unallocated_amount"],
+        fields=["name", "date", "deposit", "withdrawal", "description", "reference_number",
+                "unallocated_amount", "recon_matched_entries"],
         order_by="date asc",
     )
+    txns = [t for t in txns if not t.get("recon_matched_entries")]
+    for t in txns:
+        t.pop("recon_matched_entries", None)
     return txns
 
 
@@ -1828,7 +1845,7 @@ def get_reconciliation_report(bank_account, from_date, to_date, company=None):
     automation_rate = round((auto / non_recon * 100) if non_recon > 0 else 0, 1)
 
     # Manual vs auto reconciled breakdown
-    auto_thresh = _load_sbr_settings().get("auto_threshold", 90)
+    auto_thresh = _load_sbr_settings().get("auto_threshold", 80)
     auto_reconciled   = sum(1 for t in txns
                             if t.get("recon_queue") == "Reconciled"
                             and float(t.get("recon_confidence") or 0) >= auto_thresh)
@@ -2061,7 +2078,7 @@ def get_queue_summary(bank_account, from_date, to_date):
 # ── Settings helpers ──────────────────────────────────────────────────────────
 
 _SBR_DEFAULTS = {
-    "auto_threshold":               90.0,
+    "auto_threshold":               80.0,
     "review_threshold":             50.0,
     "high_val_threshold":           50_000_000.0,
     "aging_days":                   10,
