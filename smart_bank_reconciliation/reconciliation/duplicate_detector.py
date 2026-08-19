@@ -11,8 +11,14 @@ class DuplicateDetector:
                 self.seen_soft.setdefault(soft_key, []).append(txn["name"])
 
     def _exact_key(self, txn):
+        # Side (deposit vs withdrawal) is part of the fingerprint — a debit and
+        # its equal-and-opposite reversal credit share the same amount/ref/date
+        # by design (same NIP session reversed), but they're two distinct real
+        # transactions, not the same one posted twice.
+        side = "D" if txn.get("deposit") else "W"
         amount = round(float(txn.get("deposit") or txn.get("withdrawal") or 0), 2)
         return (
+            side,
             str(amount),
             str(txn.get("reference_number") or ""),
             str(txn.get("date") or ""),
@@ -24,8 +30,9 @@ class DuplicateDetector:
         party = (txn.get("party") or "").strip()
         if not party:
             return None
+        side = "D" if txn.get("deposit") else "W"
         amount = round(float(txn.get("deposit") or txn.get("withdrawal") or 0), 2)
-        return (party, str(amount), str(txn.get("date") or ""))
+        return (side, party, str(amount), str(txn.get("date") or ""))
 
     def check(self, txn):
         """Returns (reasoning, duplicate_names) — (None, []) when no duplicate found.

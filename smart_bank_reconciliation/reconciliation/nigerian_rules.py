@@ -11,7 +11,7 @@ WHT_MAX_TOLERANCE = 500        # cap, matching the old flat buffer for large inv
 
 _COT = re.compile(r"\bZ?COT\b|\bCOMMISSION ON TURNOVER\b", re.I)
 _FIRS = re.compile(r"\bFIRS\b|\bFEDERAL INLAND REVENUE\b|\bTIN\b", re.I)
-_REVERSAL = re.compile(r"\bREVERSAL\b|\bREVERSED\b|\bCHQ.?RETURN\b|\bBOUNCE\b", re.I)
+_REVERSAL = re.compile(r"\bREVERSAL\b|\bREVERSED\b|\bRSVL\b|\bCHQ.?RETURN\b|\bBOUNCE\b", re.I)
 _INTEREST = re.compile(r"\bINTEREST\b|\bCREDIT INT\b|\bINTEREST CREDIT\b", re.I)
 _PAYROLL = re.compile(r"\bSALARY\b|\bPAYROLL\b|\bSTAFF\b", re.I)
 
