@@ -2027,11 +2027,11 @@ function sbr_open_consolidate_transactions_modal(frm) {
         var data = r.message;
         var jeUrl = "/app/journal-entry/" + encodeURIComponent(data.journal_entry);
         frappe.show_alert({
-          message: data.count + __(" transactions consolidated into ") +
+          message: data.count + __(" transactions consolidated into draft ") +
             '<a href="' + jeUrl + '" target="_blank">' + data.journal_entry + "</a>" +
-            __(" — review and approve each in the Review queue"),
+            __(" — open it to complete any required fields and submit, then approve each in the Review queue"),
           indicator: "green",
-        }, 10);
+        }, 12);
         // Reload the transaction list so the transactions show their new Review status
         setTimeout(function () { sbr_load_transactions(frm); }, 400);
       },
@@ -2327,12 +2327,12 @@ function sbr_bind_card_actions(frm, $canvas) {
             $canvas.find(".sbr-row-check, .sbr-select-all").prop("checked", false);
             $canvas.find(".sbr-toolbar-rerun-sel, .sbr-toolbar-consolidate-sel").hide();
             frappe.show_alert({
-              message: data.count + __(" transactions consolidated into ") +
+              message: data.count + __(" transactions consolidated into draft ") +
                 '<a href="/app/journal-entry/' + encodeURIComponent(data.journal_entry) +
                 '" target="_blank">' + data.journal_entry + "</a>" +
-                __(" — review and approve each in the Review queue"),
+                __(" — open it to complete any required fields and submit, then approve each in the Review queue"),
               indicator: "green",
-            }, 10);
+            }, 12);
             setTimeout(function () { sbr_load_transactions(frm); }, 400);
           },
         });

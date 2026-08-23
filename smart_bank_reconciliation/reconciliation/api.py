@@ -1186,6 +1186,7 @@ def consolidate_transactions(transaction_names, company=None):
     je.posting_date = latest_date
     je.company      = company_name
     je.remark       = narration
+    je.user_remark  = narration
     je.cheque_no    = "CONSOL-" + frappe.generate_hash(length=6).upper()
     je.cheque_date  = latest_date
 
@@ -1199,21 +1200,29 @@ def consolidate_transactions(transaction_names, company=None):
         je.append("accounts", {"account": clearing_account, "debit_in_account_currency": amt,       "credit_in_account_currency": 0,        "user_remark": narration})
         je.append("accounts", {"account": gl_account,       "debit_in_account_currency": 0,         "credit_in_account_currency": amt,      "user_remark": narration})
 
+    # Some sites configure their own mandatory fields/Accounting Dimensions
+    # (e.g. a custom "Channel" dimension) that this app has no safe way to
+    # guess a correct value for — auto-filling a wrong Channel/Cost Center/
+    # Department would misclassify a real accounting entry. Left as a DRAFT
+    # (not submitted) for the user to complete and submit themselves, using
+    # the same ignore_mandatory approach this app already uses for its other
+    # "create a starter JE/PE for the user to finish" path (create_draft_entry).
     frappe.db.commit()
     try:
-        je.insert(ignore_permissions=True)
+        je.insert(ignore_permissions=True, ignore_mandatory=True)
     except Exception as _exc:
         if "1020" in str(_exc) or "Record has changed" in str(_exc):
             import time as _time
             _time.sleep(0.1)
-            je.insert(ignore_permissions=True)
+            je.insert(ignore_permissions=True, ignore_mandatory=True)
         else:
             raise
     frappe.db.commit()
 
     # Route the originals to Review with the JE surfaced as the suggested
     # match, exactly like Many:1 — NOT auto-reconciled. The user still has to
-    # open each one and approve it (which links it via the normal
+    # open the JE to fill in any site-specific required fields and submit it,
+    # then approve each transaction here (which links it via the normal
     # Bank Transaction Payments flow in approve_match).
     matched_entries_json = frappe.as_json([je.name])
     for txn in txns:
@@ -1222,8 +1231,9 @@ def consolidate_transactions(transaction_names, company=None):
             "recon_match_type":      "Consolidated",
             "recon_confidence":      90.0,
             "recon_matched_entries": matched_entries_json,
-            "recon_ai_reasoning":    "Consolidated with {0} other transaction(s) into {1} — "
-                                     "please verify and approve.".format(len(txns) - 1, je.name),
+            "recon_ai_reasoning":    "Consolidated with {0} other transaction(s) into draft {1} — "
+                                     "open it to complete any required fields and submit, "
+                                     "then approve here.".format(len(txns) - 1, je.name),
         })
     frappe.db.commit()
 
