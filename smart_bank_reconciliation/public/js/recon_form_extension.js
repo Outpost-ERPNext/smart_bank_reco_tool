@@ -1624,7 +1624,8 @@ function sbr_open_bank_charges_modal(frm) {
           'Transactions are identified as bank charges by <strong>keyword match</strong> (description contains a known charge keyword) ' +
           'or <strong>amount rule</strong> (debit ≤ configured threshold). ' +
           'Select the ones to consolidate, then click <strong>Consolidate</strong>. ' +
-          'The original transactions will be marked Reconciled; the new combined transaction stays Unreconciled for manual Journal Entry creation.' +
+          'The combined amount is searched against your existing unreconciled Payment/Journal Entries — ' +
+          'if one matches, all selected transactions move to Review for you to approve; nothing is auto-reconciled and no new entry is created.' +
         '</div>' +
       '</div>' +
 
@@ -1756,8 +1757,7 @@ function sbr_open_bank_charges_modal(frm) {
       (totalWit > 0 ? "Total charges (debit): " + ReconUI.fmtCurrency(totalWit) + "\n" : "") +
       (totalDep > 0 ? "Total credits: "        + ReconUI.fmtCurrency(totalDep) + "\n" : "") +
       "Categories:\n" + catLines + "\n\n" +
-      "Original transactions will be marked Reconciled.\n" +
-      "The consolidated transaction remains Unreconciled for manual Journal Entry creation.";
+      "Search your existing unreconciled Payment/Journal Entries for one matching this combined amount?";
 
     frappe.confirm(confirmMsg, function () {
       frappe.call({
@@ -1773,11 +1773,21 @@ function sbr_open_bank_charges_modal(frm) {
         callback: function (r) {
           if (r.exc) return;
           d.hide();
-          var data   = r.message;
-          var txnUrl = "/app/bank-transaction/" + encodeURIComponent(data.bank_transaction);
+          var data = r.message;
+          if (!data.matched) {
+            frappe.show_alert({
+              message: __("No existing ERP entry matches the combined amount ({0}) of these {1} charges — nothing was changed.",
+                [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+              indicator: "orange",
+            }, 12);
+            return;
+          }
+          var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";
           frappe.show_alert({
-            message: data.count + __(" bank charge(s) consolidated → ") +
-              '<a href="' + txnUrl + '" target="_blank">' + data.bank_transaction + "</a>",
+            message: data.count + __(" bank charge(s) consolidated — matched to ") +
+              '<a href="/app/' + route + '/' + encodeURIComponent(data.matched_entry) +
+              '" target="_blank">' + data.matched_entry + "</a>" +
+              " (" + data.confidence.toFixed(1) + __("% confidence) — review and approve each in the Review queue"),
             indicator: "green",
           }, 12);
           setTimeout(function () { sbr_load_transactions(frm); }, 400);
@@ -2025,11 +2035,20 @@ function sbr_open_consolidate_transactions_modal(frm) {
         if (r.exc) return;
         d.hide();
         var data = r.message;
-        var jeUrl = "/app/journal-entry/" + encodeURIComponent(data.journal_entry);
+        if (!data.matched) {
+          frappe.show_alert({
+            message: __("No existing ERP entry matches the combined amount ({0}) of these {1} transactions — nothing was changed.",
+              [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+            indicator: "orange",
+          }, 12);
+          return;
+        }
+        var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";
+        var entryUrl = "/app/" + route + "/" + encodeURIComponent(data.matched_entry);
         frappe.show_alert({
-          message: data.count + __(" transactions consolidated into draft ") +
-            '<a href="' + jeUrl + '" target="_blank">' + data.journal_entry + "</a>" +
-            __(" — open it to complete any required fields and submit, then approve each in the Review queue"),
+          message: data.count + __(" transactions consolidated — matched to ") +
+            '<a href="' + entryUrl + '" target="_blank">' + data.matched_entry + "</a>" +
+            " (" + data.confidence.toFixed(1) + __("% confidence) — review and approve each in the Review queue"),
           indicator: "green",
         }, 12);
         // Reload the transaction list so the transactions show their new Review status
@@ -2311,7 +2330,7 @@ function sbr_bind_card_actions(frm, $canvas) {
       return;
     }
     frappe.confirm(
-      __("Consolidate {0} selected transaction(s) into one Journal Entry for review?", [names.length]),
+      __("Search for an existing ERP entry matching the combined amount of {0} selected transaction(s)?", [names.length]),
       function () {
         frappe.call({
           method: "smart_bank_reconciliation.reconciliation.api.consolidate_transactions",
@@ -2326,11 +2345,20 @@ function sbr_bind_card_actions(frm, $canvas) {
             var data = r.message;
             $canvas.find(".sbr-row-check, .sbr-select-all").prop("checked", false);
             $canvas.find(".sbr-toolbar-rerun-sel, .sbr-toolbar-consolidate-sel").hide();
+            if (!data.matched) {
+              frappe.show_alert({
+                message: __("No existing ERP entry matches the combined amount ({0}) of these {1} transactions — nothing was changed.",
+                  [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+                indicator: "orange",
+              }, 12);
+              return;
+            }
+            var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";
             frappe.show_alert({
-              message: data.count + __(" transactions consolidated into draft ") +
-                '<a href="/app/journal-entry/' + encodeURIComponent(data.journal_entry) +
-                '" target="_blank">' + data.journal_entry + "</a>" +
-                __(" — open it to complete any required fields and submit, then approve each in the Review queue"),
+              message: data.count + __(" transactions consolidated — matched to ") +
+                '<a href="/app/' + route + '/' + encodeURIComponent(data.matched_entry) +
+                '" target="_blank">' + data.matched_entry + "</a>" +
+                " (" + data.confidence.toFixed(1) + __("% confidence) — review and approve each in the Review queue"),
               indicator: "green",
             }, 12);
             setTimeout(function () { sbr_load_transactions(frm); }, 400);
