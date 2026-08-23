@@ -357,9 +357,14 @@ window.ReconUI = (function () {
       var tileLabel = $(this).data("queue");
       var queueName = tileLabel === "TOTAL" ? null : (TILE_TO_QUEUE[tileLabel] || null);
       filterByQueue($container, queueName);
-      // Navigate to AI Match Pairs tab when a specific queue tile is clicked
-      if (queueName && $container.find(".sbr-card").length) {
+      // Queues with AI suggestion cards (Auto/Review/Unmatched/High-Val/Duplicate/
+      // Aging) live on the AI Match Pairs tab. Total and Reconciled have no cards
+      // there — they're plain rows on the Bank Transactions tab, so route there
+      // instead of leaving the user stuck on whatever tab was already open.
+      if (queueName && tileLabel !== "RECONCILED" && $container.find(".sbr-card").length) {
         switchTab($container, "ai");
+      } else {
+        switchTab($container, "bank");
       }
     });
   }
@@ -416,7 +421,11 @@ window.ReconUI = (function () {
         '<button class="sbr-btn sbr-btn-accept sbr-banner-approve-btn">' +
           "✓ Approve All Auto (" + auto + ")</button>" +
       "</div>"
-    ).show();
+    );
+    // Only relevant while looking at the Auto queue — don't leave it showing
+    // (and the approve-all action available) on every other tile/tab.
+    var activeQueue = $container.data("sbr-queue-filter") || null;
+    $container.find(".sbr-ai-banner").css("display", activeQueue === "Auto" ? "flex" : "none");
   }
 
   /* ── Filter by queue ── */
@@ -427,7 +436,8 @@ window.ReconUI = (function () {
     var txt = ($container.data("sbr-text-filter") || "").toLowerCase().trim();
     var confRangeTable = $container.data("sbr-confidence-filter") || null;
     var agingRange = queueName === "Aging" ? ($container.data("sbr-aging-range-filter") || null) : null;
-    var confRange  = queueName === "Review" ? ($container.data("sbr-conf-range-filter") || null) : null;
+    var confRange  = (queueName === "Review" || queueName === "Aging")
+      ? ($container.data("sbr-conf-range-filter") || null) : null;
 
     var total = 0, visible = 0;
     $container.find(".sbr-row").each(function () {
@@ -461,9 +471,17 @@ window.ReconUI = (function () {
       if (cardOk && agingOk && confOk) { $card.show(); } else { $card.hide(); }
     });
 
-    // Show/hide the Aging / Confidence sub-filter bars alongside their queue tab
+    // Show/hide the Aging / Confidence sub-filter bars alongside their queue tab.
+    // Confidence filtering is also offered on Aging (not just Review) — aging
+    // cards already carry a real data-confidence score, so the same bucket
+    // logic applies unchanged; both filters can be used together on Aging.
     $container.find(".sbr-aging-filter-bar").css("display", queueName === "Aging" ? "flex" : "none");
-    $container.find(".sbr-conf-filter-bar").css("display", queueName === "Review" ? "flex" : "none");
+    $container.find(".sbr-conf-filter-bar").css("display",
+      (queueName === "Review" || queueName === "Aging") ? "flex" : "none");
+
+    // "Approve All Auto" only makes sense while looking at the Auto queue —
+    // it was previously left visible on every tile/tab once AI Match ran.
+    $container.find(".sbr-ai-banner").css("display", queueName === "Auto" ? "flex" : "none");
 
     // Show/hide duplicate bulk-action toolbar whenever filter changes
     var $dupBar = $container.find(".sbr-dup-bulk-bar");

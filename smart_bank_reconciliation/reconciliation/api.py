@@ -1118,10 +1118,16 @@ def _inject_preselected(entry_name, vouchers):
 
 @frappe.whitelist()
 def consolidate_transactions(transaction_names, company=None):
-    """Combine selected bank transactions into a single new Bank Transaction.
+    """Bundle selected orphan bank transactions into one Journal Entry against
+    the configured suspense/clearing account, and route the originals to the
+    Review queue with that JE pre-filled as the suggested match — the same
+    "propose, then let the user approve" pattern the AI engine's own Many:1
+    grouping already uses (matching_engine.py's _process_many_to_one), rather
+    than silently marking them Reconciled with no real entry behind it.
 
-    The originals are marked Reconciled/unallocated=0. The new combined
-    transaction remains unreconciled so it can be matched to an ERP entry.
+    Deliberately does NOT create a placeholder Bank Transaction for the net
+    amount — that inflated the transaction total by 1 for every consolidation
+    without adding any real bank activity.
     """
     frappe.only_for(["Accounts Manager", "System Manager"])
 
@@ -1146,46 +1152,83 @@ def consolidate_transactions(transaction_names, company=None):
     # Use the latest date among selected transactions
     latest_date = max(t.date for t in txns)
 
-    # Create the combined Bank Transaction
-    new_txn = frappe.new_doc("Bank Transaction")
-    new_txn.bank_account       = bank_account
-    new_txn.date               = latest_date
-    new_txn.deposit            = total_deposit
-    new_txn.withdrawal         = total_withdrawal
-    new_txn.description        = "Consolidated Transaction by " + frappe.session.user
-    new_txn.unallocated_amount = total_deposit - total_withdrawal
     gl_account = frappe.db.get_value("Bank Account", bank_account, "account")
-    new_txn.currency = (
-        frappe.db.get_value("Account", gl_account, "account_currency")
-        if gl_account else None
-    ) or frappe.defaults.get_defaults().get("currency") or "NGN"
+    if not gl_account:
+        frappe.throw(_("The selected Bank Account has no linked GL Account."))
+    company_name = company or frappe.db.get_value("Account", gl_account, "company") or \
+                   frappe.defaults.get_defaults().get("company")
+
+    # A dedicated "pending classification" account — configured once in SBR
+    # Settings — so a mixed bag of small unrelated items (license fees, IOU
+    # claims, airtime, bank charges, ...) isn't miscategorized by guessing.
+    clearing_account = _load_sbr_settings().get("suspense_account")
+    if not clearing_account:
+        for keyword in ["%Suspense%", "%Clearing%"]:
+            clearing_account = frappe.db.get_value(
+                "Account",
+                {"company": company_name, "account_name": ["like", keyword], "is_group": 0},
+                "name",
+            ) or ""
+            if clearing_account:
+                break
+    if not clearing_account:
+        frappe.throw(_(
+            "No Suspense/Clearing Account configured. Set one under SBR Settings "
+            "(Suspense Account), or create a 'Suspense' or 'Clearing' account in the "
+            "Chart of Accounts for {0}."
+        ).format(company_name))
+
+    net = total_deposit - total_withdrawal
+    narration = "Consolidated {0} bank transactions by {1}".format(len(txns), frappe.session.user)
+
+    je = frappe.new_doc("Journal Entry")
+    je.voucher_type = "Bank Entry"
+    je.posting_date = latest_date
+    je.company      = company_name
+    je.remark       = narration
+    je.cheque_no    = "CONSOL-" + frappe.generate_hash(length=6).upper()
+    je.cheque_date  = latest_date
+
+    if net >= 0:
+        # Net money IN: DR bank, CR suspense (pending classification)
+        je.append("accounts", {"account": gl_account,       "debit_in_account_currency": net,       "credit_in_account_currency": 0,        "user_remark": narration})
+        je.append("accounts", {"account": clearing_account, "debit_in_account_currency": 0,         "credit_in_account_currency": net,      "user_remark": narration})
+    else:
+        amt = abs(net)
+        # Net money OUT: DR suspense (pending classification), CR bank
+        je.append("accounts", {"account": clearing_account, "debit_in_account_currency": amt,       "credit_in_account_currency": 0,        "user_remark": narration})
+        je.append("accounts", {"account": gl_account,       "debit_in_account_currency": 0,         "credit_in_account_currency": amt,      "user_remark": narration})
 
     frappe.db.commit()
     try:
-        new_txn.insert(ignore_permissions=True)
-        new_txn.submit()
+        je.insert(ignore_permissions=True)
     except Exception as _exc:
         if "1020" in str(_exc) or "Record has changed" in str(_exc):
             import time as _time
             _time.sleep(0.1)
-            new_txn.insert(ignore_permissions=True)
-            new_txn.submit()
+            je.insert(ignore_permissions=True)
         else:
             raise
+    frappe.db.commit()
 
-    # Mark each original transaction as Reconciled with unallocated_amount = 0
+    # Route the originals to Review with the JE surfaced as the suggested
+    # match, exactly like Many:1 — NOT auto-reconciled. The user still has to
+    # open each one and approve it (which links it via the normal
+    # Bank Transaction Payments flow in approve_match).
+    matched_entries_json = frappe.as_json([je.name])
     for txn in txns:
         frappe.db.set_value("Bank Transaction", txn.name, {
-            "recon_queue":        "Reconciled",
-            "recon_user_action":  "Consolidated",
-            "recon_ai_reasoning": "Consolidated into " + new_txn.name,
-            "status":             "Reconciled",
-            "unallocated_amount": 0,
+            "recon_queue":           "Review",
+            "recon_match_type":      "Consolidated",
+            "recon_confidence":      90.0,
+            "recon_matched_entries": matched_entries_json,
+            "recon_ai_reasoning":    "Consolidated with {0} other transaction(s) into {1} — "
+                                     "please verify and approve.".format(len(txns) - 1, je.name),
         })
     frappe.db.commit()
 
     return {
-        "bank_transaction": new_txn.name,
+        "journal_entry":    je.name,
         "count":            len(txns),
         "total_deposit":    total_deposit,
         "total_withdrawal": total_withdrawal,

@@ -2025,13 +2025,14 @@ function sbr_open_consolidate_transactions_modal(frm) {
         if (r.exc) return;
         d.hide();
         var data = r.message;
-        var txnUrl = "/app/bank-transaction/" + encodeURIComponent(data.bank_transaction);
+        var jeUrl = "/app/journal-entry/" + encodeURIComponent(data.journal_entry);
         frappe.show_alert({
-          message: data.count + __(" transactions consolidated → ") +
-            '<a href="' + txnUrl + '" target="_blank">' + data.bank_transaction + "</a>",
+          message: data.count + __(" transactions consolidated into ") +
+            '<a href="' + jeUrl + '" target="_blank">' + data.journal_entry + "</a>" +
+            __(" — review and approve each in the Review queue"),
           indicator: "green",
         }, 10);
-        // Reload the transaction list so the new combined transaction appears
+        // Reload the transaction list so the transactions show their new Review status
         setTimeout(function () { sbr_load_transactions(frm); }, 400);
       },
     });
@@ -2310,7 +2311,7 @@ function sbr_bind_card_actions(frm, $canvas) {
       return;
     }
     frappe.confirm(
-      __("Consolidate {0} selected transaction(s) into one combined Bank Transaction?", [names.length]),
+      __("Consolidate {0} selected transaction(s) into one Journal Entry for review?", [names.length]),
       function () {
         frappe.call({
           method: "smart_bank_reconciliation.reconciliation.api.consolidate_transactions",
@@ -2326,9 +2327,10 @@ function sbr_bind_card_actions(frm, $canvas) {
             $canvas.find(".sbr-row-check, .sbr-select-all").prop("checked", false);
             $canvas.find(".sbr-toolbar-rerun-sel, .sbr-toolbar-consolidate-sel").hide();
             frappe.show_alert({
-              message: data.count + __(" transactions consolidated → ") +
-                '<a href="/app/bank-transaction/' + encodeURIComponent(data.bank_transaction) +
-                '" target="_blank">' + data.bank_transaction + "</a>",
+              message: data.count + __(" transactions consolidated into ") +
+                '<a href="/app/journal-entry/' + encodeURIComponent(data.journal_entry) +
+                '" target="_blank">' + data.journal_entry + "</a>" +
+                __(" — review and approve each in the Review queue"),
               indicator: "green",
             }, 10);
             setTimeout(function () { sbr_load_transactions(frm); }, 400);
@@ -2772,6 +2774,7 @@ function sbr_open_upload_modal(frm, $canvas) {
             '<div class="sbr-upload-zone-sub">or <label class="sbr-upload-browse" for="sbr-file-input">browse your computer</label></div>' +
             '<input type="file" id="sbr-file-input" accept=".csv,.txt,.xlsx,.xls,.mt940,.sta,.940" style="display:none">' +
             '<div class="sbr-upload-zone-hint">CSV · Excel (.xlsx/.xls) · MT940/STA &nbsp;|&nbsp; Columns: Date · Description · Debit · Credit · Reference</div>' +
+            '<button class="sbr-btn sbr-upload-download-template" type="button" style="margin-top:10px">&#8595; Download Template</button>' +
           '</div>' +
           '<div class="sbr-upload-preview" style="display:none"></div>' +
         '</div>' +
@@ -2869,6 +2872,16 @@ function sbr_open_upload_modal(frm, $canvas) {
     $overlay.find(".sbr-upload-zone").show();
     $overlay.find(".sbr-upload-import").prop("disabled", true);
     $overlay.find("#sbr-file-input").val("");
+  });
+
+  /* Download template — same column layout the parser/auto-detect expects */
+  $overlay.on("click", ".sbr-upload-download-template", function (e) {
+    e.stopPropagation();
+    var blob = new Blob([DEMO_CSV], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = "bank_statement_template.csv"; a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   });
 
   /* Close */
