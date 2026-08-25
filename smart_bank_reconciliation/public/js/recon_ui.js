@@ -120,6 +120,10 @@ window.ReconUI = (function () {
   }
 
   function confidenceBar(pct) {
+    // Defensive clamp — older records saved before the backend confidence
+    // clamp could carry an out-of-range value; never render a bar/label
+    // outside 0-100%.
+    pct = Math.max(0, Math.min(100, pct || 0));
     var color = pct >= 90 ? "#16A34A" : pct >= 50 ? "#D97706" : "#DC2626";
     return '<div class="sbr-conf-bar-wrap">' +
       '<div class="sbr-conf-bar-fill" style="width:' + pct + '%;background:' + color + '"></div>' +
@@ -130,7 +134,7 @@ window.ReconUI = (function () {
     if (!signals) return "";
     var html = '<div class="sbr-signal-row">';
     Object.keys(signals).forEach(function (k) {
-      var v = Math.round(signals[k]);
+      var v = Math.max(0, Math.min(100, Math.round(signals[k])));
       var ok = v >= 80 ? "#16A34A" : v >= 50 ? "#D97706" : "#DC2626";
       html += '<span class="sbr-signal-chip" style="color:' + ok + ';border-color:' + ok + '">' +
               (SIGNAL_LABEL[k] || k) + " " + v + "%</span>";
@@ -146,6 +150,7 @@ window.ReconUI = (function () {
     if (!pct || pct <= 0) {
       return '<span style="color:#cbd5e1;font-size:12px">—</span>';
     }
+    pct = Math.min(100, pct);
     var level, cls;
     if (pct >= 90)      { level = "HIGH"; cls = "sbr-conf-high"; }
     else if (pct >= 60) { level = "MED";  cls = "sbr-conf-med";  }
@@ -460,6 +465,7 @@ window.ReconUI = (function () {
       );
     }
 
+    var visibleCardTxns = [];
     $container.find(".sbr-card").each(function () {
       var $card = $(this);
       var cardQueue = $card.data("queue") || "";
@@ -468,20 +474,39 @@ window.ReconUI = (function () {
         || (queueName === "Unmatched" && cardQueue === "");
       var agingOk = _agingBucketMatch(parseInt($card.data("aging-days"), 10), agingRange);
       var confOk  = _confBucketMatch(parseFloat($card.data("confidence")) || 0, confRange);
-      if (cardOk && agingOk && confOk) { $card.show(); } else { $card.hide(); }
+      if (cardOk && agingOk && confOk) {
+        $card.show();
+        if (queueName === "Review" || queueName === "Aging") visibleCardTxns.push($card.data("txn"));
+      } else {
+        $card.hide();
+      }
     });
 
     // Show/hide the Aging / Confidence sub-filter bars alongside their queue tab.
     // Confidence filtering is also offered on Aging (not just Review) — aging
     // cards already carry a real data-confidence score, so the same bucket
     // logic applies unchanged; both filters can be used together on Aging.
-    $container.find(".sbr-aging-filter-bar").css("display", queueName === "Aging" ? "flex" : "none");
+    $container.find(".sbr-aging-filter-bar").css("display", queueName === "Aging" ? "inline-flex" : "none");
     $container.find(".sbr-conf-filter-bar").css("display",
-      (queueName === "Review" || queueName === "Aging") ? "flex" : "none");
+      (queueName === "Review" || queueName === "Aging") ? "inline-flex" : "none");
 
     // "Approve All Auto" only makes sense while looking at the Auto queue —
     // it was previously left visible on every tile/tab once AI Match ran.
     $container.find(".sbr-ai-banner").css("display", queueName === "Auto" ? "flex" : "none");
+
+    // Bulk-approve-filtered — Review/Aging only, count/enable tracks
+    // whatever is currently visible under the active filters.
+    var $bulkBar = $container.find(".sbr-bulk-approve-bar");
+    if (queueName === "Review" || queueName === "Aging") {
+      $bulkBar.css("display", "flex");
+      $bulkBar.find(".sbr-bulk-approve-count").text(visibleCardTxns.length);
+      $bulkBar.data("sbr-visible-txns", visibleCardTxns);
+      $bulkBar.find(".sbr-bulk-approve-filtered-btn")
+        .prop("disabled", !visibleCardTxns.length)
+        .css("opacity", visibleCardTxns.length ? "1" : "0.5");
+    } else {
+      $bulkBar.hide();
+    }
 
     // Show/hide duplicate bulk-action toolbar whenever filter changes
     var $dupBar = $container.find(".sbr-dup-bulk-bar");
@@ -591,20 +616,115 @@ window.ReconUI = (function () {
         '<p class="sbr-empty" style="padding:16px">No transactions found for this period.</p>'
       );
       $container.find(".sbr-txn-counter").text("0 transactions");
-      return;
+      return { totalDeposit: 0, totalWithdrawal: 0, netBalance: parseFloat($container.data("sbr-opening-balance")) || 0 };
     }
 
-    // Store for modal and consolidate access
+    // Running balance follows true chronological order over every individual
+    // real bank statement line — computed BEFORE any consolidation grouping
+    // collapses rows, so a merged group's display date (its latest member)
+    // never distorts the balance of transactions that fall between its
+    // members' actual dates.
+    var openingBalance = parseFloat($container.data("sbr-opening-balance")) || 0;
+    var chronological = transactions.slice().sort(function (a, b) {
+      return new Date(a.date) - new Date(b.date);
+    });
+    var runningBalance = {};
+    var runningBal = openingBalance;
+    chronological.forEach(function (t) {
+      runningBal += (parseFloat(t.deposit) || 0) - (parseFloat(t.withdrawal) || 0);
+      runningBalance[t.name] = runningBal;
+    });
+
+    // Consolidated groups collapse into a single display row — WITHOUT any
+    // new field: recon_run_id ("Last Run ID") is a pre-existing custom field
+    // that nothing else in this app reads or writes, repurposed purely as
+    // the Consolidate group key (set identically on every member by
+    // _consolidate_via_existing_match in api.py, whether or not a match was
+    // found — that's what lets an UNMATCHED group collapse into one row too,
+    // not just a matched one).
+    var byName = {};
+    transactions.forEach(function (t) { byName[t.name] = t; });
+    var groups = {};       // group key -> [txn names]
+    var groupOf = {};      // txn name -> group key
+    transactions.forEach(function (t) {
+      if (t.recon_match_type !== "Consolidated" || !t.recon_run_id) return;
+      var key = t.recon_run_id;
+      (groups[key] = groups[key] || []).push(t.name);
+      groupOf[t.name] = key;
+    });
+    // A "group" of exactly one isn't a group — leave it as a normal row.
+    Object.keys(groups).forEach(function (key) {
+      if (groups[key].length < 2) {
+        groups[key].forEach(function (n) { delete groupOf[n]; });
+        delete groups[key];
+      }
+    });
+    $container.data("sbr-groups", groups);
+
+    var displayTransactions = [];
+    var addedGroup = {};
+    transactions.forEach(function (t) {
+      var key = groupOf[t.name];
+      if (!key) { displayTransactions.push(t); return; }
+      if (addedGroup[key]) return;
+      addedGroup[key] = true;
+      var members = groups[key].map(function (n) { return byName[n]; }).filter(Boolean);
+      var rep = members.slice().sort(function (a, b) { return a.name < b.name ? -1 : 1; })[0];
+      var totalDep = 0, totalWit = 0, totalUnalloc = 0, latest = members[0];
+      members.forEach(function (m) {
+        totalDep     += parseFloat(m.deposit) || 0;
+        totalWit     += parseFloat(m.withdrawal) || 0;
+        totalUnalloc += parseFloat(m.unallocated_amount) || 0;
+        if (new Date(m.date) > new Date(latest.date)) latest = m;
+      });
+      displayTransactions.push($.extend({}, rep, {
+        deposit: totalDep,
+        withdrawal: totalWit,
+        unallocated_amount: totalUnalloc,
+        date: latest.date,
+        description: "Consolidated (" + members.length + " txns): " +
+          members.map(function (m) { return m.name; }).join(", "),
+        _consolidatedBalanceKey: latest.name,
+      }));
+    });
+    transactions = displayTransactions;
+
+    // Consolidated entries (grouped or individually-unmatched) surface at
+    // the top of the Bank Transactions list so it's immediately obvious
+    // which rows were consolidated and what they matched against —
+    // everything else keeps its original order.
+    transactions = transactions.slice().sort(function (a, b) {
+      var aC = a.recon_match_type === "Consolidated" ? 0 : 1;
+      var bC = b.recon_match_type === "Consolidated" ? 0 : 1;
+      return aC - bC;
+    });
+
+    // Store for modal and consolidate access — the collapsed/display list,
+    // since every current reader only needs correct per-row totals and
+    // name-based lookup, both of which the collapsed rows still satisfy.
     $container.data("transactions", transactions);
 
-    var html = '<table class="sbr-table"><thead><tr>' +
+    var totalDeposit = 0, totalWithdrawal = 0;
+    transactions.forEach(function (t) {
+      totalDeposit    += parseFloat(t.deposit)    || 0;
+      totalWithdrawal += parseFloat(t.withdrawal) || 0;
+    });
+    var netBalance = openingBalance + totalDeposit - totalWithdrawal;
+
+    var html = '<table class="sbr-table sbr-txn-table"><colgroup>' +
+      '<col style="width:36px"><col style="width:40px"><col style="width:90px">' +
+      '<col style="width:220px"><col style="width:130px"><col style="width:130px">' +
+      '<col style="width:130px"><col style="width:150px"><col style="width:180px">' +
+      '<col style="width:110px"><col style="width:140px"><col style="width:100px">' +
+      '</colgroup><thead><tr>' +
       '<th class="sbr-check-col"><input type="checkbox" class="sbr-select-all" title="Select all visible"></th>' +
-      '<th style="width:36px;color:#94a3b8;font-weight:600">#</th>' +
-      "<th>Date</th>" +
+      '<th class="sbr-idx-col" style="color:#94a3b8;font-weight:600">#</th>' +
+      '<th class="sbr-date-col">Date</th>' +
       "<th>Description / Narration</th>" +
       "<th>Deposit (" + currencySymbol() + ")</th>" +
       "<th>Withdrawal (" + currencySymbol() + ")</th>" +
       "<th>Unallocated (" + currencySymbol() + ")</th>" +
+      "<th>Balance (" + currencySymbol() + ")</th>" +
       "<th>Reference No.</th>" +
       "<th>AI Match</th>" +
       "<th>Matched ERP Entry</th>" +
@@ -630,19 +750,26 @@ window.ReconUI = (function () {
                 (isReconciled ? "" :
                   '<input type="checkbox" class="sbr-row-check" data-txn="' + t.name + '">') +
               "</td>" +
-              '<td style="color:#94a3b8;font-size:11px;font-variant-numeric:tabular-nums">' + (idx + 1) + "</td>" +
-              "<td style='white-space:nowrap'>" + (t.date || "") + "</td>" +
-              "<td class='sbr-desc'>" + (t.description || t.party || "—") + "</td>" +
-              '<td style="color:#16a34a;font-weight:600;font-variant-numeric:tabular-nums">' +
+              '<td class="sbr-idx-col" style="color:#94a3b8;font-size:11px;font-variant-numeric:tabular-nums">' + (idx + 1) + "</td>" +
+              "<td class='sbr-date-col' style='white-space:nowrap'>" + (t.date || "") + "</td>" +
+              "<td class='sbr-desc' title=\"" + (t.description || t.party || "").replace(/"/g, "&quot;") + "\">" +
+                (t.description || t.party || "—") + "</td>" +
+              '<td class="sbr-amt-cell" style="color:#16a34a;font-weight:600;font-variant-numeric:tabular-nums">' +
                 (t.deposit && parseFloat(t.deposit) > 0 ? formatAmount(t.deposit) : "") + "</td>" +
-              '<td style="color:#dc2626;font-weight:600;font-variant-numeric:tabular-nums">' +
+              '<td class="sbr-amt-cell" style="color:#dc2626;font-weight:600;font-variant-numeric:tabular-nums">' +
                 (t.withdrawal && parseFloat(t.withdrawal) > 0 ? formatAmount(t.withdrawal) : "") + "</td>" +
-              '<td style="color:#64748b;font-variant-numeric:tabular-nums">' +
+              '<td class="sbr-amt-cell" style="color:#64748b;font-variant-numeric:tabular-nums">' +
                 (t.unallocated_amount && parseFloat(t.unallocated_amount) > 0
                   ? formatAmount(t.unallocated_amount) : "—") + "</td>" +
-              "<td class='sbr-ref'>" + (t.reference_number || "—") + "</td>" +
+              '<td class="sbr-amt-cell" style="color:#0f172a;font-weight:600;font-variant-numeric:tabular-nums">' +
+                formatAmount((function () {
+                  var key = t._consolidatedBalanceKey || t.name;
+                  return runningBalance[key] != null ? runningBalance[key] : 0;
+                })()) + "</td>" +
+              "<td class='sbr-ref' title=\"" + (t.reference_number || "").replace(/"/g, "&quot;") + "\">" +
+                (t.reference_number || "—") + "</td>" +
               '<td class="sbr-match-cell">' + matchCell + "</td>" +
-              '<td class="sbr-ref sbr-matched-entry-cell" style="max-width:160px">' + matchedEntryHtml + "</td>" +
+              '<td class="sbr-ref sbr-matched-entry-cell">' + matchedEntryHtml + "</td>" +
               "<td>" + (isReconciled
                 ? '<span style="font-size:11px;color:#16a34a;font-weight:500">&#10003; Reconciled</span>' +
                   ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
@@ -652,7 +779,19 @@ window.ReconUI = (function () {
               ) + "</td>" +
               "</tr>";
     });
-    html += "</tbody></table>";
+    html += "</tbody>" +
+      '<tfoot><tr class="sbr-table-footer" style="background:#f8fafc;font-weight:700;' +
+        'border-top:2px solid #cbd5e1">' +
+        '<td class="sbr-check-col"></td>' +
+        '<td class="sbr-idx-col"></td>' +
+        '<td class="sbr-date-col"></td>' +
+        '<td style="padding:8px 12px;color:#374151">Totals</td>' +
+        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#16a34a;font-variant-numeric:tabular-nums">' + formatAmount(totalDeposit) + "</td>" +
+        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#dc2626;font-variant-numeric:tabular-nums">' + formatAmount(totalWithdrawal) + "</td>" +
+        "<td></td>" +
+        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#0f172a;font-variant-numeric:tabular-nums">' + formatAmount(netBalance) + "</td>" +
+        '<td colspan="4"></td>' +
+      "</tr></tfoot></table>";
 
     $container.find(".sbr-table-wrap").html(html);
     $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
@@ -672,6 +811,8 @@ window.ReconUI = (function () {
       $(this).addClass("sbr-row-active");
       showSuggestionCard($container, txnName);
     });
+
+    return { totalDeposit: totalDeposit, totalWithdrawal: totalWithdrawal, netBalance: netBalance };
   }
 
   function updateMatchBadges($container, transactions) {
@@ -1259,6 +1400,8 @@ window.ReconUI = (function () {
     var html = '<div class="sbr-sp-header">' +
       '<span style="font-weight:700;font-size:14px;color:#0f172a">AI Match Pairs</span>' +
       '<div style="display:flex;align-items:center;gap:8px">' +
+        '<button class="sbr-btn sbr-sp-export-btn" style="padding:4px 10px;font-size:11px" ' +
+          'title="Export the currently visible/filtered cards">&#8595; Export CSV</button>' +
         '<button class="sbr-sp-scroll-btn sbr-scroll-bot-btn" title="Scroll to bottom">&#8681;</button>' +
         '<span class="sbr-sp-badge">' + signalCount + " SIGNALS</span>" +
       '</div>' +
@@ -1291,11 +1434,15 @@ window.ReconUI = (function () {
               (autoCount > 1 ? "es" : "") + " ready</div>";
     }
 
+    // Aging / Confidence sub-filters share one row so they sit side by side
+    // instead of stacking as separate full-width bars.
+    html += '<div class="sbr-subfilter-row" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px;">';
+
     // Aging sub-filter — shown only when the Aging queue filter is active
     html +=
       '<div class="sbr-aging-filter-bar" style="display:none;align-items:center;gap:8px;' +
         'padding:8px 12px;background:#fff7ed;border:1px solid #fed7aa;' +
-        'border-radius:6px;margin-bottom:10px;font-size:12px;color:#9a3412">' +
+        'border-radius:6px;font-size:12px;color:#9a3412">' +
         '<span style="font-weight:600">Aging (days unreconciled):</span>' +
         '<select class="sbr-aging-range-filter" style="padding:4px 8px;border:1px solid #fed7aa;' +
           'border-radius:5px;font-size:12px;color:#9a3412;background:#fff">' +
@@ -1312,7 +1459,7 @@ window.ReconUI = (function () {
     html +=
       '<div class="sbr-conf-filter-bar" style="display:none;align-items:center;gap:8px;' +
         'padding:8px 12px;background:#fffbeb;border:1px solid #fde68a;' +
-        'border-radius:6px;margin-bottom:10px;font-size:12px;color:#92400e">' +
+        'border-radius:6px;font-size:12px;color:#92400e">' +
         '<span style="font-weight:600">Confidence score:</span>' +
         '<select class="sbr-conf-range-filter" style="padding:4px 8px;border:1px solid #fde68a;' +
           'border-radius:5px;font-size:12px;color:#92400e;background:#fff">' +
@@ -1320,8 +1467,24 @@ window.ReconUI = (function () {
           '<option value="0-10">0–10%</option>' +
           '<option value="11-50">11–50%</option>' +
           '<option value="51-79">51–79%</option>' +
-          '<option value="80+">80%+</option>' +
         '</select>' +
+      '</div>';
+
+    html += '</div>';
+
+    // Bulk-approve-filtered bar — shown on Review/Aging; approves whatever
+    // is currently visible under the active filters (queue + confidence +
+    // aging + search + party), not a fixed hardcoded set.
+    html +=
+      '<div class="sbr-bulk-approve-bar" style="display:none;align-items:center;gap:10px;' +
+        'padding:8px 12px;background:#f0fdf4;border:1px solid #bbf7d0;' +
+        'border-radius:6px;margin-bottom:10px;font-size:12px;color:#166534">' +
+        '<span style="font-weight:600"><span class="sbr-bulk-approve-count">0</span> matching this filter</span>' +
+        '<span style="flex:1"></span>' +
+        '<button class="sbr-btn sbr-bulk-approve-filtered-btn" disabled ' +
+          'style="opacity:0.5;background:#16a34a;color:#fff;border-color:#16a34a">' +
+          '&#10003; Bulk Approve Filtered' +
+        '</button>' +
       '</div>';
 
     // Duplicate bulk-action toolbar — shown only when Duplicate queue filter is active
@@ -1353,6 +1516,44 @@ window.ReconUI = (function () {
     $panel.find(".sbr-sp-queue-tab").on("click", function () {
       var filter = $(this).data("filter");
       filterByQueue($container, filter === "all" ? null : filter);
+    });
+
+    // Export whatever cards are currently visible under the active
+    // queue/confidence/aging/search filters — not a fixed export of everything.
+    $panel.find(".sbr-sp-export-btn").on("click", function () {
+      var visibleNames = {};
+      $panel.find(".sbr-card:visible").each(function () {
+        visibleNames[$(this).data("txn")] = true;
+      });
+      var rows = ($container.data("suggestions") || []).filter(function (s) {
+        return visibleNames[s.bank_txn];
+      });
+      if (!rows.length) {
+        frappe.msgprint(__("No cards to export under the current filter."));
+        return;
+      }
+      var header = ["Bank TXN","Date","Description","Reference","Deposit","Withdrawal",
+                     "Queue","Match Type","Confidence %","Matched Entry","Reasoning"];
+      function esc(v) {
+        var s = String(v === null || v === undefined ? "" : v).replace(/"/g, '""');
+        return '"' + s + '"';
+      }
+      var csvRows = [header.map(esc).join(",")];
+      rows.forEach(function (s) {
+        var m = s.matched || {};
+        csvRows.push([
+          s.bank_txn, s.date, s.description || "", s.reference_number || "",
+          s.deposit || "", s.withdrawal || "",
+          s.queue || "", s.match_type || "",
+          s.confidence || "", m.name || "", s.reasoning || "",
+        ].map(esc).join(","));
+      });
+      var blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      var queueLabel = ($container.data("sbr-queue-filter") || "all").toLowerCase();
+      a.href = url; a.download = "sbr_" + queueLabel + "_export.csv"; a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
     });
 
     // ↓ button — scroll to last visible card
@@ -1865,19 +2066,23 @@ window.ReconUI = (function () {
           $modal.find(".sbr-report-subtitle").html(sub);
         }
 
-        // ── 6 stat cards (added MANUALLY MATCHED) ──
-        // Pre-compute bank unmatched count (Unmatched + Aging + Duplicate) to match the tab
-        var bankUmCount = d.transactions.filter(function (t) {
-          return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate";
-        }).length;
+        // ── Stat cards — mirror the main screen's own tiles exactly (same
+        // 8 categories, same counts, same colors) so this report can never
+        // show a different number than what the user already sees on the
+        // main screen for the same period. ERP Unmatched has no equivalent
+        // tile on the main screen (it's PE/JE-sourced, not Bank Transaction-
+        // sourced) so it's kept as a separate, clearly-additional tab below
+        // rather than a 9th "main" card.
         var autoColor = s.automation_rate >= 70 ? "#16a34a" : s.automation_rate >= 40 ? "#d97706" : "#dc2626";
         var cards = [
-          { label: "AUTO-MATCHED",      val: s.auto,                  color: "#16a34a", border: "#bbf7d0" },
-          { label: "MANUALLY MATCHED",  val: s.manual_reconciled || 0, color: "#0369a1", border: "#bae6fd" },
-          { label: "NEED REVIEW",       val: s.review,                color: "#d97706", border: "#fde68a" },
-          { label: "BANK UNMATCHED",    val: bankUmCount,             color: "#dc2626", border: "#fecaca" },
-          { label: "ERP UNMATCHED",     val: erp_um.length,           color: "#dc2626", border: "#fed7aa" },
-          { label: "AUTOMATION RATE",   val: s.automation_rate + "%", color: "#1d4ed8", border: "#bfdbfe" },
+          { label: "TOTAL",      val: s.total,      color: "#1d4ed8", border: "#bfdbfe" },
+          { label: "AUTO",       val: s.auto,       color: QUEUE_COLOR.Auto.text,       border: QUEUE_COLOR.Auto.bg },
+          { label: "REVIEW",     val: s.review,     color: QUEUE_COLOR.Review.text,     border: QUEUE_COLOR.Review.bg },
+          { label: "UNMATCHED",  val: s.unmatched,  color: QUEUE_COLOR.Unmatched.text,  border: QUEUE_COLOR.Unmatched.bg },
+          { label: "HIGH-VAL",   val: s.high_val,   color: QUEUE_COLOR["High-Val"].text, border: QUEUE_COLOR["High-Val"].bg },
+          { label: "DUPES",      val: s.dupes,      color: QUEUE_COLOR.Duplicate.text,  border: QUEUE_COLOR.Duplicate.bg },
+          { label: "AGING",      val: s.aging,      color: QUEUE_COLOR.Aging.text,      border: QUEUE_COLOR.Aging.bg },
+          { label: "RECONCILED", val: s.reconciled, color: QUEUE_COLOR.Reconciled.text, border: "#cbd5e1" },
         ];
         var cardsHtml = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px">';
         cards.forEach(function (c) {
@@ -1910,18 +2115,25 @@ window.ReconUI = (function () {
             '</div>' +
           '</div>';
 
-        // ── Tabs ──
-        var autoMatchedTxns   = d.transactions.filter(function (t) { return t.queue === "Auto"; });
-        var manualMatchedTxns = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
-        var reviewTxns        = d.transactions.filter(function (t) { return t.queue === "Review" || t.queue === "High-Val"; });
-        var bankUmTxns        = d.transactions.filter(function (t) { return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate"; });
+        // ── Tabs — one per main-screen tile, same grouping, plus ERP
+        // Unmatched appended as an extra (non-tile) tab ──
+        var autoTxns       = d.transactions.filter(function (t) { return t.queue === "Auto"; });
+        var reviewTxns     = d.transactions.filter(function (t) { return t.queue === "Review"; });
+        var unmatchedTxns  = d.transactions.filter(function (t) { return t.queue === "Unmatched"; });
+        var highValTxns    = d.transactions.filter(function (t) { return t.queue === "High-Val"; });
+        var dupTxns        = d.transactions.filter(function (t) { return t.queue === "Duplicate"; });
+        var agingTxns      = d.transactions.filter(function (t) { return t.queue === "Aging"; });
+        var reconciledTxns = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
 
         var tabs = [
-          { id: "matched",        icon: "✅ ", label: "Matched",           count: autoMatchedTxns.length   },
-          { id: "manual-matched", icon: "✓ ",  label: "Manually Matched",  count: manualMatchedTxns.length },
-          { id: "review",         icon: "⚠ ",  label: "Review",            count: reviewTxns.length        },
-          { id: "bank-um",        icon: "",     label: "Bank Unmatched",    count: bankUmTxns.length        },
-          { id: "erp-um",         icon: "",     label: "ERP Unmatched",     count: erp_um.length            },
+          { id: "auto",       icon: "✅ ", label: "Auto",       count: autoTxns.length       },
+          { id: "review",     icon: "⚠ ",  label: "Review",     count: reviewTxns.length     },
+          { id: "unmatched",  icon: "",     label: "Unmatched",  count: unmatchedTxns.length  },
+          { id: "high-val",   icon: "",     label: "High-Val",   count: highValTxns.length    },
+          { id: "duplicate",  icon: "",     label: "Duplicate",  count: dupTxns.length        },
+          { id: "aging",      icon: "",     label: "Aging",      count: agingTxns.length      },
+          { id: "reconciled", icon: "✓ ",  label: "Reconciled", count: reconciledTxns.length },
+          { id: "erp-um",     icon: "",     label: "ERP Unmatched (extra)", count: erp_um.length },
         ];
 
         var tabBarHtml = '<div style="display:flex;border-bottom:2px solid #e2e8f0;margin-bottom:12px;overflow-x:auto">';
@@ -1939,7 +2151,7 @@ window.ReconUI = (function () {
         });
         tabBarHtml += '</div>';
 
-        // ── Panel: Matched (Auto) ──
+        // ── Panel builders — shared row shapes reused across the 7 tile-matching tabs ──
         var matchedCols = [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "ERP ENTRY" }, { label: "CONFIDENCE", right: true }];
         function _matchRow(t) {
           var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
@@ -1952,43 +2164,8 @@ window.ReconUI = (function () {
             _confBadge(t.confidence, !!t.suggested_match),
           ];
         }
-        var panelMatched =
-          '<div class="sbr-report-panel" data-panel="matched">' +
-            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions auto-approved by the reconciliation engine</div>' +
-            _table(matchedCols, autoMatchedTxns.map(_matchRow), "No auto-matched transactions yet") +
-          '</div>';
-
-        // ── Panel: Manually Matched ──
-        var panelManualMatched =
-          '<div class="sbr-report-panel" data-panel="manual-matched" style="display:none">' +
-            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions reconciled manually by a user</div>' +
-            _table(matchedCols, manualMatchedTxns.map(_matchRow), "No manually matched transactions") +
-          '</div>';
-
-        // ── Panel: Review ──
-        var reviewRows = reviewTxns.map(function (t) {
-          var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
-          return [
-            _entry(t.name),
-            '<span style="white-space:nowrap;font-size:12px">' + t.date + "</span>",
-            _desc(t.description),
-            '<span style="font-variant-numeric:tabular-nums">' + formatAmount(amt) + "</span>",
-            _entry(t.suggested_match),
-            _confBadge(t.confidence),
-          ];
-        });
-        var panelReview =
-          '<div class="sbr-report-panel" data-panel="review" style="display:none">' +
-            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions in the review queue — require human decision</div>' +
-            _table(
-              [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "SUGGESTED MATCH" }, { label: "CONFIDENCE", right: true }],
-              reviewRows,
-              "No transactions in review"
-            ) +
-          '</div>';
-
-        // ── Panel: Bank Unmatched ──
-        var bankUmRows = bankUmTxns.map(function (t) {
+        var plainCols = [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "PARTY" }];
+        function _plainRow(t) {
           var amt = t.deposit > 0 ? t.deposit : t.withdrawal;
           return [
             _entry(t.name),
@@ -1997,18 +2174,56 @@ window.ReconUI = (function () {
             '<span style="font-variant-numeric:tabular-nums">' + formatAmount(amt) + "</span>",
             t.party || "—",
           ];
-        });
-        var panelBankUm =
-          '<div class="sbr-report-panel" data-panel="bank-um" style="display:none">' +
-            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Bank transactions with no matching ERP entry — action required</div>' +
+        }
+
+        var panelAuto =
+          '<div class="sbr-report-panel" data-panel="auto">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions auto-approved by the reconciliation engine</div>' +
+            _table(matchedCols, autoTxns.map(_matchRow), "No auto-matched transactions yet") +
+          '</div>';
+
+        var panelReview =
+          '<div class="sbr-report-panel" data-panel="review" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Transactions in the review queue — require human decision</div>' +
             _table(
-              [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "PARTY" }],
-              bankUmRows,
-              "No unmatched bank transactions"
+              [{ label: "BANK TXN" }, { label: "DATE" }, { label: "DESCRIPTION" }, { label: "AMOUNT", right: true }, { label: "SUGGESTED MATCH" }, { label: "CONFIDENCE", right: true }],
+              reviewTxns.map(_matchRow),
+              "No transactions in review"
             ) +
           '</div>';
 
-        // ── Panel: ERP Unmatched ──
+        var panelUnmatched =
+          '<div class="sbr-report-panel" data-panel="unmatched" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">No matching ERP entry found — action required</div>' +
+            _table(plainCols, unmatchedTxns.map(_plainRow), "No unmatched transactions") +
+          '</div>';
+
+        var panelHighVal =
+          '<div class="sbr-report-panel" data-panel="high-val" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Above the high-value threshold — held for review regardless of confidence</div>' +
+            _table(matchedCols, highValTxns.map(_matchRow), "No high-value transactions") +
+          '</div>';
+
+        var panelDuplicate =
+          '<div class="sbr-report-panel" data-panel="duplicate" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Flagged as a possible duplicate of another transaction</div>' +
+            _table(plainCols, dupTxns.map(_plainRow), "No duplicate transactions") +
+          '</div>';
+
+        var panelAging =
+          '<div class="sbr-report-panel" data-panel="aging" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Unreconciled past the aging threshold</div>' +
+            _table(plainCols, agingTxns.map(_plainRow), "No aging transactions") +
+          '</div>';
+
+        var panelReconciled =
+          '<div class="sbr-report-panel" data-panel="reconciled" style="display:none">' +
+            '<div style="font-size:11px;color:#94a3b8;margin-bottom:8px">Fully reconciled — ' +
+              (s.auto_reconciled || 0) + ' auto-approved, ' + (s.manual_reconciled || 0) + ' manually approved</div>' +
+            _table(matchedCols, reconciledTxns.map(_matchRow), "No reconciled transactions") +
+          '</div>';
+
+        // ── Panel: ERP Unmatched — no main-screen tile equivalent, kept as an extra ──
         var erpUmRows = erp_um.map(function (e) {
           return [
             _entry(e.name),
@@ -2031,7 +2246,8 @@ window.ReconUI = (function () {
         var ts = frappe.datetime.now_datetime ? frappe.datetime.now_datetime() : new Date().toLocaleString();
         $modal.find(".sbr-modal-body").html(
           cardsHtml + rateHtml + tabBarHtml +
-          panelMatched + panelManualMatched + panelReview + panelBankUm + panelErpUm
+          panelAuto + panelReview + panelUnmatched + panelHighVal +
+          panelDuplicate + panelAging + panelReconciled + panelErpUm
         );
         $modal.find(".sbr-report-ts").text("Generated " + ts);
         $modal.find(".sbr-report-export").prop("disabled", false).data("reportData", d);
@@ -2063,15 +2279,15 @@ window.ReconUI = (function () {
         return xml;
       }
 
-      var autoMatchedX   = d.transactions.filter(function (t) { return t.queue === "Auto"; });
-      var manualMatchedX = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
-      var reviewTxns = d.transactions.filter(function (t) {
-        return t.queue === "Review" || t.queue === "High-Val";
-      });
-      var bankUmTxns = d.transactions.filter(function (t) {
-        return t.queue === "Unmatched" || t.queue === "Aging" || t.queue === "Duplicate";
-      });
-      var erpUm = d.erp_unmatched || [];
+      // Same 7 groupings as the report's own tabs — one sheet per main-screen tile.
+      var autoX       = d.transactions.filter(function (t) { return t.queue === "Auto"; });
+      var reviewX     = d.transactions.filter(function (t) { return t.queue === "Review"; });
+      var unmatchedX  = d.transactions.filter(function (t) { return t.queue === "Unmatched"; });
+      var highValX    = d.transactions.filter(function (t) { return t.queue === "High-Val"; });
+      var dupX        = d.transactions.filter(function (t) { return t.queue === "Duplicate"; });
+      var agingX      = d.transactions.filter(function (t) { return t.queue === "Aging"; });
+      var reconciledX = d.transactions.filter(function (t) { return t.queue === "Reconciled"; });
+      var erpUm       = d.erp_unmatched || [];
 
       var xlsHeader =
         '<?xml version="1.0" encoding="UTF-8"?>\n' +
@@ -2091,25 +2307,22 @@ window.ReconUI = (function () {
       }
       var _xlsMatchCols = ["Bank TXN","Date","Description","Reference","Amount","ERP Entry","Confidence %"];
 
-      // Sheet 1 — Auto Matched
-      xlsBody += xlsSheet(
-        "Auto Matched (" + autoMatchedX.length + ")",
-        _xlsMatchCols,
-        autoMatchedX.map(_xlsMatchRow)
-      );
+      function _xlsPlainRow(t) {
+        return [t.name, t.date, t.description || "", t.reference_number || "",
+          t.deposit    > 0 ? t.deposit.toFixed(2)    : "",
+          t.withdrawal > 0 ? t.withdrawal.toFixed(2) : "",
+          t.party || ""];
+      }
+      var _xlsPlainCols = ["Bank TXN","Date","Description","Reference","Deposit","Withdrawal","Party"];
 
-      // Sheet 2 — Manually Matched
-      xlsBody += xlsSheet(
-        "Manually Matched (" + manualMatchedX.length + ")",
-        _xlsMatchCols,
-        manualMatchedX.map(_xlsMatchRow)
-      );
+      // Sheet 1 — Auto
+      xlsBody += xlsSheet("Auto (" + autoX.length + ")", _xlsMatchCols, autoX.map(_xlsMatchRow));
 
-      // Sheet 3 — Review
+      // Sheet 2 — Review
       xlsBody += xlsSheet(
-        "Review (" + reviewTxns.length + ")",
+        "Review (" + reviewX.length + ")",
         ["Bank TXN","Date","Description","Reference","Amount","Suggested Match","Confidence %"],
-        reviewTxns.map(function (t) {
+        reviewX.map(function (t) {
           var amt = t.deposit > 0 ? t.deposit : -(t.withdrawal || 0);
           return [t.name, t.date, t.description || "", t.reference_number || "",
             amt.toFixed(2), t.suggested_match || "",
@@ -2117,19 +2330,22 @@ window.ReconUI = (function () {
         })
       );
 
-      // Sheet 4 — Bank Unmatched
-      xlsBody += xlsSheet(
-        "Bank Unmatched (" + bankUmTxns.length + ")",
-        ["Bank TXN","Date","Description","Reference","Deposit","Withdrawal","Party","Sub-Queue"],
-        bankUmTxns.map(function (t) {
-          return [t.name, t.date, t.description || "", t.reference_number || "",
-            t.deposit    > 0 ? t.deposit.toFixed(2)    : "",
-            t.withdrawal > 0 ? t.withdrawal.toFixed(2) : "",
-            t.party || "", t.queue];
-        })
-      );
+      // Sheet 3 — Unmatched
+      xlsBody += xlsSheet("Unmatched (" + unmatchedX.length + ")", _xlsPlainCols, unmatchedX.map(_xlsPlainRow));
 
-      // Sheet 5 — ERP Unmatched
+      // Sheet 4 — High-Val
+      xlsBody += xlsSheet("High-Val (" + highValX.length + ")", _xlsMatchCols, highValX.map(_xlsMatchRow));
+
+      // Sheet 5 — Duplicate
+      xlsBody += xlsSheet("Duplicate (" + dupX.length + ")", _xlsPlainCols, dupX.map(_xlsPlainRow));
+
+      // Sheet 6 — Aging
+      xlsBody += xlsSheet("Aging (" + agingX.length + ")", _xlsPlainCols, agingX.map(_xlsPlainRow));
+
+      // Sheet 7 — Reconciled
+      xlsBody += xlsSheet("Reconciled (" + reconciledX.length + ")", _xlsMatchCols, reconciledX.map(_xlsMatchRow));
+
+      // Sheet 8 — ERP Unmatched
       xlsBody += xlsSheet(
         "ERP Unmatched (" + erpUm.length + ")",
         ["ERP Voucher","Type","Date","Amount","Party"],

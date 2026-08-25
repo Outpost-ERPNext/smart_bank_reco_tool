@@ -130,6 +130,40 @@
   font-size: 12px;
   color: #475569;
 }
+
+/* ── Transaction table: all columns fit within the viewport, no
+   horizontal scroll needed on a normal screen. Fixed layout + a
+   colgroup (set in JS) divide the width by percentage; long text
+   columns truncate with a hover tooltip (same pattern as the
+   description column), while amount columns wrap instead of
+   truncating so no digit of a money value is ever hidden. */
+.sbr-txn-table {
+  table-layout: fixed;
+  width: 100%;
+}
+.sbr-txn-table thead th {
+  white-space: normal;
+  word-break: break-word;
+  padding: 6px 8px;
+}
+.sbr-txn-table tbody td,
+.sbr-txn-table tfoot td {
+  padding: 6px 8px;
+  overflow-wrap: break-word;
+}
+.sbr-txn-table .sbr-desc {
+  max-width: none;
+}
+.sbr-txn-table .sbr-ref {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sbr-txn-table .sbr-amt-cell,
+.sbr-txn-table .sbr-matched-entry-cell {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 .sbr-row { cursor: pointer; }
 .sbr-row:hover td { background: #f8fafc; }
 .sbr-row-active td { background: #eff6ff; }
@@ -622,8 +656,43 @@
 }
 
 /* ── P2.2: Checkbox column ── */
-.sbr-check-col { width: 36px !important; padding: 8px 4px 8px 10px !important; }
+/* Frozen first column — stays visible while the table scrolls horizontally
+   (the row selection checkbox needs to stay reachable regardless of which
+   columns are currently in view). The header cell needs a higher z-index
+   than the body cells so it stays above them at the sticky top+left corner. */
+.sbr-check-col {
+  width: 36px !important;
+  padding: 8px 4px 8px 10px !important;
+  position: sticky;
+  left: 0;
+  background: #fff;
+  z-index: 1;
+}
+.sbr-table thead th.sbr-check-col {
+  z-index: 2;
+  background: #f8fafc;
+}
 .sbr-row-check, .sbr-select-all { cursor: pointer; width: 14px; height: 14px; }
+
+/* ── Freeze columns through Date; everything after Description scrolls ── */
+.sbr-txn-table .sbr-idx-col,
+.sbr-txn-table .sbr-date-col {
+  position: sticky;
+  background: #fff;
+  z-index: 1;
+}
+.sbr-txn-table .sbr-idx-col { left: 36px; }
+.sbr-txn-table .sbr-date-col { left: 76px; }
+.sbr-txn-table thead th.sbr-idx-col,
+.sbr-txn-table thead th.sbr-date-col {
+  z-index: 2;
+  background: #f8fafc;
+}
+.sbr-txn-table tfoot .sbr-check-col,
+.sbr-txn-table tfoot .sbr-idx-col,
+.sbr-txn-table tfoot .sbr-date-col {
+  background: #f8fafc;
+}
 
 /* ── P2.2: Modal overlay ── */
 .sbr-modal-overlay {

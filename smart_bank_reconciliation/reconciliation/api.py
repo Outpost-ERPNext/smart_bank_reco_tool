@@ -10,8 +10,34 @@ from .matching_engine import BankMatchingEngine
 _KNOWN_RECON_QUEUES = {"Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"}
 
 
+def _dedupe_consolidated_groups(rows):
+    """Collapse rows that a Consolidate action grouped together down to one
+    representative row, so tile/report counts reflect one economic event per
+    group instead of one per raw bank statement line — mirrors how the
+    frontend renders a consolidated group as a single row.
+
+    Grouped by recon_run_id: a pre-existing, otherwise-unused custom field
+    repurposed purely as the Consolidate group key (see
+    _consolidate_via_existing_match) — no new field added. Works for both
+    the matched and unmatched outcome, since a group id is written either way.
+    """
+    seen_keys = set()
+    result = []
+    for r in rows:
+        if r.get("recon_match_type") != "Consolidated" or not r.get("recon_run_id"):
+            result.append(r)
+            continue
+        key = r["recon_run_id"]
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        result.append(r)
+    return result
+
+
 def _tally_queue_counts(rows, queue_field="recon_queue"):
     from collections import Counter
+    rows = _dedupe_consolidated_groups(rows)
     counts = Counter(
         r.get(queue_field) if r.get(queue_field) in _KNOWN_RECON_QUEUES else "Unmatched"
         for r in rows
@@ -38,7 +64,8 @@ def get_bank_transactions(bank_account, from_date, to_date):
             filters={"bank_account": bank_account, "date": ["between", [from_date, to_date]], "docstatus": 1},
             fields=["name", "date", "deposit", "withdrawal", "description",
                     "reference_number", "party_type", "party", "status", "unallocated_amount",
-                    "recon_queue", "recon_confidence", "recon_matched_entries", "recon_match_type"],
+                    "recon_queue", "recon_confidence", "recon_matched_entries", "recon_match_type",
+                    "recon_run_id"],
             order_by="date desc",
         )
     except Exception:
@@ -50,8 +77,11 @@ def get_bank_transactions(bank_account, from_date, to_date):
             order_by="date desc",
         )
 
-    total = len(rows)
+    # queue_counts.total already dedupes consolidated groups (they display as
+    # one row); keep the plain "total" field in lockstep so nothing that
+    # reads it separately drifts out of sync with the tile counts.
     queue_counts = _tally_queue_counts(rows)
+    total = queue_counts["total"]
 
     # Enrich party_type from matched Payment Entry for transactions that have no
     # party set on the bank transaction itself (typical for imported statements).
@@ -357,11 +387,9 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
         alloc = _alloc_amount(entry, n)
 
         if frappe.db.exists("Payment Entry", entry_name):
-            _update_with_retry("tabPayment Entry", entry_name, clearance_date)
-            payment_document = "Payment Entry"
+            table, payment_document = "tabPayment Entry", "Payment Entry"
         elif frappe.db.exists("Journal Entry", entry_name):
-            _update_with_retry("tabJournal Entry", entry_name, clearance_date)
-            payment_document = "Journal Entry"
+            table, payment_document = "tabJournal Entry", "Journal Entry"
         elif frappe.db.exists("Sales Invoice", entry_name) or frappe.db.exists("Purchase Invoice", entry_name):
             frappe.throw(
                 "Cannot reconcile bank transaction directly against invoice {0}. "
@@ -370,11 +398,55 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
         else:
             continue
 
-        # Insert into Bank Transaction Payments child table (ERPNext native linking)
-        if not frappe.db.exists(
+        already_linked_here = frappe.db.exists(
             "Bank Transaction Payments",
             {"parent": bank_transaction, "payment_entry": entry_name},
-        ):
+        )
+
+        # Guard against double-allocating one ERP entry to two different bank
+        # transactions — e.g. two transactions independently top-scoring the
+        # same Payment Entry within a single bulk-approve batch. If this
+        # entry is already cleared against a DIFFERENT bank transaction,
+        # refuse rather than silently linking a second one to the same money
+        # — UNLESS that other transaction is a sibling in the same Consolidate
+        # group as this one (same recon_match_type="Consolidated" AND the
+        # same recon_run_id, repurposed as the group key — see
+        # _consolidate_via_existing_match), which deliberately shares one
+        # matched entry across every member on purpose.
+        existing_clearance = frappe.db.get_value(table, entry_name, "clearance_date")
+        if existing_clearance and not already_linked_here:
+            linked_txns = frappe.db.get_all(
+                "Bank Transaction Payments",
+                filters={"payment_entry": entry_name, "parenttype": "Bank Transaction"},
+                pluck="parent",
+            )
+            my_txn = frappe.db.get_value(
+                "Bank Transaction", bank_transaction,
+                ["recon_match_type", "recon_run_id"], as_dict=True,
+            )
+            is_same_group = False
+            if my_txn and my_txn.recon_match_type == "Consolidated" and my_txn.recon_run_id:
+                for lt in linked_txns:
+                    other = frappe.db.get_value(
+                        "Bank Transaction", lt,
+                        ["recon_match_type", "recon_run_id"], as_dict=True,
+                    )
+                    if (other and other.recon_match_type == "Consolidated"
+                            and other.recon_run_id == my_txn.recon_run_id):
+                        is_same_group = True
+                        break
+            if not is_same_group:
+                frappe.throw(
+                    "{0} {1} is already reconciled (cleared {2}) against another bank "
+                    "transaction. Un-reconcile it there first before matching it here.".format(
+                        payment_document, entry_name, existing_clearance
+                    )
+                )
+
+        _update_with_retry(table, entry_name, clearance_date)
+
+        # Insert into Bank Transaction Payments child table (ERPNext native linking)
+        if not already_linked_here:
             frappe.db.sql(
                 """INSERT INTO `tabBank Transaction Payments`
                    (name, creation, modified, modified_by, owner, docstatus,
@@ -453,13 +525,60 @@ def bulk_approve_auto(bank_account, from_date, to_date):
             "date": ["between", [from_date, to_date]],
             "docstatus": 1,
         },
-        fields=["recon_queue"],
+        fields=["recon_queue", "recon_match_type", "recon_matched_entries", "recon_run_id"],
     )
 
     return {
         "count": len(approved),
         "approved_transactions": approved,
         "new_counts": _tally_queue_counts(all_txns),
+    }
+
+
+@frappe.whitelist()
+def bulk_approve_transactions(transaction_names):
+    """Approve a caller-supplied list of Bank Transactions in one call.
+
+    Used by the Review/Aging tabs' "Bulk Approve Filtered" action, which
+    approves exactly whatever the user currently has visible under their
+    active filters (confidence range, aging range, search text, ...) —
+    the frontend already knows that exact set, so this takes it directly
+    rather than re-deriving a single filter dimension server-side.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    import json
+    if isinstance(transaction_names, str):
+        transaction_names = json.loads(transaction_names)
+    if not transaction_names:
+        return {"count": 0, "approved_transactions": [], "skipped": []}
+
+    txns = frappe.db.get_all(
+        "Bank Transaction",
+        filters={"name": ["in", transaction_names], "docstatus": 1},
+        fields=["name", "recon_matched_entries", "recon_queue"],
+    )
+
+    approved, skipped = [], []
+    for txn in txns:
+        if txn.get("recon_queue") == "Reconciled":
+            continue
+        try:
+            entries = json.loads(txn.get("recon_matched_entries") or "[]")
+            if not entries:
+                skipped.append(txn["name"])
+                continue
+            approve_match(txn["name"], entries)
+            approved.append(txn["name"])
+        except Exception:
+            frappe.log_error(frappe.get_traceback(),
+                             f"Bulk approve (filtered) failed for {txn['name']}")
+            skipped.append(txn["name"])
+
+    return {
+        "count":                len(approved),
+        "approved_transactions": approved,
+        "skipped":              skipped,
     }
 
 
@@ -494,7 +613,7 @@ def bulk_reject_review(bank_account, from_date, to_date):
             "date": ["between", [from_date, to_date]],
             "docstatus": 1,
         },
-        fields=["recon_queue"],
+        fields=["recon_queue", "recon_match_type", "recon_matched_entries", "recon_run_id"],
     )
 
     return {
@@ -520,8 +639,9 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
     frappe.db.sql(
         "UPDATE `tabBank Transaction` SET "
         "recon_queue = NULL, recon_confidence = 0, recon_matched_entries = NULL, "
-        "recon_match_type = NULL, recon_ai_reasoning = NULL, recon_draft_payload = NULL, "
-        "recon_signals_json = NULL, recon_wht_amount = NULL, recon_user_action = NULL "
+        "recon_match_type = NULL, recon_run_id = NULL, recon_ai_reasoning = NULL, "
+        "recon_draft_payload = NULL, recon_signals_json = NULL, recon_wht_amount = NULL, "
+        "recon_user_action = NULL "
         "WHERE name IN (" + in_clause + ") AND status != 'Reconciled'",
         transaction_names,
     )
@@ -541,7 +661,7 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
             "date": ["between", [from_date, to_date]],
             "docstatus": 1,
         },
-        fields=["recon_queue"],
+        fields=["recon_queue", "recon_match_type", "recon_matched_entries", "recon_run_id"],
     )
     queue_counts = _tally_queue_counts(all_txns)
 
@@ -1117,20 +1237,6 @@ def _inject_preselected(entry_name, vouchers):
 
 
 def _consolidate_via_existing_match(txn_names, company=None, bank_account=None, label="Consolidated"):
-    """Shared logic behind both "Consolidate Transactions" and "Consolidate
-    Bank Charges": combine the given Bank Transactions into one virtual net
-    amount and search EXISTING, already-submitted, unreconciled ERP entries
-    (Payment Entry / Journal Entry) for a match — using the exact same
-    scoring engine as ordinary AI matching. Creates no new document. If a
-    candidate scores above the usual 10% floor, every selected transaction is
-    routed to Review with that entry as the suggested match and a real,
-    computed confidence score — never auto-reconciled; the user still opens
-    and approves each one, same as the engine's own Many:1 grouping
-    (matching_engine.py's _process_many_to_one) does internally.
-
-    If nothing matches, the transactions are left untouched and the caller
-    is told so — there is nothing yet to record as their combined amount.
-    """
     txns = frappe.db.get_all(
         "Bank Transaction",
         filters={"name": ["in", txn_names], "docstatus": 1},
@@ -1143,86 +1249,79 @@ def _consolidate_via_existing_match(txn_names, company=None, bank_account=None, 
     total_deposit    = sum(float(t.deposit    or 0) for t in txns)
     total_withdrawal = sum(float(t.withdrawal or 0) for t in txns)
     used_account     = bank_account or txns[0].bank_account
-    latest_date      = max(t.date for t in txns)
     net              = total_deposit - total_withdrawal
 
     company_name = company or frappe.db.get_value("Bank Account", used_account, "company") or \
                    frappe.defaults.get_defaults().get("company")
 
-    # A shared party across every selected transaction strengthens the match;
-    # a mixed bag (the usual case — unrelated small items) leaves it blank
-    # and the scorer falls back to its neutral party baseline.
-    parties = {(t.get("party") or "").strip() for t in txns if t.get("party")}
-    common_party = next(iter(parties)) if len(parties) == 1 else ""
+    # Pick the latest transaction to become the single merged one
+    primary_txn = max(txns, key=lambda t: getdate(t.date) if t.date else getdate("1900-01-01"))
+    other_txns = [t for t in txns if t.name != primary_txn.name]
 
-    virtual_txn = {
-        "deposit":          net if net >= 0 else 0,
-        "withdrawal":       abs(net) if net < 0 else 0,
-        "date":             latest_date,
-        "description":      label + ": " + ", ".join(t.name for t in txns),
-        "reference_number": "",
-        "party":            common_party,
-        "party_type":       (txns[0].get("party_type") or "") if common_party else "",
-    }
+    new_deposit = net if net >= 0 else 0
+    new_withdrawal = abs(net) if net < 0 else 0
+    user_name = frappe.db.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+    desc = label + " (" + str(len(txns)) + " txns, consolidated by " + user_name + "): " + ", ".join(t.name for t in txns)
 
-    from .signal_calculator import SignalCalculator
-    from .pattern_store import PatternStore
+    # 1. Update the primary transaction
+    frappe.db.set_value("Bank Transaction", primary_txn.name, {
+        "deposit": new_deposit,
+        "withdrawal": new_withdrawal,
+        "unallocated_amount": abs(net),
+        "description": desc,
+        "recon_queue": "Unmatched",
+        "recon_matched_entries": "",
+        "recon_confidence": 0,
+        "recon_match_type": "Consolidated"
+    })
 
-    engine = BankMatchingEngine(used_account, latest_date, latest_date, company_name)
-    candidates = [
-        c for c in engine._get_candidates()
-        # Invoices excluded — approve_match refuses to reconcile a bank
-        # transaction directly against one (a Payment Entry is required
-        # first), so surfacing one here would be a suggested match the user
-        # can never actually approve.
-        if c.get("entry_type") in ("Payment Entry", "Journal Entry")
-    ]
+    # 2. Delete the others completely to merge into a single transaction
+    for t in other_txns:
+        frappe.db.sql("DELETE FROM `tabBank Transaction` WHERE name=%s", t.name)
 
-    settings = _load_sbr_settings()
-    signal_calc = SignalCalculator(
-        PatternStore(),
-        amount_tolerance_pct=settings.get("amount_tolerance_pct"),
-        date_window=settings.get("date_window_days"),
-    )
-    scored = signal_calc.score_all(virtual_txn, candidates)
-
-    result = {
-        "count":            len(txns),
-        "total_deposit":    total_deposit,
-        "total_withdrawal": total_withdrawal,
-        "net_amount":       net,
-    }
-
-    if not scored:
-        result["matched"] = False
-        return result
-
-    best = scored[0]
-
-    # Always Review, regardless of how high the confidence scores — a
-    # consolidated group is always a manual call, never auto-reconciled.
-    matched_entries_json = frappe.as_json([best["name"]])
-    reasoning = "{0} {1} transactions (net {2:,.2f}) by {3} — matched against {4} {5}. {6}".format(
-        label, len(txns), net, frappe.session.user, best["entry_type"], best["name"], best.get("reasoning") or ""
-    ).strip()
-
-    for txn in txns:
-        frappe.db.set_value("Bank Transaction", txn.name, {
-            "recon_queue":           "Review",
-            "recon_match_type":      "Consolidated",
-            "recon_confidence":      best["confidence"],
-            "recon_matched_entries": matched_entries_json,
-            "recon_ai_reasoning":    reasoning,
-        })
     frappe.db.commit()
 
-    result.update({
-        "matched":       True,
-        "entry_type":    best["entry_type"],
-        "matched_entry": best["name"],
-        "confidence":    best["confidence"],
-    })
-    return result
+    # 3. Auto-run the AI matching engine on the new single transaction
+    from .matching_engine import BankMatchingEngine
+    engine = BankMatchingEngine(used_account, primary_txn.date, primary_txn.date, company_name, only_names=[primary_txn.name])
+    engine.run()
+
+    # 4. Fetch the result
+    updated_txn = frappe.db.get_value("Bank Transaction", primary_txn.name,
+        ["recon_queue", "recon_matched_entries", "recon_confidence", "recon_match_type", "recon_ai_reasoning"], as_dict=1)
+
+    matched = updated_txn.recon_queue in ("Review", "Auto", "High-Val") if updated_txn else False
+    entry_name = ""
+    entry_type = ""
+    
+    if matched and updated_txn.get("recon_matched_entries"):
+        import json
+        try:
+            entries = json.loads(updated_txn.recon_matched_entries)
+            if entries:
+                entry_name = entries[0]
+                if frappe.db.exists("Payment Entry", entry_name):
+                    entry_type = "Payment Entry"
+                elif frappe.db.exists("Journal Entry", entry_name):
+                    entry_type = "Journal Entry"
+                elif frappe.db.exists("Sales Invoice", entry_name):
+                    entry_type = "Sales Invoice"
+                elif frappe.db.exists("Purchase Invoice", entry_name):
+                    entry_type = "Purchase Invoice"
+        except Exception:
+            pass
+
+    return {
+        "count": len(txns),
+        "total_deposit": total_deposit,
+        "total_withdrawal": total_withdrawal,
+        "net_amount": net,
+        "matched": matched,
+        "entry_type": entry_type,
+        "matched_entry": entry_name,
+        "confidence": updated_txn.recon_confidence or 0 if updated_txn else 0,
+    }
+
 
 
 @frappe.whitelist()
@@ -1543,8 +1642,9 @@ def reset_ai_suggestions(bank_account, from_date, to_date):
     frappe.db.sql(
         "UPDATE `tabBank Transaction` SET "
         "recon_queue=NULL, recon_confidence=0, recon_matched_entries=NULL, "
-        "recon_match_type=NULL, recon_ai_reasoning=NULL, recon_draft_payload=NULL, "
-        "recon_signals_json=NULL, recon_wht_amount=0, recon_user_action=NULL "
+        "recon_match_type=NULL, recon_run_id=NULL, recon_ai_reasoning=NULL, "
+        "recon_draft_payload=NULL, recon_signals_json=NULL, recon_wht_amount=0, "
+        "recon_user_action=NULL "
         "WHERE bank_account=%s AND `date` BETWEEN %s AND %s "
         "AND status != 'Reconciled' AND docstatus=1",
         (bank_account, from_date, to_date),
@@ -1842,21 +1942,31 @@ def get_reconciliation_report(bank_account, from_date, to_date, company=None):
         },
         fields=["name", "date", "deposit", "withdrawal", "description",
                 "reference_number", "party", "status", "recon_queue",
-                "recon_confidence", "recon_matched_entries", "unallocated_amount"],
+                "recon_confidence", "recon_matched_entries", "recon_match_type",
+                "recon_run_id", "unallocated_amount"],
         order_by="date asc",
     )
 
     import json as _json
     from collections import Counter
-    total        = len(txns)
+    # Dedupe consolidated groups down to one row each for the summary counts
+    # only — matches the main screen's tiles, which do the same. The full
+    # per-transaction list below (transactions_out) still uses the un-deduped
+    # `txns` so every original bank statement line remains individually
+    # listed/exportable.
+    deduped_txns = _dedupe_consolidated_groups(txns)
+    total        = len(deduped_txns)
     queue_counts = Counter(
         t.get("recon_queue") if t.get("recon_queue") in _KNOWN_RECON_QUEUES else "Unmatched"
-        for t in txns
+        for t in deduped_txns
     )
 
     reconciled  = queue_counts.get("Reconciled", 0)
     auto        = queue_counts.get("Auto", 0)
-    review      = queue_counts.get("Review", 0) + queue_counts.get("High-Val", 0)
+    # Raw per-queue count — matches the main screen's own Review tile exactly
+    # (previously combined with High-Val here, which made this number diverge
+    # from the tile the user actually sees on the main screen).
+    review      = queue_counts.get("Review", 0)
     unmatched   = queue_counts.get("Unmatched", 0)
     high_val    = queue_counts.get("High-Val", 0)
     dupes       = queue_counts.get("Duplicate", 0)
@@ -2091,7 +2201,7 @@ def get_queue_summary(bank_account, from_date, to_date):
             "date": ["between", [from_date, to_date]],
             "docstatus": 1,
         },
-        fields=["recon_queue"],
+        fields=["recon_queue", "recon_match_type", "recon_matched_entries", "recon_run_id"],
     )
     return _tally_queue_counts(rows)
 

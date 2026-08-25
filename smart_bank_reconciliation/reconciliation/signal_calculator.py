@@ -84,7 +84,13 @@ class SignalCalculator:
         }
 
     def _confidence(self, signals):
-        return sum(signals[s] * WEIGHTS[s] for s in WEIGHTS)
+        # Every other signal is bounded to 0-100, but the pattern-learning
+        # "history" boost is deliberately -200..+150 (see pattern_store.py)
+        # so a strong match plus a strong history boost can otherwise sum
+        # past 100, and a weak match plus repeated rejections can go
+        # negative — neither is a valid confidence percentage.
+        raw = sum(signals[s] * WEIGHTS[s] for s in WEIGHTS)
+        return max(0.0, min(100.0, raw))
 
     def _amount(self, bank, erp, entry_type=None):
         if not bank or not erp:

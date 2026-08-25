@@ -216,6 +216,10 @@ frappe.ui.form.on("Bank Reconciliation Tool", {
     frm.set_df_property("account_opening_balance", "read_only", 1);
     frm.set_df_property("account_opening_balance", "hidden", 0);
     frm.set_df_property("bank_statement_closing_balance", "hidden", 0);
+    // Closing Balance is now auto-computed from Opening Balance + the loaded
+    // transactions' Deposit/Withdrawal totals (see sbr_load_transactions) —
+    // no longer manually entered, so read-only.
+    frm.set_df_property("bank_statement_closing_balance", "read_only", 1);
 
     // Clarify which side each balance represents
     frm.set_df_property("account_opening_balance",      "label", __("Opening Balance as per ERP (GL)"));
@@ -415,9 +419,30 @@ function sbr_fetch_opening_balance(frm) {
     callback: function (r) {
       if (!r.exc) {
         frm.set_value("account_opening_balance", r.message || 0);
+        // Opening balance and the transaction list load independently and
+        // asynchronously — whichever arrives last must (re)finalize the
+        // computed Closing Balance, so it's never left stale if the table
+        // already rendered before this callback fired.
+        sbr_recompute_closing_balance(frm);
       }
     },
   });
+}
+
+/* ── Recompute Closing Balance (Bank) = Opening + Deposit − Withdrawal
+   from whatever transactions are currently loaded, without re-rendering
+   the table — used whenever opening balance arrives after the table did. */
+function sbr_recompute_closing_balance(frm) {
+  var $canvas = frm.fields_dict.recon_ui_container
+    ? frm.fields_dict.recon_ui_container.$wrapper : null;
+  if (!$canvas) return;
+  var txns = $canvas.data("transactions");
+  if (!txns || !txns.length) return;
+  var opening = parseFloat(frm.doc.account_opening_balance) || 0;
+  var net = txns.reduce(function (sum, t) {
+    return sum + (parseFloat(t.deposit) || 0) - (parseFloat(t.withdrawal) || 0);
+  }, opening);
+  frm.set_value("bank_statement_closing_balance", net);
 }
 
 /* ── Refresh the balance bar inside the custom panel ── */
@@ -494,9 +519,10 @@ function sbr_load_erp_vouchers_default(frm, $canvas) {
 /* ── Build toolbar (called on refresh and after AI state change) ── */
 function sbr_build_toolbar(frm) {
   frm.page.clear_inner_toolbar();
-  frm.page.add_inner_button(__("Fetch Transactions"), function () {
-    sbr_load_transactions(frm);
-  });
+  // Temporarily non-functional per request — transactions still load
+  // automatically when Bank Account + date range are set
+  // (sbr_debounce_filter_load), so this being disabled doesn't block anything.
+  frm.page.add_inner_button(__("Fetch Bank Transactions"), function () {}).prop("disabled", true).css("opacity", "0.5");
   frm.page.add_inner_button(__("↺ Reset AI"), function () {
     if (!frm.doc.bank_account || !frm.doc.bank_statement_from_date || !frm.doc.bank_statement_to_date) {
       frappe.msgprint(__("Please set Bank Account and date range first."));
@@ -611,8 +637,13 @@ function sbr_load_transactions(frm) {
       ReconUI.renderSummaryTiles($canvas, qCounts);
       ReconUI.renderTabShell($canvas, data.total || 0);
       if (data.total) {
-        ReconUI.renderTransactionTable($canvas, data.transactions);
+        $canvas.data("sbr-opening-balance", parseFloat(frm.doc.account_opening_balance) || 0);
+        var totals = ReconUI.renderTransactionTable($canvas, data.transactions);
         ReconUI.filterByQueue($canvas, null);
+        // Closing Balance (Bank) is auto-computed, not manually entered —
+        // Opening Balance + total Deposit − total Withdrawal of the loaded
+        // statement, matching the table's own footer totals.
+        if (totals) frm.set_value("bank_statement_closing_balance", totals.netBalance);
       } else {
         sbr_render_inline_upload(frm, $canvas);
       }
@@ -848,6 +879,45 @@ function sbr_bulk_approve(frm) {
   );
 }
 
+/* ── Bulk-approve whatever is currently visible under the active Review/Aging filters ── */
+function sbr_bulk_approve_filtered(frm, names) {
+  if (!names || !names.length) {
+    frappe.msgprint(__("No transactions match the current filter."));
+    return;
+  }
+  frappe.confirm(
+    __("Approve all {0} filtered transaction(s)?", [names.length]),
+    function () {
+      frappe.call({
+        method: "smart_bank_reconciliation.reconciliation.api.bulk_approve_transactions",
+        args: { transaction_names: JSON.stringify(names) },
+        callback: function (r) {
+          if (r.exc) return;
+          var data = r.message;
+          var $canvas = frm.fields_dict.recon_ui_container.$wrapper;
+          (data.approved_transactions || []).forEach(function (name) {
+            $canvas.find('.sbr-row[data-txn="' + name + '"]')
+              .addClass("sbr-row-done")
+              .attr("data-queue", "Reconciled")
+              .find(".sbr-match-cell")
+              .html('<span class="sbr-conf-badge sbr-conf-reconciled">✓ Reconciled</span>');
+            $canvas.find('.sbr-card[data-txn="' + name + '"]')
+              .css("opacity", ".45")
+              .find(".sbr-card-actions")
+              .html('<p class="sbr-success">&#10003; Reconciled.</p>');
+          });
+          sbr_load_transactions(frm);
+          var msg = data.count + __(" transaction(s) reconciled.");
+          if ((data.skipped || []).length) {
+            msg += " " + data.skipped.length + __(" skipped (no suggested match to approve against).");
+          }
+          frappe.msgprint(msg);
+        },
+      });
+    }
+  );
+}
+
 
 
 /* ── Re-run AI on selected transactions ── */
@@ -906,20 +976,55 @@ function sbr_rerun_selected(frm) {
   );
 }
 
+/* ── Resolve a (possibly consolidated-group) row name to every real Bank
+   Transaction it represents — group membership is derived client-side by
+   ReconUI.renderTransactionTable from shared recon_matched_entries values
+   (no dedicated group field), stored on the canvas as {matched_entries_json
+   -> [member names]}. Returns [txnName] unchanged for an ordinary row. ── */
+function sbr_group_members($canvas, txnName) {
+  var groups = $canvas.data("sbr-groups") || {};
+  for (var key in groups) {
+    if (groups[key].indexOf(txnName) !== -1) return groups[key];
+  }
+  return [txnName];
+}
+
+/* ── Approve the same matched_entries against every member of a (possibly
+   consolidated) row, sequentially — mirrors how the backend Consolidate
+   endpoint already writes the same match info to every grouped transaction. ── */
+function sbr_approve_group(members, matchedEntries, onDone) {
+  var i = 0, failed = [];
+  function next() {
+    if (i >= members.length) { onDone(failed); return; }
+    var name = members[i++];
+    frappe.call({
+      method: "smart_bank_reconciliation.reconciliation.api.approve_match",
+      args: { bank_transaction: name, matched_entries: matchedEntries },
+      callback: function (r) {
+        if (r.exc) failed.push(name);
+        next();
+      },
+    });
+  }
+  next();
+}
+
 /* ── Handle reconcile-modal confirm ── */
 function sbr_handle_modal_confirm(frm, $canvas, txnName, result, $modal) {
+  var members = sbr_group_members($canvas, txnName);
   if (result.pane === "reconcile") {
-    frappe.confirm(__("Mark {0} as Reconciled without linking an ERP voucher?", [txnName]), function () {
-      frappe.call({
-        method: "smart_bank_reconciliation.reconciliation.api.approve_match",
-        args: { bank_transaction: txnName, matched_entries: [] },
-        callback: function (r) {
-          if (!r.exc) {
-            $modal.remove();
-            sbr_mark_row_reconciled($canvas, txnName);
-            frappe.show_alert({ message: __("Transaction marked as Reconciled."), indicator: "green" });
-          }
-        },
+    var confirmMsg = members.length > 1
+      ? __("Mark all {0} consolidated transactions as Reconciled without linking an ERP voucher?", [members.length])
+      : __("Mark {0} as Reconciled without linking an ERP voucher?", [txnName]);
+    frappe.confirm(confirmMsg, function () {
+      sbr_approve_group(members, [], function (failed) {
+        $modal.remove();
+        members.forEach(function (n) { if (failed.indexOf(n) === -1) sbr_mark_row_reconciled($canvas, n); });
+        if (failed.length) {
+          frappe.show_alert({ message: __("Failed for: ") + failed.join(", "), indicator: "red" }, 8);
+        } else {
+          frappe.show_alert({ message: __("Reconciled."), indicator: "green" });
+        }
       });
     });
     return;
@@ -928,20 +1033,37 @@ function sbr_handle_modal_confirm(frm, $canvas, txnName, result, $modal) {
     // 1:Many returns selectedVouchers (array of {name,amount}); 1:1 returns selectedVoucher (string)
     var entriesToReconcile = result.selectedVouchers ||
         (result.selectedVoucher ? [{ name: result.selectedVoucher, amount: 0 }] : []);
-    frappe.call({
-      method: "smart_bank_reconciliation.reconciliation.api.approve_match",
-      args: { bank_transaction: txnName, matched_entries: entriesToReconcile },
-      callback: function (r) {
-        if (!r.exc) {
-          $modal.remove();
-          sbr_mark_row_reconciled($canvas, txnName);
-          frappe.show_alert({ message: __("Transaction reconciled."), indicator: "green" });
-        }
-      },
+    sbr_approve_group(members, entriesToReconcile, function (failed) {
+      $modal.remove();
+      members.forEach(function (n) { if (failed.indexOf(n) === -1) sbr_mark_row_reconciled($canvas, n); });
+      if (failed.length) {
+        frappe.show_alert({ message: __("Failed for: ") + failed.join(", "), indicator: "red" }, 8);
+      } else {
+        frappe.show_alert({
+          message: members.length > 1 ? __("All consolidated transactions reconciled.") : __("Transaction reconciled."),
+          indicator: "green",
+        });
+      }
     });
   } else if (result.pane === "createVoucher") {
     $modal.remove();
     $(document).off("keydown.sbrmodal");
+    // ERPNext's native voucher-creation (create_payment_entry_bts /
+    // create_journal_entry_bts) always sizes the new voucher to this ONE
+    // Bank Transaction's own stored amount — it has no concept of a
+    // consolidated group's combined total. So for a grouped row this
+    // creates a voucher for just the representative's individual amount;
+    // the other members still need to be reconciled separately. Flag that
+    // plainly rather than silently create something the user would read as
+    // covering the full combined amount.
+    if (members.length > 1) {
+      frappe.show_alert({
+        message: __("Note: this creates a voucher sized to {0}'s own amount only, not the full " +
+          "consolidated total — the other {1} transaction(s) in this group still need separate reconciliation.",
+          [txnName, members.length - 1]),
+        indicator: "orange",
+      }, 15);
+    }
     sbr_open_create_voucher_dialog(frm, $canvas, txnName);
   } else if (result.pane === "updateTransaction") {
     $modal.remove();
@@ -1757,7 +1879,9 @@ function sbr_open_bank_charges_modal(frm) {
       (totalWit > 0 ? "Total charges (debit): " + ReconUI.fmtCurrency(totalWit) + "\n" : "") +
       (totalDep > 0 ? "Total credits: "        + ReconUI.fmtCurrency(totalDep) + "\n" : "") +
       "Categories:\n" + catLines + "\n\n" +
-      "Search your existing unreconciled Payment/Journal Entries for one matching this combined amount?";
+      "This groups them into one row and searches your existing unreconciled Payment/Journal " +
+      "Entries for a match to the combined amount. If nothing matches, they still group as one " +
+      "row you can create a voucher for manually. Continue?";
 
     frappe.confirm(confirmMsg, function () {
       frappe.call({
@@ -1776,10 +1900,13 @@ function sbr_open_bank_charges_modal(frm) {
           var data = r.message;
           if (!data.matched) {
             frappe.show_alert({
-              message: __("No existing ERP entry matches the combined amount ({0}) of these {1} charges — nothing was changed.",
-                [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+              message: __("{0} charges grouped (combined {1}) — no existing ERP entry matched. " +
+                "They now show – for matched entry and sort to the top of Bank Transactions; " +
+                "use Actions there to create a voucher if needed.",
+                [data.count, ReconUI.fmtCurrency(Math.abs(data.net_amount))]),
               indicator: "orange",
             }, 12);
+            setTimeout(function () { sbr_load_transactions(frm); }, 400);
             return;
           }
           var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";
@@ -2037,10 +2164,13 @@ function sbr_open_consolidate_transactions_modal(frm) {
         var data = r.message;
         if (!data.matched) {
           frappe.show_alert({
-            message: __("No existing ERP entry matches the combined amount ({0}) of these {1} transactions — nothing was changed.",
-              [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+            message: __("{0} transactions grouped (combined {1}) — no existing ERP entry matched. " +
+              "They now show – for matched entry and sort to the top of Bank Transactions; " +
+              "use Actions there to create a voucher if needed.",
+              [data.count, ReconUI.fmtCurrency(Math.abs(data.net_amount))]),
             indicator: "orange",
           }, 12);
+          setTimeout(function () { sbr_load_transactions(frm); }, 400);
           return;
         }
         var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";
@@ -2146,6 +2276,14 @@ function sbr_bind_card_actions(frm, $canvas) {
   $canvas.off("click", ".sbr-banner-approve-btn");
   $canvas.on("click", ".sbr-banner-approve-btn", function () {
     sbr_bulk_approve(frm);
+  });
+
+  // Bulk-approve whatever is currently visible under the active filters
+  // (Review or Aging tab, confidence/aging range applied or "All")
+  $canvas.off("click", ".sbr-bulk-approve-filtered-btn");
+  $canvas.on("click", ".sbr-bulk-approve-filtered-btn", function () {
+    var names = $canvas.find(".sbr-bulk-approve-bar").data("sbr-visible-txns") || [];
+    sbr_bulk_approve_filtered(frm, names);
   });
 
   // Mark duplicate investigated
@@ -2330,7 +2468,9 @@ function sbr_bind_card_actions(frm, $canvas) {
       return;
     }
     frappe.confirm(
-      __("Search for an existing ERP entry matching the combined amount of {0} selected transaction(s)?", [names.length]),
+      __("Group these {0} selected transactions and search for an existing ERP entry matching their combined " +
+        "amount? If nothing matches, they still group as one row (– for matched entry) at the top of Bank " +
+        "Transactions.", [names.length]),
       function () {
         frappe.call({
           method: "smart_bank_reconciliation.reconciliation.api.consolidate_transactions",
@@ -2347,10 +2487,13 @@ function sbr_bind_card_actions(frm, $canvas) {
             $canvas.find(".sbr-toolbar-rerun-sel, .sbr-toolbar-consolidate-sel").hide();
             if (!data.matched) {
               frappe.show_alert({
-                message: __("No existing ERP entry matches the combined amount ({0}) of these {1} transactions — nothing was changed.",
-                  [ReconUI.fmtCurrency(Math.abs(data.net_amount)), data.count]),
+                message: __("{0} transactions grouped (combined {1}) — no existing ERP entry matched. " +
+                  "They now show – for matched entry and sort to the top of Bank Transactions; " +
+                  "use Actions there to create a voucher if needed.",
+                  [data.count, ReconUI.fmtCurrency(Math.abs(data.net_amount))]),
                 indicator: "orange",
               }, 12);
+              setTimeout(function () { sbr_load_transactions(frm); }, 400);
               return;
             }
             var route = data.entry_type === "Payment Entry" ? "payment-entry" : "journal-entry";

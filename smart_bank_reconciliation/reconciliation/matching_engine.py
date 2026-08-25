@@ -85,6 +85,17 @@ class BankMatchingEngine:
                 results.append(txn)
                 continue
 
+            # Consolidated via the manual Consolidate feature — a human already
+            # confirmed this match against a combined amount that the
+            # transaction can never score against on its own. A routine
+            # re-run of AI Match All must not silently unwind it back to
+            # Unmatched/Aging just because it doesn't individually score.
+            if txn.get("recon_match_type") == "Consolidated":
+                self._save(txn["name"], queue="Review")
+                txn["recon_queue"] = "Review"
+                results.append(txn)
+                continue
+
             # Duplicate bank transaction check (run before ERP scoring but don't skip it)
             dup_reason, dup_names = dup_detector.check(txn)
 
@@ -120,7 +131,12 @@ class BankMatchingEngine:
             nigerian.apply(txn, scored)
 
             if not scored:
-                queue = "Duplicate" if dup_reason else ("Aging" if self._is_aging(txn) else "Unmatched")
+                # No ERP candidate at all — stays Unmatched however old it gets.
+                # "Aging" is reserved for transactions that DO have a matched
+                # entry (even a weak one) sitting unreconciled past the
+                # threshold; a transaction with nothing to show on the ERP
+                # side belongs in Unmatched, not Aging.
+                queue = "Duplicate" if dup_reason else "Unmatched"
                 reasoning = dup_reason or "No matching ERP entry found"
                 draft = None if dup_reason else draft_gen.build(txn)
 
@@ -160,7 +176,11 @@ class BankMatchingEngine:
                 if best_display:
                     txn["matched"] = best_display
                     txn["recon_confidence"] = best_display["confidence"]
-                    txn["recon_match_type"] = best_display.get("match_type", "")
+                    # This block only runs when dup_reason was truthy (best_display
+                    # is only ever built inside `if dup_reason and candidates`), so
+                    # the in-memory match_type must agree with the DB write above
+                    # ("Duplicate") rather than the underlying candidate's own type.
+                    txn["recon_match_type"] = "Duplicate"
                     txn["recon_matched_entries"] = frappe.as_json(display_entry_names)
             else:
                 best = scored[0]
@@ -195,12 +215,19 @@ class BankMatchingEngine:
                 is_invoice = best.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
                 draft = draft_gen.build(txn, best_invoice=best) if is_invoice else None
 
+                # Queue already forces "Duplicate" above when dup_reason is set —
+                # match_type must agree, not keep the underlying candidate's own
+                # type (e.g. "1:1 Exact"), otherwise the two fields contradict
+                # each other in the DB and in exports.
+                match_type = "Duplicate" if dup_reason else (
+                    best.get("match_type") or ("Partial Invoice Payment" if is_invoice else None)
+                )
                 self._save(
                     txn["name"],
                     queue=queue,
                     confidence=conf,
                     matched_entries=frappe.as_json(entry_names) if not is_invoice else None,
-                    match_type=best.get("match_type") or ("Partial Invoice Payment" if is_invoice else None),
+                    match_type=match_type,
                     reasoning=best.get("reasoning"),
                     signals_json=frappe.as_json(best.get("signals", {})),
                     wht_amount=best.get("wht_amount"),
@@ -212,7 +239,7 @@ class BankMatchingEngine:
                     txn["recon_duplicate_of"] = dup_names
                 if draft:
                     txn["recon_draft_payload"] = draft
-                txn["recon_match_type"] = best.get("match_type")
+                txn["recon_match_type"] = match_type
                 txn["recon_ai_reasoning"] = best.get("reasoning")
                 txn["recon_matched_entries"] = frappe.as_json(entry_names)
                 txn["matched"] = best
@@ -327,6 +354,8 @@ class BankMatchingEngine:
                 "name", "date", "deposit", "withdrawal", "description",
                 "reference_number", "party_type", "party", "bank_account",
                 "status", "unallocated_amount",
+                "recon_match_type", "recon_confidence", "recon_matched_entries",
+                "recon_ai_reasoning",
             ],
             order_by="date asc",
         )

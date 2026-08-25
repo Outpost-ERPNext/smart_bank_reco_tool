@@ -64,17 +64,30 @@ class NigerianRules:
         diff = abs(erp_amount - bank_amount)
         if diff < 0.01:
             return  # exact amount match — nothing was withheld, not a WHT case
+        # Evaluate every configured rate and pick whichever is the CLOSEST fit
+        # (smallest residual from its expected WHT amount), not just the
+        # first one whose tolerance window happens to contain diff — for
+        # small invoices the 5%/10% windows can overlap, and first-match-wins
+        # would mislabel an exact 10% deduction as 5%.
+        best_rate = None
+        best_residual = None
+        best_expected_wht = None
         for rate in WHT_RATES:
             expected_wht = erp_amount * rate
             tolerance = min(WHT_MAX_TOLERANCE, max(WHT_MIN_TOLERANCE, expected_wht * WHT_REL_TOLERANCE_PCT))
-            if abs(diff - expected_wht) <= tolerance:
-                best["match_type"] = f"Partial (WHT {int(rate * 100)}%)"
-                best["wht_amount"] = expected_wht
-                best["reasoning"] = (
-                    (best.get("reasoning") or "")
-                    + f" [WHT {int(rate*100)}%: NGN {expected_wht:,.2f} deducted]"
-                )
-                # Cap confidence — always needs human review for WHT
-                best["confidence"] = min(float(best.get("confidence") or 0), 87.0)
-                best["_force_review"] = True
-                return
+            residual = abs(diff - expected_wht)
+            if residual <= tolerance and (best_residual is None or residual < best_residual):
+                best_rate = rate
+                best_residual = residual
+                best_expected_wht = expected_wht
+
+        if best_rate is not None:
+            best["match_type"] = f"Partial (WHT {int(best_rate * 100)}%)"
+            best["wht_amount"] = best_expected_wht
+            best["reasoning"] = (
+                (best.get("reasoning") or "")
+                + f" [WHT {int(best_rate*100)}%: NGN {best_expected_wht:,.2f} deducted]"
+            )
+            # Cap confidence — always needs human review for WHT
+            best["confidence"] = min(float(best.get("confidence") or 0), 87.0)
+            best["_force_review"] = True
