@@ -30,6 +30,9 @@ window.ReconUI = (function () {
   var STICKY_BREAKER_DEFAULTS = { transform: "none", filter: "none", perspective: "none", contain: "none", willChange: "auto" };
   function _neutralizeStickyBreakers($scope) {
     $scope.find(".sbr-table-wrap").each(function () {
+      // Pass 1: ancestors above the wrap must not create a new containing
+      // block (transform/filter/perspective/contain/will-change), or every
+      // sticky descendant inside the wrap silently stops sticking.
       var el = this.parentElement;
       var hops = 0;
       while (el && el !== document.body && hops < 15) {
@@ -45,6 +48,32 @@ window.ReconUI = (function () {
           }
         });
         el = el.parentElement;
+        hops++;
+      }
+
+      // Pass 2: .sbr-table-wrap only becomes its own scroll container (and
+      // therefore a meaningful sticky boundary) if its max-height is
+      // actually honored. Flex/grid items default to min-height:auto,
+      // which lets them grow past a declared max-height instead of
+      // scrolling internally — so if the wrap (or any ancestor up to the
+      // nearest sized box) sits inside a flex/grid layout, force
+      // min-height:0 the whole way up so the height constraint reaches it
+      // and the wrap actually scrolls in place instead of the whole page
+      // scrolling with it.
+      var node = this;
+      hops = 0;
+      while (node && node !== document.body && hops < 40) {
+        var parent = node.parentElement;
+        if (parent) {
+          var parentDisplay = window.getComputedStyle(parent).display;
+          if (parentDisplay === "flex" || parentDisplay === "inline-flex" ||
+              parentDisplay === "grid" || parentDisplay === "inline-grid") {
+            if (window.getComputedStyle(node).minHeight !== "0px") {
+              node.style.setProperty("min-height", "0", "important");
+            }
+          }
+        }
+        node = parent;
         hops++;
       }
     });
