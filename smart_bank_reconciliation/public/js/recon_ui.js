@@ -2,6 +2,23 @@
 
 window.ReconUI = (function () {
 
+  /* ── Inject V15 Sticky Fix ── */
+  if (!document.getElementById("sbr-v15-sticky-fix")) {
+    var style = document.createElement("style");
+    style.id = "sbr-v15-sticky-fix";
+    style.innerHTML = `
+      .sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }
+      .sbr-table thead th { position: sticky !important; top: 0 !important; z-index: 10 !important; background: #f8fafc !important; }
+      .sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col { position: sticky !important; z-index: 11 !important; background: #fff !important; }
+      .sbr-txn-table .sbr-idx-col { left: 36px !important; }
+      .sbr-txn-table .sbr-date-col { left: 76px !important; }
+      .sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col { position: sticky !important; left: 0 !important; z-index: 11 !important; background: #fff !important; }
+      .sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col, .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important; background: #f8fafc !important; }
+    `;
+    document.head.appendChild(style);
+  }
+
+
   /* ── Constants ── */
 
   var QUEUE_COLOR = {
