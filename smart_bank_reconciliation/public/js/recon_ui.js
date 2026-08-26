@@ -226,7 +226,7 @@ window.ReconUI = (function () {
             '<button class="sbr-toolbar-sel-btn sbr-toolbar-clear-sel" type="button">Clear</button>' +
           "</div>" +
         "</div>" +
-        '<div class="sbr-table-wrap"></div>' +
+        '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;"></div>' +
       "</div>" +
       '<div class="sbr-tab-content" data-tab="erp" style="display:none">' +
         '<p class="sbr-empty" style="padding:24px 0">ERP Vouchers appear here after loading. ' +
@@ -711,7 +711,7 @@ window.ReconUI = (function () {
     });
     var netBalance = openingBalance + totalDeposit - totalWithdrawal;
 
-    var html = '<table class="sbr-table sbr-txn-table"><colgroup>' +
+    var html = '<table class="sbr-table sbr-txn-table" style="border-collapse: separate; border-spacing: 0;"><colgroup>' +
       '<col style="width:36px"><col style="width:40px"><col style="width:90px">' +
       '<col style="width:220px"><col style="width:130px"><col style="width:130px">' +
       '<col style="width:130px"><col style="width:150px"><col style="width:180px">' +
@@ -1651,8 +1651,8 @@ window.ReconUI = (function () {
       "</div>";
 
     var tableHtml =
-      '<div class="sbr-table-wrap">' +
-      '<table class="sbr-table"><thead><tr>' +
+      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
+      '<table class="sbr-table" style="border-collapse: separate; border-spacing: 0;"><thead><tr>' +
         '<th style="width:44px">Type</th><th>Voucher</th><th>Date</th>' +
         '<th>Party / Remark</th><th>Amount (' + currencySymbol() + ')</th><th>Reference</th><th>Status</th>' +
       "</tr></thead><tbody>" + buildRows(vouchers) + "</tbody></table></div>";
@@ -2450,8 +2450,8 @@ window.ReconUI = (function () {
         '<span style="font-size:12px;color:#64748b;font-weight:500">' + count + " action" + (count !== 1 ? "s" : "") + " recorded</span>" +
         '<button class="sbr-btn sbr-audit-export-btn" style="padding:4px 12px;font-size:11px">↓ Export CSV</button>' +
       "</div>" +
-      '<div class="sbr-table-wrap" style="overflow-x:auto">' +
-      '<table class="sbr-table">' +
+      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
+      '<table class="sbr-table" style="border-collapse: separate; border-spacing: 0;">' +
       "<thead><tr>" +
         '<th style="width:28px;color:#94a3b8">#</th>' +
         "<th>Date</th><th>Transaction</th><th>Description</th>" +

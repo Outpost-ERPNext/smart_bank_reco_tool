@@ -170,7 +170,9 @@
 .sbr-row { cursor: pointer; }
 .sbr-row:hover td { background: #f8fafc; }
 .sbr-row-active td { background: #eff6ff; }
-.sbr-row-done td { opacity: 0.45; }
+.sbr-row-done td { color: #94a3b8 !important; }
+.sbr-row-done td .sbr-amt-cell { color: #94a3b8 !important; }
+.sbr-row-done td .sbr-ref { color: #94a3b8 !important; }
 
 /* ── Queue badge ── */
 .sbr-badge {
