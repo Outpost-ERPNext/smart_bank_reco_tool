@@ -19,6 +19,37 @@ window.ReconUI = (function () {
     party: "party", side: "side", history: "history",
   };
 
+  // position: sticky silently stops working if any ancestor between the
+  // sticky element and its scrolling container (.sbr-table-wrap) has a
+  // transform/filter/perspective/contain — properties some Frappe/ERPNext
+  // versions or other installed apps set on desk chrome wrappers for
+  // unrelated reasons. Neutralize any such ancestor found above each
+  // table-wrap so sticky headers/columns keep working regardless of what
+  // the surrounding page does.
+  var STICKY_BREAKER_PROPS = ["transform", "filter", "perspective", "contain", "willChange"];
+  var STICKY_BREAKER_DEFAULTS = { transform: "none", filter: "none", perspective: "none", contain: "none", willChange: "auto" };
+  function _neutralizeStickyBreakers($scope) {
+    $scope.find(".sbr-table-wrap").each(function () {
+      var el = this.parentElement;
+      var hops = 0;
+      while (el && el !== document.body && hops < 15) {
+        var cs = window.getComputedStyle(el);
+        STICKY_BREAKER_PROPS.forEach(function (prop) {
+          var val = cs[prop];
+          if (val && val !== STICKY_BREAKER_DEFAULTS[prop]) {
+            el.style.setProperty(
+              prop.replace(/[A-Z]/g, function (c) { return "-" + c.toLowerCase(); }),
+              STICKY_BREAKER_DEFAULTS[prop],
+              "important"
+            );
+          }
+        });
+        el = el.parentElement;
+        hops++;
+      }
+    });
+  }
+
   function _guessEntryRoute(name) {
     var n = (name || "").toUpperCase();
     if (n.indexOf("-JV-")    !== -1) return "journal-entry";
@@ -226,7 +257,7 @@ window.ReconUI = (function () {
             '<button class="sbr-toolbar-sel-btn sbr-toolbar-clear-sel" type="button">Clear</button>' +
           "</div>" +
         "</div>" +
-        '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;"></div>' +
+        '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;"></div>' +
       "</div>" +
       '<div class="sbr-tab-content" data-tab="erp" style="display:none">' +
         '<p class="sbr-empty" style="padding:24px 0">ERP Vouchers appear here after loading. ' +
@@ -796,6 +827,7 @@ window.ReconUI = (function () {
     $container.find(".sbr-table-wrap").html(html);
     $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
     _resolveEntryLinks($container);
+    _neutralizeStickyBreakers($container);
 
     // Select-all: only affects visible rows
     $container.find(".sbr-select-all").on("change", function () {
@@ -1651,13 +1683,14 @@ window.ReconUI = (function () {
       "</div>";
 
     var tableHtml =
-      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
+      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
       '<table class="sbr-table" style="border-collapse: separate; border-spacing: 0;"><thead><tr>' +
         '<th style="width:44px">Type</th><th>Voucher</th><th>Date</th>' +
         '<th>Party / Remark</th><th>Amount (' + currencySymbol() + ')</th><th>Reference</th><th>Status</th>' +
       "</tr></thead><tbody>" + buildRows(vouchers) + "</tbody></table></div>";
 
     $tab.html(toolbarHtml + tableHtml);
+    _neutralizeStickyBreakers($tab);
 
     // Client-side search + type filter (no API round-trip)
     function applyFilter() {
@@ -2450,7 +2483,7 @@ window.ReconUI = (function () {
         '<span style="font-size:12px;color:#64748b;font-weight:500">' + count + " action" + (count !== 1 ? "s" : "") + " recorded</span>" +
         '<button class="sbr-btn sbr-audit-export-btn" style="padding:4px 12px;font-size:11px">↓ Export CSV</button>' +
       "</div>" +
-      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; transform: translateZ(0); border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
+      '<div class="sbr-table-wrap" style="max-height: 65vh; overflow-y: auto; overflow-x: auto; position: relative; border: 1px solid #e2e8f0; border-radius: 6px; background: #fff;">' +
       '<table class="sbr-table" style="border-collapse: separate; border-spacing: 0;">' +
       "<thead><tr>" +
         '<th style="width:28px;color:#94a3b8">#</th>' +
@@ -2462,6 +2495,7 @@ window.ReconUI = (function () {
       "</table></div>"
     );
     _resolveEntryLinks($tab);
+    _neutralizeStickyBreakers($tab);
 
     // Export CSV
     $tab.find(".sbr-audit-export-btn").on("click", function () {

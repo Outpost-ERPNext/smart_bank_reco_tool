@@ -90,7 +90,6 @@
   overflow-y: auto;
   max-height: 65vh !important;
   position: relative;
-  transform: translateZ(0);
   border: 1px solid #e2e8f0;
   border-radius: 6px;
   background: #fff;
@@ -106,6 +105,7 @@
   position: sticky !important;
   top: 0 !important;
   z-index: 10 !important;
+  will-change: transform;
   background: #f8fafc;
   padding: 8px 12px;
   text-align: left;
@@ -672,6 +672,7 @@
   left: 0 !important;
   background: #fff !important;
   z-index: 11 !important;
+  will-change: transform;
 }
 .sbr-table thead th.sbr-check-col {
   z-index: 15 !important;
@@ -685,6 +686,7 @@
   position: sticky !important;
   background: #fff !important;
   z-index: 11 !important;
+  will-change: transform;
 }
 .sbr-txn-table .sbr-idx-col { left: 36px !important; }
 .sbr-txn-table .sbr-date-col { left: 76px !important; }
