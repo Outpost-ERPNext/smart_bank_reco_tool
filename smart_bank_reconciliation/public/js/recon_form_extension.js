@@ -437,8 +437,13 @@ function sbr_recompute_closing_balance(frm) {
     ? frm.fields_dict.recon_ui_container.$wrapper : null;
   if (!$canvas) return;
   var txns = $canvas.data("transactions");
-  if (!txns || !txns.length) return;
   var opening = parseFloat(frm.doc.account_opening_balance) || 0;
+  if (!txns || !txns.length) {
+    // No transactions loaded (e.g. opening balance arrived before any statement
+    // was fetched/uploaded) — Closing must equal Opening, never a leftover value.
+    frm.set_value("bank_statement_closing_balance", opening);
+    return;
+  }
   var net = txns.reduce(function (sum, t) {
     return sum + (parseFloat(t.deposit) || 0) - (parseFloat(t.withdrawal) || 0);
   }, opening);
@@ -646,6 +651,11 @@ function sbr_load_transactions(frm) {
         if (totals) frm.set_value("bank_statement_closing_balance", totals.netBalance);
       } else {
         sbr_render_inline_upload(frm, $canvas);
+        // No transactions in this date range — clear any Closing Balance left
+        // over from a previously viewed account/range rather than leaving it
+        // stale (bank_statement_closing_balance is a Single-doctype field that
+        // otherwise keeps whatever the last-viewed reconciliation wrote to it).
+        frm.set_value("bank_statement_closing_balance", parseFloat(frm.doc.account_opening_balance) || 0);
       }
 
       // Auto-run fresh AI on every load; skip only after manual Reset AI.
@@ -2648,19 +2658,92 @@ function sbr_update_dup_sel_count($canvas) {
   $btn.prop("disabled", n === 0).css("opacity", n === 0 ? "0.5" : "1");
 }
 
+/* Quote-aware CSV line splitter — a plain split(",") breaks the instant a
+   value is quoted specifically because it contains commas, e.g. a bank
+   exporting amounts as `" 4,510,000.00 "` to preserve thousand separators.
+   That single quoted field would otherwise be sliced into three bogus
+   columns at its internal commas, shifting every column after it. */
+function sbr_split_csv_line(line) {
+  var vals = [];
+  var cur = "";
+  var inQuotes = false;
+  for (var i = 0; i < line.length; i++) {
+    var ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; }
+        else { inQuotes = false; }
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      vals.push(cur.trim());
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  vals.push(cur.trim());
+  return vals;
+}
+
+/* True only for a row that actually names a date column and an amount
+   column — used to find the real header row, since some banks prepend a
+   grand-totals line (blank cells + a few summary figures) above it that a
+   naive "line 0 is always the header" assumption would misread as headers,
+   corrupting every column mapping below it. */
+function sbr_looks_like_header(tokens) {
+  var norm = tokens.map(function (t) { return (t || "").trim().toLowerCase(); });
+  var hasDate = norm.some(function (t) {
+    return ["date", "value date", "trans date", "tran date", "transaction date"].indexOf(t) !== -1;
+  });
+  var hasAmount = norm.some(function (t) {
+    return ["debit", "credit", "withdrawal", "withdrawals", "deposit", "deposits", "amount"].indexOf(t) !== -1;
+  });
+  return hasDate && hasAmount;
+}
+
 function sbr_parse_csv(text) {
-  var lines = text.trim().split(/\r?\n/);
+  var lines = text.trim().split(/\r?\n/).filter(function (l) { return l.trim() !== ""; });
   if (lines.length < 2) return null;
-  var headers = lines[0].split(",").map(function (h) { return h.trim().replace(/^"|"$/g, ""); });
+
+  var headerIdx = 0;
+  var maxScan = Math.min(lines.length - 1, 10);
+  for (var i = 0; i <= maxScan; i++) {
+    if (sbr_looks_like_header(sbr_split_csv_line(lines[i]))) { headerIdx = i; break; }
+  }
+
+  var headers = sbr_split_csv_line(lines[headerIdx]).map(function (h) {
+    return h.replace(/^"|"$/g, "");
+  });
   var rows = [];
-  for (var i = 1; i < lines.length; i++) {
-    var vals = lines[i].split(",").map(function (v) { return v.trim().replace(/^"|"$/g, ""); });
+  for (var j = headerIdx + 1; j < lines.length; j++) {
+    var vals = sbr_split_csv_line(lines[j]);
     if (vals.every(function (v) { return !v; })) continue;
     var row = {};
     headers.forEach(function (h, idx) { row[h] = vals[idx] || ""; });
     rows.push(row);
   }
   return { headers: headers, rows: rows };
+}
+
+/* Parse a bank statement amount cell in whatever format it arrives —
+   thousand-separator commas, currency symbols, surrounding whitespace, or
+   accounting-style negatives like "(1,200.00)" — none of which plain
+   parseFloat() understands (it silently stops at the first comma/symbol
+   instead of erroring, so a wrong amount imports with no visible sign). */
+function sbr_parse_amount(v) {
+  if (v === null || v === undefined) return 0;
+  var s = String(v).trim();
+  if (!s) return 0;
+  var negative = /^\(.*\)$/.test(s) || /^-/.test(s) || /-\s*$/.test(s);
+  var cleaned = s.replace(/[^\d.]/g, "");
+  if (!cleaned) return 0;
+  var n = parseFloat(cleaned);
+  if (isNaN(n)) return 0;
+  return negative ? -n : n;
 }
 
 /* ── Multi-format file loader (CSV/TXT: client-side; XLSX/MT940: server-side) ── */
@@ -2735,8 +2818,8 @@ function sbr_do_import(frm, $canvas, parsed) {
     return {
       date:        sbr_norm_date(r[dateCol])  || "",
       description: r[descCol]  || "",
-      debit:       parseFloat(r[debitCol]  || 0) || 0,
-      credit:      parseFloat(r[credCol]   || 0) || 0,
+      debit:       sbr_parse_amount(r[debitCol]),
+      credit:      sbr_parse_amount(r[credCol]),
       reference:   r[refCol]   || "",
     };
   });
@@ -2858,7 +2941,7 @@ function sbr_show_inline_preview($canvas, data) {
   var debitCol = sbr_detect_col(h, ["debit", "Debit", "DEBIT", "withdrawal", "Withdrawals"]);
   var credCol  = sbr_detect_col(h, ["credit", "Credit", "CREDIT", "deposit", "Deposits"]);
   var refCol   = sbr_detect_col(h, ["reference", "Reference", "REF", "Cheque No", "Transaction ID"]);
-  function fmtN(n) { var v = parseFloat(n) || 0; return v > 0 ? ReconUI.fmtCurrency(v) : ""; }
+  function fmtN(n) { var v = sbr_parse_amount(n); return v > 0 ? "₦" + v.toLocaleString("en-NG", { minimumFractionDigits: 0 }) : ""; }
   var previewRows = data.rows.slice(0, 5).map(function (r) {
     return "<tr>" +
       "<td style='white-space:nowrap'>" + (r[dateCol] || "") + "</td>" +
@@ -2962,8 +3045,8 @@ function sbr_open_upload_modal(frm, $canvas) {
   var parsedData = null;
 
   function fmt(n) {
-    var v = parseFloat(n) || 0;
-    return v > 0 ? ReconUI.fmtCurrency(v) : "";
+    var v = sbr_parse_amount(n);
+    return v > 0 ? "₦" + v.toLocaleString("en-NG", { minimumFractionDigits: 0 }) : "";
   }
 
   function showPreview(data) {
@@ -3070,8 +3153,8 @@ function sbr_open_upload_modal(frm, $canvas) {
       return {
         date:        sbr_norm_date(r[colMap.date]        || r["date"]        || r["Date"]        || ""),
         description: r[colMap.description] || r["description"] || r["Description"] || "",
-        debit:       parseFloat(r[colMap.debit]  || r["debit"]  || r["Debit"]  || 0) || 0,
-        credit:      parseFloat(r[colMap.credit] || r["credit"] || r["Credit"] || 0) || 0,
+        debit:       sbr_parse_amount(r[colMap.debit]  || r["debit"]  || r["Debit"]),
+        credit:      sbr_parse_amount(r[colMap.credit] || r["credit"] || r["Credit"]),
         reference:   r[colMap.reference]   || r["reference"]   || r["Reference"]   || "",
       };
     });

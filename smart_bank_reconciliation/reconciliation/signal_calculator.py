@@ -140,7 +140,11 @@ class SignalCalculator:
 
     def _party(self, txn, entry):
         a = (txn.get("party") or txn.get("description") or "").strip().upper()
-        b = (entry.get("party") or entry.get("pay_to_recd_from") or "").strip().upper()
+        # Prefer the human-readable name (e.g. "Shobowale Keyesuite Venture")
+        # over the raw party code (e.g. "CST2526") — a bank narration is text,
+        # so fuzzy-matching it against a customer/supplier code is close to
+        # meaningless and drags otherwise-strong matches down on this signal.
+        b = (entry.get("party_name") or entry.get("party") or entry.get("pay_to_recd_from") or "").strip().upper()
         if not a or not b:
             return 50
         if a == b:

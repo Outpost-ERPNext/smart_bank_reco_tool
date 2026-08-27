@@ -280,13 +280,13 @@ window.ReconUI = (function () {
             '<option value="Aging">Aging</option>' +
             '<option value="Reconciled">Reconciled</option>' +
           "</select>" +
-          '<select class="sbr-party-type-filter" style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151;background:#fff">' +
+          '<select class="sbr-party-type-filter">' +
             '<option value="">All Party Types</option>' +
             '<option value="Customer">Customer</option>' +
             '<option value="Supplier">Supplier</option>' +
             '<option value="Employee">Employee</option>' +
           "</select>" +
-          '<select class="sbr-confidence-filter" style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151;background:#fff">' +
+          '<select class="sbr-confidence-filter">' +
             '<option value="">All Confidence</option>' +
             '<option value="0-10">0–10%</option>' +
             '<option value="11-50">11–50%</option>' +
@@ -294,7 +294,7 @@ window.ReconUI = (function () {
             '<option value="80+">80%+</option>' +
           "</select>" +
           '<input type="text" class="sbr-search-input" placeholder="Search description, reference, party…" ' +
-            'style="flex:1;min-width:180px;max-width:340px;padding:5px 10px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;color:#374151">' +
+            'style="flex:1;min-width:180px;max-width:340px;padding:5px 10px;border:1px solid #c7d2fe;border-radius:6px;font-size:12px;color:#374151;background:#fff">' +
           '<span class="sbr-txn-counter"></span>' +
           '<div class="sbr-toolbar-sel-btns">' +
             '<button class="sbr-toolbar-rerun-sel" type="button" style="display:none">↺ Re-run Selected</button>' +
@@ -629,6 +629,24 @@ window.ReconUI = (function () {
     }
 
     $container.data("sbr-queue-filter", queueName || null);
+
+    // The Review queue can never contain an 80%+ match — matching_engine
+    // caps confidence below the Auto threshold for anything force-routed to
+    // Review (reversal, WHT deduction, duplicate-voucher risk, etc.) — so
+    // offering "80%+" as a filter there is misleading (it can only ever
+    // return zero rows). Hide it, and if it was already selected when the
+    // user switches into Review, fall back to "All Confidence".
+    var $eightyOpt = $container.find('.sbr-confidence-filter option[value="80+"]');
+    if (queueName === "Review") {
+      $eightyOpt.hide().prop("disabled", true);
+      if ($container.find(".sbr-confidence-filter").val() === "80+") {
+        $container.find(".sbr-confidence-filter").val("");
+        $container.data("sbr-confidence-filter", null);
+      }
+    } else {
+      $eightyOpt.show().prop("disabled", false);
+    }
+
     applyFilters($container);
   }
 
@@ -651,13 +669,6 @@ window.ReconUI = (function () {
     return "—";
   }
 
-  // recon_matched_entries only ever stores bare names (no doctype), so the
-  // route above is a guess from the name string — reliable for this app's own
-  // JE/PE naming but wrong whenever a company's Sales/Purchase Invoice naming
-  // series doesn't contain "SINV"/"PINV"/"SI"/"PI" (e.g. "SUM-INV-1160"),
-  // silently falling back to "payment-entry" and producing a dead link. This
-  // asks the server which doctype each name actually belongs to and corrects
-  // any wrong hrefs in place, without blocking the initial render.
   var _entryRouteCache = {};
   function _resolveEntryLinks($scope) {
     var names = [];
@@ -685,6 +696,52 @@ window.ReconUI = (function () {
         applyCache();
       },
     });
+  }
+
+  /* Column header for Date/Deposit/Withdrawal/AI Match — click toggles
+     ascending/descending, reordering the already-rendered rows in place
+     (see _sortTable) rather than re-fetching or rebuilding the table. */
+  function _sortableHeader(extraClass, field, label) {
+    // white-space:nowrap keeps the arrow glued to the end of the label on
+    // the same line — without it, the header's normal wrap/break-word rule
+    // (needed elsewhere for long labels in narrow columns) can push just the
+    // arrow span onto its own line underneath, misaligning the header row.
+    // overflow/ellipsis is a safety net if a label is ever too long to fit.
+    return '<th class="sbr-sortable ' + extraClass + '" data-sort-field="' + field +
+      '" style="cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="Click to sort">' +
+      label + ' <span class="sbr-sort-arrow" data-sort-field="' + field + '" style="color:#4f46e5;display:inline-block;width:10px;vertical-align:baseline;line-height:1"></span></th>';
+  }
+
+  /* Reorder the rendered .sbr-row elements by a data-* attribute already on
+     each row (data-date / data-deposit / data-withdrawal / data-confidence)
+     — no re-render, no server round-trip, and filter visibility (a separate
+     show/hide toggle on the same rows) is untouched. */
+  function _sortTable($container, field, dir) {
+    var $tbody = $container.find(".sbr-txn-table tbody");
+    // jQuery collections have no native .sort() (they're array-like, not
+    // real Arrays) — pull plain DOM elements out with .get() to sort them.
+    var rows = $tbody.find(".sbr-row").detach().get();
+    var isNumeric = field !== "date";
+    rows.sort(function (a, b) {
+      var av = a.getAttribute("data-" + field) || "";
+      var bv = b.getAttribute("data-" + field) || "";
+      if (isNumeric) {
+        av = parseFloat(av) || 0;
+        bv = parseFloat(bv) || 0;
+        return dir === "asc" ? av - bv : bv - av;
+      }
+      if (av === bv) return 0;
+      var cmp = av < bv ? -1 : 1;
+      return dir === "asc" ? cmp : -cmp;
+    });
+    $tbody.append(rows);
+    // Renumber the "#" column to match the new visual order.
+    rows.forEach(function (row, i) {
+      $(row).find(".sbr-idx-col").text(i + 1);
+    });
+
+    $container.find(".sbr-sort-arrow").text("");
+    $container.find('.sbr-sort-arrow[data-sort-field="' + field + '"]').text(dir === "asc" ? "▲" : "▼");
   }
 
   function renderTransactionTable($container, transactions) {
@@ -789,21 +846,21 @@ window.ReconUI = (function () {
     var netBalance = openingBalance + totalDeposit - totalWithdrawal;
 
     var html = '<table class="sbr-table sbr-txn-table" style="border-collapse: separate; border-spacing: 0;"><colgroup>' +
-      '<col style="width:36px"><col style="width:40px"><col style="width:90px">' +
+      '<col style="width:36px"><col style="width:40px"><col style="width:108px">' +
       '<col style="width:220px"><col style="width:130px"><col style="width:130px">' +
       '<col style="width:130px"><col style="width:150px"><col style="width:180px">' +
       '<col style="width:110px"><col style="width:140px"><col style="width:100px">' +
       '</colgroup><thead><tr>' +
       '<th class="sbr-check-col"><input type="checkbox" class="sbr-select-all" title="Select all visible"></th>' +
-      '<th class="sbr-idx-col" style="color:#94a3b8;font-weight:600">#</th>' +
-      '<th class="sbr-date-col">Date</th>' +
+      '<th class="sbr-idx-col">#</th>' +
+      _sortableHeader("sbr-date-col", "date", "Date") +
       "<th>Description / Narration</th>" +
-      "<th>Deposit (" + currencySymbol() + ")</th>" +
-      "<th>Withdrawal (" + currencySymbol() + ")</th>" +
+      _sortableHeader("", "deposit", "Deposit (" + currencySymbol() + ")") +
+      _sortableHeader("", "withdrawal", "Withdrawal (" + currencySymbol() + ")") +
       "<th>Unallocated (" + currencySymbol() + ")</th>" +
       "<th>Balance (" + currencySymbol() + ")</th>" +
       "<th>Reference No.</th>" +
-      "<th>AI Match</th>" +
+      _sortableHeader("", "confidence", "AI Match") +
       "<th>Matched ERP Entry</th>" +
       "<th>Actions</th>" +
       "</tr></thead><tbody>";
@@ -822,6 +879,9 @@ window.ReconUI = (function () {
               ' data-txn="' + t.name + '" data-queue="' + queue + '"' +
               ' data-party-type="' + (t.party_type || "") + '"' +
               ' data-confidence="' + Math.round(pct) + '"' +
+              ' data-date="' + (t.date || "") + '"' +
+              ' data-deposit="' + (parseFloat(t.deposit) || 0) + '"' +
+              ' data-withdrawal="' + (parseFloat(t.withdrawal) || 0) + '"' +
               ' data-search-text="' + searchText + '">' +
               '<td class="sbr-check-col">' +
                 (isReconciled ? "" :
@@ -879,6 +939,19 @@ window.ReconUI = (function () {
     $container.find(".sbr-select-all").on("change", function () {
       var checked = $(this).prop("checked");
       $container.find(".sbr-row:visible .sbr-row-check").prop("checked", checked);
+    });
+
+    // Sortable column headers: Date, Deposit, Withdrawal, AI Match — click
+    // toggles ascending/descending; clicking a different column resets to
+    // ascending on that column.
+    $container.find(".sbr-sortable").on("click", function () {
+      var field = $(this).data("sort-field");
+      var prevField = $container.data("sbr-sort-field");
+      var prevDir   = $container.data("sbr-sort-dir");
+      var dir = (field === prevField && prevDir === "asc") ? "desc" : "asc";
+      $container.data("sbr-sort-field", field);
+      $container.data("sbr-sort-dir", dir);
+      _sortTable($container, field, dir);
     });
 
     // Row click → switch to AI tab (Actions button handled by sbr_bind_card_actions)

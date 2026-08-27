@@ -1249,86 +1249,106 @@ def _consolidate_via_existing_match(txn_names, company=None, bank_account=None, 
     total_deposit    = sum(float(t.deposit    or 0) for t in txns)
     total_withdrawal = sum(float(t.withdrawal or 0) for t in txns)
     used_account     = bank_account or txns[0].bank_account
+    latest_date      = max(t.date for t in txns)
     net              = total_deposit - total_withdrawal
 
     company_name = company or frappe.db.get_value("Bank Account", used_account, "company") or \
                    frappe.defaults.get_defaults().get("company")
 
-    # Pick the latest transaction to become the single merged one
-    primary_txn = max(txns, key=lambda t: getdate(t.date) if t.date else getdate("1900-01-01"))
-    other_txns = [t for t in txns if t.name != primary_txn.name]
 
-    new_deposit = net if net >= 0 else 0
-    new_withdrawal = abs(net) if net < 0 else 0
-    user_name = frappe.db.get_value("User", frappe.session.user, "full_name") or frappe.session.user
-    desc = label + " (" + str(len(txns)) + " txns, consolidated by " + user_name + "): " + ", ".join(t.name for t in txns)
+    parties = {(t.get("party") or "").strip() for t in txns if t.get("party")}
+    common_party = next(iter(parties)) if len(parties) == 1 else ""
 
-    # 1. Update the primary transaction
-    frappe.db.set_value("Bank Transaction", primary_txn.name, {
-        "deposit": new_deposit,
-        "withdrawal": new_withdrawal,
-        "unallocated_amount": abs(net),
-        "description": desc,
-        "recon_queue": "Unmatched",
-        "recon_matched_entries": "",
-        "recon_confidence": 0,
-        "recon_match_type": "Consolidated"
-    })
+    virtual_txn = {
+        "deposit":          net if net >= 0 else 0,
+        "withdrawal":       abs(net) if net < 0 else 0,
+        "date":             latest_date,
+        "description":      label + ": " + ", ".join(t.name for t in txns),
+        "reference_number": "",
+        "party":            common_party,
+        "party_type":       (txns[0].get("party_type") or "") if common_party else "",
+    }
 
-    # 2. Delete the others completely to merge into a single transaction
-    for t in other_txns:
-        frappe.db.sql("DELETE FROM `tabBank Transaction` WHERE name=%s", t.name)
+    from .signal_calculator import SignalCalculator
+    from .pattern_store import PatternStore
 
+    engine = BankMatchingEngine(used_account, latest_date, latest_date, company_name)
+    candidates = [
+        c for c in engine._get_candidates()
+        if c.get("entry_type") in ("Payment Entry", "Journal Entry")
+    ]
+
+    settings = _load_sbr_settings()
+    signal_calc = SignalCalculator(
+        PatternStore(),
+        amount_tolerance_pct=settings.get("amount_tolerance_pct"),
+        date_window=settings.get("date_window_days"),
+    )
+    scored = signal_calc.score_all(virtual_txn, candidates)
+
+    best = scored[0] if scored else None
+
+    result = {
+        "count":            len(txns),
+        "total_deposit":    total_deposit,
+        "total_withdrawal": total_withdrawal,
+        "net_amount":       net,
+        "matched":          best is not None,
+    }
+
+    if best is not None:
+        queue = "Review"
+        confidence = best["confidence"]
+        matched_entries_json = frappe.as_json([best["name"]])
+        reasoning = "{0} {1} transactions (net {2:,.2f}) by {3} — matched against {4} {5}. {6}".format(
+            label, len(txns), net, frappe.session.user, best["entry_type"], best["name"], best.get("reasoning") or ""
+        ).strip()
+        result.update({
+            "entry_type":    best["entry_type"],
+            "matched_entry": best["name"],
+            "confidence":    confidence,
+        })
+    else:
+        # No existing ERP entry fits the combined amount — still group the
+        # transactions; the user creates a voucher manually from any of them
+        # if needed.
+        queue = "Unmatched"
+        confidence = 0
+        matched_entries_json = None
+        reasoning = "{0} {1} transactions (net {2:,.2f}) by {3} — no existing ERP entry matched.".format(
+            label, len(txns), net, frappe.session.user
+        )
+
+    group_id = frappe.generate_hash(length=12)
+
+    for txn in txns:
+        frappe.db.set_value("Bank Transaction", txn.name, {
+            "recon_queue":           queue,
+            "recon_match_type":      "Consolidated",
+            "recon_confidence":      confidence,
+            "recon_matched_entries": matched_entries_json,
+            "recon_ai_reasoning":    reasoning,
+            "recon_run_id":          group_id,
+            "recon_user_action":     "Consolidated",
+        })
     frappe.db.commit()
 
-    # 3. Auto-run the AI matching engine on the new single transaction
-    from .matching_engine import BankMatchingEngine
-    engine = BankMatchingEngine(used_account, primary_txn.date, primary_txn.date, company_name, only_names=[primary_txn.name])
-    engine.run()
+    return result
 
-    # 4. Fetch the result
-    updated_txn = frappe.db.get_value("Bank Transaction", primary_txn.name,
-        ["recon_queue", "recon_matched_entries", "recon_confidence", "recon_match_type", "recon_ai_reasoning"], as_dict=1)
 
-    matched = updated_txn.recon_queue in ("Review", "Auto", "High-Val") if updated_txn else False
-    entry_name = ""
-    entry_type = ""
-    
-    if matched and updated_txn.get("recon_matched_entries"):
-        import json
-        try:
-            entries = json.loads(updated_txn.recon_matched_entries)
-            if entries:
-                entry_name = entries[0]
-                if frappe.db.exists("Payment Entry", entry_name):
-                    entry_type = "Payment Entry"
-                elif frappe.db.exists("Journal Entry", entry_name):
-                    entry_type = "Journal Entry"
-                elif frappe.db.exists("Sales Invoice", entry_name):
-                    entry_type = "Sales Invoice"
-                elif frappe.db.exists("Purchase Invoice", entry_name):
-                    entry_type = "Purchase Invoice"
-        except Exception:
-            pass
-
-    return {
-        "count": len(txns),
-        "total_deposit": total_deposit,
-        "total_withdrawal": total_withdrawal,
-        "net_amount": net,
-        "matched": matched,
-        "entry_type": entry_type,
-        "matched_entry": entry_name,
-        "confidence": updated_txn.recon_confidence or 0 if updated_txn else 0,
-    }
+@frappe.whitelist()
+def consolidate_transactions(transaction_names, company=None):
+    frappe.only_for(["Accounts Manager", "System Manager"])
+    if isinstance(transaction_names, str):
+        transaction_names = json.loads(transaction_names)
+    if len(transaction_names) < 2:
+        frappe.throw(_("Select at least 2 transactions to consolidate."))
+    return _consolidate_via_existing_match(transaction_names, company=company, label="Consolidated")
 
 
 
 @frappe.whitelist()
 def consolidate_transactions(transaction_names, company=None):
-    """Combine selected orphan bank transactions and search for a matching
-    existing ERP entry. See _consolidate_via_existing_match for the full
-    rationale — this creates no new document."""
     frappe.only_for(["Accounts Manager", "System Manager"])
     if isinstance(transaction_names, str):
         transaction_names = json.loads(transaction_names)
@@ -1339,14 +1359,6 @@ def consolidate_transactions(transaction_names, company=None):
 
 @frappe.whitelist()
 def get_consolidatable_transactions(bank_account, from_date, to_date):
-    """Return submitted, unreconciled bank transactions with no existing ERP match.
-
-    A transaction the AI already matched (Auto/Review/High-Val, or Duplicate with
-    a best-effort match) is still "unreconciled" at the raw status/unallocated_amount
-    level until someone approves it — but it already has a specific entry to
-    reconcile against, so it shouldn't be offered here. Consolidate is for genuine
-    orphans (no ERP entry found at all), not transactions that already have one.
-    """
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     txns = frappe.db.get_all(
         "Bank Transaction",
@@ -1369,11 +1381,6 @@ def get_consolidatable_transactions(bank_account, from_date, to_date):
 
 @frappe.whitelist()
 def consolidate_bank_charges(bank_account, amount, consolidation_type, charges_account=None, company=None):
-    """Create a draft Journal Entry for consolidated bank charges.
-
-    Debit (charge taken by bank): DR Bank Charges Account  / CR Bank GL Account
-    Credit (interest / refund in): DR Bank GL Account      / CR Bank Charges Account
-    """
     frappe.only_for(["Accounts Manager", "System Manager"])
 
     amount = float(amount or 0)
@@ -1856,13 +1863,34 @@ def _parse_excel_xls(raw_bytes):
     return _excel_rows_to_dicts(all_rows)
 
 
+_HEADER_DATE_NAMES = {"date", "value date", "trans date", "tran date", "transaction date"}
+_HEADER_AMOUNT_NAMES = {"debit", "credit", "withdrawal", "withdrawals", "deposit", "deposits", "amount"}
+
+
+def _looks_like_header_row(cells):
+    """True only for a row that actually names a date column and an amount
+    column — used to find the real header row. Some banks prepend a
+    grand-totals line (mostly blank cells plus a few summary figures) above
+    the real header, which blindly trusting row 0 would misread as headers,
+    corrupting every column mapping below it."""
+    norm = {str(c or "").strip().lower() for c in cells}
+    return bool(norm & _HEADER_DATE_NAMES) and bool(norm & _HEADER_AMOUNT_NAMES)
+
+
 def _excel_rows_to_dicts(all_rows):
     if not all_rows:
         return [], []
     import datetime as _dt
-    headers = [str(h or "").strip() for h in all_rows[0]]
+
+    header_idx = 0
+    for i, row in enumerate(all_rows[: min(len(all_rows), 10)]):
+        if _looks_like_header_row(row):
+            header_idx = i
+            break
+
+    headers = [str(h or "").strip() for h in all_rows[header_idx]]
     rows = []
-    for raw_row in all_rows[1:]:
+    for raw_row in all_rows[header_idx + 1 :]:
         vals = []
         for v in raw_row:
             if isinstance(v, (_dt.datetime, _dt.date)):

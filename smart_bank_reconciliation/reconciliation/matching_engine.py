@@ -86,13 +86,17 @@ class BankMatchingEngine:
                 continue
 
             # Consolidated via the manual Consolidate feature — a human already
-            # confirmed this match against a combined amount that the
-            # transaction can never score against on its own. A routine
-            # re-run of AI Match All must not silently unwind it back to
-            # Unmatched/Aging just because it doesn't individually score.
+            # decided this group's outcome (Review if it matched an existing
+            # ERP entry, Unmatched if nothing fit — see
+            # _consolidate_via_existing_match). A routine re-run of AI Match
+            # All must not re-score it individually, but it also must not
+            # force it to "Review": that would silently turn a genuinely
+            # unmatched consolidated group into one that reads as pending
+            # review, hiding it from the Unmatched tile/queue entirely.
             if txn.get("recon_match_type") == "Consolidated":
-                self._save(txn["name"], queue="Review")
-                txn["recon_queue"] = "Review"
+                preserved_queue = txn.get("recon_queue") or "Unmatched"
+                self._save(txn["name"], queue=preserved_queue)
+                txn["recon_queue"] = preserved_queue
                 results.append(txn)
                 continue
 
@@ -193,6 +197,12 @@ class BankMatchingEngine:
                     best["reasoning"] = dup_reason + (" — " + best["reasoning"] if best.get("reasoning") else "")
                 elif best.get("_force_review"):
                     queue = "Review"
+                    # A row forced into Review (reversal, WHT deduction, etc.)
+                    # must never display a confidence that reads as "this
+                    # should've been Auto" — cap it just under the Auto
+                    # threshold so Review is internally consistent regardless
+                    # of *why* the match was held back from auto-approval.
+                    conf = min(conf, self.auto_threshold - 1)
                 elif conf >= self.auto_threshold:
                     queue = "High-Val" if bank_amount > self.high_val_threshold else "Auto"
                 elif conf >= self.review_threshold:
@@ -211,6 +221,10 @@ class BankMatchingEngine:
                     ).lstrip(". ")
                     if queue not in ("Review", "High-Val", "Duplicate"):
                         queue = "Review"
+                        # Same reasoning as the _force_review cap above — this
+                        # demotion also happens after an Auto-eligible score,
+                        # so it needs the same cap to stay consistent.
+                        conf = min(conf, self.auto_threshold - 1)
 
                 is_invoice = best.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
                 draft = draft_gen.build(txn, best_invoice=best) if is_invoice else None
@@ -355,7 +369,7 @@ class BankMatchingEngine:
                 "reference_number", "party_type", "party", "bank_account",
                 "status", "unallocated_amount",
                 "recon_match_type", "recon_confidence", "recon_matched_entries",
-                "recon_ai_reasoning",
+                "recon_ai_reasoning", "recon_queue",
             ],
             order_by="date asc",
         )
@@ -376,7 +390,7 @@ class BankMatchingEngine:
         # "Receive" payments: paid_to = company bank GL; "Pay" payments: paid_from = company bank GL.
         pe_rows = frappe.db.sql(
             """
-            SELECT name, payment_type, party_type, party,
+            SELECT name, payment_type, party_type, party, party_name,
                    paid_amount, received_amount, posting_date,
                    reference_no, paid_to, paid_from, remarks
             FROM `tabPayment Entry`
@@ -427,7 +441,7 @@ class BankMatchingEngine:
     def _get_invoice_candidates(self, date_from, date_to):
         si_list = frappe.db.sql(
             """
-            SELECT name, name as reference_no, posting_date, customer as party,
+            SELECT name, name as reference_no, posting_date, customer as party, customer_name,
                    outstanding_amount as amount, grand_total, title, po_no as secondary_ref, remarks
             FROM `tabSales Invoice`
             WHERE company = %s
@@ -443,10 +457,11 @@ class BankMatchingEngine:
             si["entry_type"] = "Sales Invoice"
             si["party_type"] = "Customer"
             si["name"] = si["reference_no"]
+            si["party_name"] = si.get("customer_name")
 
         pi_list = frappe.db.sql(
             """
-            SELECT name, name as reference_no, posting_date, supplier as party,
+            SELECT name, name as reference_no, posting_date, supplier as party, supplier_name,
                    outstanding_amount as amount, grand_total, title, bill_no as secondary_ref, remarks
             FROM `tabPurchase Invoice`
             WHERE company = %s
@@ -462,6 +477,7 @@ class BankMatchingEngine:
             pi["entry_type"] = "Purchase Invoice"
             pi["party_type"] = "Supplier"
             pi["name"] = pi["reference_no"]
+            pi["party_name"] = pi.get("supplier_name")
 
         return list(si_list) + list(pi_list)
 
