@@ -440,8 +440,10 @@ function sbr_recompute_closing_balance(frm) {
   var opening = parseFloat(frm.doc.account_opening_balance) || 0;
   if (!txns || !txns.length) {
     // No transactions loaded (e.g. opening balance arrived before any statement
-    // was fetched/uploaded) — Closing must equal Opening, never a leftover value.
-    frm.set_value("bank_statement_closing_balance", opening);
+    // was fetched/uploaded) — there's no real bank-side data yet, so leave this
+    // blank rather than showing Opening Balance (which would look like a real,
+    // reconciled bank closing figure that was never actually loaded).
+    frm.set_value("bank_statement_closing_balance", null);
     return;
   }
   var net = txns.reduce(function (sum, t) {
@@ -652,10 +654,12 @@ function sbr_load_transactions(frm) {
       } else {
         sbr_render_inline_upload(frm, $canvas);
         // No transactions in this date range — clear any Closing Balance left
-        // over from a previously viewed account/range rather than leaving it
-        // stale (bank_statement_closing_balance is a Single-doctype field that
-        // otherwise keeps whatever the last-viewed reconciliation wrote to it).
-        frm.set_value("bank_statement_closing_balance", parseFloat(frm.doc.account_opening_balance) || 0);
+        // over from a previously viewed account/range (bank_statement_closing_balance
+        // is a Single-doctype field that otherwise keeps whatever the last-viewed
+        // reconciliation wrote to it). Leave it blank rather than backfilling with
+        // Opening Balance — no bank statement has actually been loaded for this
+        // range, so there's no real closing figure to show yet.
+        frm.set_value("bank_statement_closing_balance", null);
       }
 
       // Auto-run fresh AI on every load; skip only after manual Reset AI.
