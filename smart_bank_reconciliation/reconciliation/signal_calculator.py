@@ -227,7 +227,7 @@ class SignalCalculator:
             "reasoning": ". ".join(parts) or "Low confidence match",
             "entries": [entry],
             "amount": entry.get("amount"),
-            "party": entry.get("party"),
+            "party": entry.get("party_name") or entry.get("party"),
             "party_type": entry.get("party_type") or "",
             "posting_date": entry.get("posting_date") or entry.get("cheque_date"),
             "payment_type": entry.get("payment_type"),

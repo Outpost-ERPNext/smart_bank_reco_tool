@@ -430,8 +430,9 @@ function sbr_fetch_opening_balance(frm) {
 }
 
 /* ── Recompute Closing Balance (Bank) = Opening + Deposit − Withdrawal
-   from whatever transactions are currently loaded, without re-rendering
-   the table — used whenever opening balance arrives after the table did. */
+   from whatever transactions are currently loaded — used whenever opening
+   balance arrives after the table did (the two are independent, unordered
+   async calls: sbr_fetch_opening_balance vs sbr_load_transactions). */
 function sbr_recompute_closing_balance(frm) {
   var $canvas = frm.fields_dict.recon_ui_container
     ? frm.fields_dict.recon_ui_container.$wrapper : null;
@@ -450,6 +451,21 @@ function sbr_recompute_closing_balance(frm) {
     return sum + (parseFloat(t.deposit) || 0) - (parseFloat(t.withdrawal) || 0);
   }, opening);
   frm.set_value("bank_statement_closing_balance", net);
+
+  // The table itself (per-row running balance + footer total) is drawn from
+  // $canvas.data("sbr-opening-balance"), snapshotted once at first render. If
+  // that render happened before this (the real, correct) opening balance
+  // arrived, the snapshot is stale — 0, or leftover from a previously viewed
+  // bank account, since this is a plain data-cache with no staleness guard of
+  // its own. The top field above gets fixed either way, but the in-table
+  // numbers would otherwise stay wrong for the rest of the page view with no
+  // visible sign anything was off. Re-sync the cache and redraw when it drifted.
+  if (parseFloat($canvas.data("sbr-opening-balance")) !== opening) {
+    $canvas.data("sbr-opening-balance", opening);
+    var raw = $canvas.data("sbr-raw-transactions") || txns;
+    ReconUI.renderTransactionTable($canvas, raw);
+    ReconUI.filterByQueue($canvas, $canvas.data("sbr-queue-filter") || null, true);
+  }
 }
 
 /* ── Refresh the balance bar inside the custom panel ── */
@@ -1959,6 +1975,19 @@ function sbr_open_bank_charges_modal(frm) {
   });
 }
 
+/* Deposit-only or Withdrawal-only groups are allowed to consolidate; mixing
+   the two would net them against each other into one merged amount, which
+   is never a real single bank event — used both by the two-panel modal and
+   the table's own "Consolidate Selected" toolbar button. */
+function sbr_has_mixed_types(arr) {
+  var hasDep = false, hasWit = false;
+  arr.forEach(function (t) {
+    if (parseFloat(t.deposit    || 0) > 0) hasDep = true;
+    if (parseFloat(t.withdrawal || 0) > 0) hasWit = true;
+  });
+  return hasDep && hasWit;
+}
+
 /* ── Consolidate Transactions modal (two-panel, full transaction list) ── */
 function sbr_open_consolidate_transactions_modal(frm) {
   var bank_account = frm.doc.bank_account;
@@ -2029,6 +2058,10 @@ function sbr_open_consolidate_transactions_modal(frm) {
     var $btn = d.get_primary_btn();
     if (n < 2) {
       $btn.prop("disabled", true).text(n === 0 ? __("Select ≥ 2 Transactions") : __("Select 1 more Transaction"));
+    } else if (sbr_has_mixed_types(selArr)) {
+      // Deposits and Withdrawals can't be consolidated together — see
+      // _doConsolidate / api.py's server-side check for the same rule.
+      $btn.prop("disabled", true).text(__("Deposit + Withdrawal — not allowed"));
     } else {
       $btn.prop("disabled", false).text(__("Consolidate {0} Transactions", [n]));
     }
@@ -2161,6 +2194,10 @@ function sbr_open_consolidate_transactions_modal(frm) {
     var selArr = Object.values(selected);
     if (selArr.length < 2) {
       frappe.msgprint(__("Select at least 2 transactions to consolidate."));
+      return;
+    }
+    if (sbr_has_mixed_types(selArr)) {
+      frappe.msgprint(__("Cannot consolidate Deposit and Withdrawal transactions together. Select transactions that are all Deposits or all Withdrawals."));
       return;
     }
     frappe.call({
@@ -2473,12 +2510,14 @@ function sbr_bind_card_actions(frm, $canvas) {
   // Directly consolidates the already-checked rows without reopening the dialog.
   $canvas.off("click", ".sbr-toolbar-consolidate-sel");
   $canvas.on("click", ".sbr-toolbar-consolidate-sel", function () {
-    var names = [];
-    $canvas.find(".sbr-row-check:checked").each(function () {
-      names.push($(this).data("txn"));
-    });
+    var selTxns = ReconUI.getSelectedTxns($canvas);
+    var names = selTxns.map(function (t) { return t.name; });
     if (names.length < 2) {
       frappe.msgprint(__("Select at least 2 transactions to consolidate."));
+      return;
+    }
+    if (sbr_has_mixed_types(selTxns)) {
+      frappe.msgprint(__("Cannot consolidate Deposit and Withdrawal transactions together. Select transactions that are all Deposits or all Withdrawals."));
       return;
     }
     frappe.confirm(

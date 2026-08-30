@@ -2,23 +2,6 @@
 
 window.ReconUI = (function () {
 
-  /* ── Inject V15 Sticky Fix ── */
-  if (!document.getElementById("sbr-v15-sticky-fix")) {
-    var style = document.createElement("style");
-    style.id = "sbr-v15-sticky-fix";
-    style.innerHTML = `
-      .sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }
-      .sbr-table thead th { position: sticky !important; top: 0 !important; z-index: 10 !important; }
-      .sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col { position: sticky !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-txn-table .sbr-idx-col { left: 36px !important; }
-      .sbr-txn-table .sbr-date-col { left: 76px !important; }
-      .sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col { position: sticky !important; left: 0 !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col, .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important; }
-    `;
-    document.head.appendChild(style);
-  }
-
-
   /* ── Constants ── */
 
   var QUEUE_COLOR = {
@@ -362,7 +345,20 @@ window.ReconUI = (function () {
       var $consBtn  = $container.find(".sbr-toolbar-consolidate-sel");
       var $rerunBtn = $container.find(".sbr-toolbar-rerun-sel");
       if (n >= 2) {
-        $consBtn.text("↕ Consolidate Selected (" + n + ")").show();
+        var selTxns = getSelectedTxns($container);
+        var hasDep = false, hasWit = false;
+        selTxns.forEach(function (t) {
+          if (parseFloat(t.deposit    || 0) > 0) hasDep = true;
+          if (parseFloat(t.withdrawal || 0) > 0) hasWit = true;
+        });
+        // Deposit + Withdrawal can't be consolidated together (see api.py's
+        // server-side check) — disable and say so rather than letting the
+        // click go through only to be rejected.
+        if (hasDep && hasWit) {
+          $consBtn.text("↕ Deposit + Withdrawal — not allowed").prop("disabled", true).show();
+        } else {
+          $consBtn.prop("disabled", false).text("↕ Consolidate Selected (" + n + ")").show();
+        }
       } else {
         $consBtn.hide();
       }
@@ -753,6 +749,12 @@ window.ReconUI = (function () {
       return { totalDeposit: 0, totalWithdrawal: 0, netBalance: parseFloat($container.data("sbr-opening-balance")) || 0 };
     }
 
+    // Keep the untouched, pre-grouping list around so a later re-render (e.g.
+    // once the true opening balance arrives — see sbr_recompute_closing_balance)
+    // can redraw from the exact same input instead of re-grouping an
+    // already-collapsed list.
+    $container.data("sbr-raw-transactions", transactions);
+
     // Running balance follows true chronological order over every individual
     // real bank statement line — computed BEFORE any consolidation grouping
     // collapses rows, so a merged group's display date (its latest member)
@@ -1043,7 +1045,23 @@ window.ReconUI = (function () {
 
     var preselectedName = (!isMany && suggestion && suggestion.matched)
         ? (suggestion.matched.name || "") : "";
-    var aiConf = parseFloat((suggestion || {}).confidence || 0);
+
+    // Consolidated transactions never get an entry in the "suggestions" cache
+    // above (that cache is populated only by the separate AI Match All /
+    // run_suggestions flow) — their AI match lives solely on the transaction
+    // record itself (recon_matched_entries / recon_confidence, written by
+    // consolidate_transactions). Without this fallback, the Matched ERP Entry
+    // column shows the right entry but this modal opens with nothing selected.
+    if (!preselectedName && !isMany && txn.recon_matched_entries) {
+      try {
+        var _rme = typeof txn.recon_matched_entries === "string"
+          ? JSON.parse(txn.recon_matched_entries) : txn.recon_matched_entries;
+        if (_rme && _rme.length) preselectedName = _rme[0];
+      } catch (e) {}
+    }
+
+    var aiConf = parseFloat((suggestion || {}).confidence ||
+      (preselectedName ? txn.recon_confidence : 0) || 0);
 
     // ── AI suggestion card ──
     var aiCardHtml = "";
@@ -1095,7 +1113,7 @@ window.ReconUI = (function () {
             '<td style="font-size:12px;white-space:nowrap">' + (e.posting_date || e.cheque_date || "—") + '</td>' +
             '<td style="font-weight:700;font-variant-numeric:tabular-nums;font-size:12px;color:#6d28d9">' +
               formatAmount(e.amount || 0) + '</td>' +
-            '<td style="font-size:12px;color:#64748b">' + (e.party || "—") + '</td>' +
+            '<td style="font-size:12px;color:#64748b">' + (e.party_name || e.party || "—") + '</td>' +
             '</tr>';
         }).join("");
         cardBody =

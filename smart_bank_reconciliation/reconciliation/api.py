@@ -1036,7 +1036,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
     pes = frappe.db.get_all(
         "Payment Entry",
         filters=pe_filters,
-        fields=["name", "posting_date", "payment_type", "party",
+        fields=["name", "posting_date", "payment_type", "party", "party_name",
                 "paid_amount", "received_amount", "reference_no"],
         order_by="posting_date desc",
     )
@@ -1046,7 +1046,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             "name":         pe.name,
             "type":         "Payment Entry",
             "date":         str(pe.posting_date),
-            "party":        pe.party or "",
+            "party":        pe.party_name or pe.party or "",
             "amount":       pe_amount,
             "reference":    pe.reference_no or "",
             "payment_type": pe.payment_type or "",
@@ -1089,7 +1089,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
     pis = frappe.db.get_all(
         "Purchase Invoice",
         filters=pi_filters,
-        fields=["name", "posting_date", "supplier", "grand_total", "bill_no"],
+        fields=["name", "posting_date", "supplier", "supplier_name", "grand_total", "bill_no"],
         order_by="posting_date desc",
     )
     for pi in pis:
@@ -1097,7 +1097,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             "name":         pi.name,
             "type":         "Purchase Invoice",
             "date":         str(pi.posting_date),
-            "party":        pi.supplier or "",
+            "party":        pi.supplier_name or pi.supplier or "",
             "amount":       float(pi.grand_total or 0),
             "reference":    pi.bill_no or "",
             "payment_type": "",
@@ -1114,7 +1114,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
     sis = frappe.db.get_all(
         "Sales Invoice",
         filters=si_filters,
-        fields=["name", "posting_date", "customer", "grand_total"],
+        fields=["name", "posting_date", "customer", "customer_name", "grand_total"],
         order_by="posting_date desc",
     )
     for si in sis:
@@ -1122,7 +1122,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             "name":         si.name,
             "type":         "Sales Invoice",
             "date":         str(si.posting_date),
-            "party":        si.customer or "",
+            "party":        si.customer_name or si.customer or "",
             "amount":       float(si.grand_total or 0),
             "reference":    "",
             "payment_type": "",
@@ -1170,7 +1170,7 @@ def _inject_preselected(entry_name, vouchers):
     # Try Payment Entry
     pe = frappe.db.get_value(
         "Payment Entry", entry_name,
-        ["name", "posting_date", "payment_type", "party", "paid_amount", "received_amount", "reference_no"],
+        ["name", "posting_date", "payment_type", "party", "party_name", "paid_amount", "received_amount", "reference_no"],
         as_dict=True,
     )
     if pe:
@@ -1178,7 +1178,7 @@ def _inject_preselected(entry_name, vouchers):
             "name":         pe.name,
             "type":         "Payment Entry",
             "date":         str(pe.posting_date or ""),
-            "party":        pe.party or "",
+            "party":        pe.party_name or pe.party or "",
             "amount":       float(pe.paid_amount or 0) or float(pe.received_amount or 0),
             "reference":    pe.reference_no or "",
             "payment_type": pe.payment_type or "",
@@ -1204,7 +1204,7 @@ def _inject_preselected(entry_name, vouchers):
     # Try Sales Invoice
     si = frappe.db.get_value(
         "Sales Invoice", entry_name,
-        ["name", "posting_date", "customer", "grand_total"],
+        ["name", "posting_date", "customer", "customer_name", "grand_total"],
         as_dict=True,
     )
     if si:
@@ -1212,7 +1212,7 @@ def _inject_preselected(entry_name, vouchers):
             "name":         si.name,
             "type":         "Sales Invoice",
             "date":         str(si.posting_date or ""),
-            "party":        si.customer or "",
+            "party":        si.customer_name or si.customer or "",
             "amount":       float(si.grand_total or 0),
             "reference":    "",
             "payment_type": "",
@@ -1221,7 +1221,7 @@ def _inject_preselected(entry_name, vouchers):
     # Try Purchase Invoice
     pi = frappe.db.get_value(
         "Purchase Invoice", entry_name,
-        ["name", "posting_date", "supplier", "grand_total", "bill_no"],
+        ["name", "posting_date", "supplier", "supplier_name", "grand_total", "bill_no"],
         as_dict=True,
     )
     if pi:
@@ -1229,7 +1229,7 @@ def _inject_preselected(entry_name, vouchers):
             "name":         pi.name,
             "type":         "Purchase Invoice",
             "date":         str(pi.posting_date or ""),
-            "party":        pi.supplier or "",
+            "party":        pi.supplier_name or pi.supplier or "",
             "amount":       float(pi.grand_total or 0),
             "reference":    pi.bill_no or "",
             "payment_type": "",
@@ -1245,6 +1245,22 @@ def _consolidate_via_existing_match(txn_names, company=None, bank_account=None, 
     )
     if not txns:
         frappe.throw(_("No valid transactions found."))
+
+    # A consolidated group must be all-deposit or all-withdrawal — mixing the
+    # two sides would silently net them against each other into one merged
+    # amount (e.g. a deposit and a withdrawal cancelling out), which is never
+    # a real single bank event and would misrepresent both transactions.
+    txn_types = set()
+    for t in txns:
+        if float(t.deposit or 0) > 0:
+            txn_types.add("deposit")
+        if float(t.withdrawal or 0) > 0:
+            txn_types.add("withdrawal")
+    if len(txn_types) > 1:
+        frappe.throw(_(
+            "Cannot consolidate Deposit and Withdrawal transactions together. "
+            "Select transactions that are all Deposits or all Withdrawals."
+        ))
 
     total_deposit    = sum(float(t.deposit    or 0) for t in txns)
     total_withdrawal = sum(float(t.withdrawal or 0) for t in txns)
@@ -1334,17 +1350,6 @@ def _consolidate_via_existing_match(txn_names, company=None, bank_account=None, 
     frappe.db.commit()
 
     return result
-
-
-@frappe.whitelist()
-def consolidate_transactions(transaction_names, company=None):
-    frappe.only_for(["Accounts Manager", "System Manager"])
-    if isinstance(transaction_names, str):
-        transaction_names = json.loads(transaction_names)
-    if len(transaction_names) < 2:
-        frappe.throw(_("Select at least 2 transactions to consolidate."))
-    return _consolidate_via_existing_match(transaction_names, company=company, label="Consolidated")
-
 
 
 @frappe.whitelist()
