@@ -987,15 +987,19 @@ def get_account_opening_balance(bank_account, from_date):
 
 @frappe.whitelist()
 def get_balance_summary(bank_account, from_date, to_date, company=None):
-    """Return ERP GL closing balance at to_date — matches the
-    'Closing (Opening + Total)' row of the General Ledger report."""
+    """Return ERP GL Net Change between from_date and to_date."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     try:
+        from frappe.utils import add_days, getdate
         gl_account = frappe.db.get_value("Bank Account", bank_account, "account")
         if not gl_account:
             return {"erp_closing": 0.0}
+        
         erp_closing = _gl_balance(gl_account, to_date)
-        return {"erp_closing": erp_closing}
+        cutoff = add_days(getdate(from_date), -1)
+        erp_opening = _gl_balance(gl_account, cutoff)
+        
+        return {"erp_closing": erp_closing - erp_opening}
     except Exception:
         return {"erp_closing": 0.0}
 

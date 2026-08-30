@@ -438,7 +438,7 @@ function sbr_recompute_closing_balance(frm) {
     ? frm.fields_dict.recon_ui_container.$wrapper : null;
   if (!$canvas) return;
   var txns = $canvas.data("transactions");
-  var opening = parseFloat(frm.doc.account_opening_balance) || 0;
+  var opening = 0; // Forced to 0 to only show net change for the period
   if (!txns || !txns.length) {
     // No transactions loaded (e.g. opening balance arrived before any statement
     // was fetched/uploaded) — there's no real bank-side data yet, so leave this
@@ -660,7 +660,7 @@ function sbr_load_transactions(frm) {
       ReconUI.renderSummaryTiles($canvas, qCounts);
       ReconUI.renderTabShell($canvas, data.total || 0);
       if (data.total) {
-        $canvas.data("sbr-opening-balance", parseFloat(frm.doc.account_opening_balance) || 0);
+        $canvas.data("sbr-opening-balance", 0); // Forced to 0 to only show net change
         var totals = ReconUI.renderTransactionTable($canvas, data.transactions);
         ReconUI.filterByQueue($canvas, null);
         // Closing Balance (Bank) is auto-computed, not manually entered —
