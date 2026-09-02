@@ -2,6 +2,24 @@
 
 window.ReconUI = (function () {
 
+  /* ── Inject V15 Sticky Fix & Colors (Bypass Dev CSS Cache) ── */
+  if (!document.getElementById("sbr-v15-styles-inject")) {
+    var style = document.createElement("style");
+    style.id = "sbr-v15-styles-inject";
+    style.innerHTML = `
+      .sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }
+      .sbr-table thead th { position: sticky !important; top: 0 !important; z-index: 10 !important; background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%) !important; color: #4338ca !important; border-bottom: 2px solid #6366f1 !important; }
+      .sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col { position: sticky !important; z-index: 11 !important; background: #fff !important; }
+      .sbr-txn-table .sbr-idx-col { left: 36px !important; }
+      .sbr-txn-table .sbr-date-col { left: 76px !important; }
+      .sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col { position: sticky !important; left: 0 !important; z-index: 11 !important; background: #fff !important; }
+      .sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col, .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important; background: #e0e7ff !important; }
+      .sbr-queue-filter, .sbr-party-type-filter, .sbr-confidence-filter { background: #eef2ff !important; border-color: #c7d2fe !important; color: #3730a3 !important; }
+      .sbr-sp-sticky-top { position: sticky !important; top: 0 !important; z-index: 20 !important; background: #fff !important; border-bottom: 2px solid #e2e8f0 !important; margin-left: -15px; margin-right: -15px; padding-left: 15px; padding-right: 15px; }
+    `;
+    document.head.appendChild(style);
+  }
+
   /* ── Constants ── */
 
   var QUEUE_COLOR = {
