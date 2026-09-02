@@ -2,23 +2,6 @@
 
 window.ReconUI = (function () {
 
-  /* ── Inject V15 Sticky Fix & Colors (Bypass Dev CSS Cache) ── */
-  if (!document.getElementById("sbr-v15-styles-inject")) {
-    var style = document.createElement("style");
-    style.id = "sbr-v15-styles-inject";
-    style.innerHTML = `
-      .sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }
-      .sbr-table thead th { position: sticky !important; top: 0 !important; z-index: 10 !important; background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%) !important; color: #4338ca !important; border-bottom: 2px solid #6366f1 !important; }
-      .sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col { position: sticky !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-txn-table .sbr-idx-col { left: 36px !important; }
-      .sbr-txn-table .sbr-date-col { left: 76px !important; }
-      .sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col { position: sticky !important; left: 0 !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col, .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important; background: #e0e7ff !important; }
-      .sbr-queue-filter, .sbr-party-type-filter, .sbr-confidence-filter { background: #eef2ff !important; border-color: #c7d2fe !important; color: #3730a3 !important; }
-    `;
-    document.head.appendChild(style);
-  }
-
   /* ── Constants ── */
 
   var QUEUE_COLOR = {
@@ -547,6 +530,15 @@ window.ReconUI = (function () {
       if (queueOk && ptOk && textOk && confOk) { $row.show(); visible++; }
       else                                      { $row.hide(); }
     });
+
+    // The footer Totals row is always the full period's grand totals, not a
+    // sum of whatever's currently visible — correct only while looking at
+    // every queue together ("All Queues" / the Total tile). Once a specific
+    // queue (Auto, Review, Reconciled, etc.) is selected, showing that
+    // full-period figure alongside a handful of filtered rows is misleading,
+    // so hide it for any single-queue view.
+    $container.find(".sbr-table-footer").css("display", queueName ? "none" : "");
+
     if (total > 0) {
       $container.find(".sbr-txn-counter").text(
         (queueName || txt || partyType || confRangeTable)
@@ -720,9 +712,13 @@ window.ReconUI = (function () {
     // (needed elsewhere for long labels in narrow columns) can push just the
     // arrow span onto its own line underneath, misaligning the header row.
     // overflow/ellipsis is a safety net if a label is ever too long to fit.
+    // The arrow shows a neutral ⇅ up front (rather than nothing until the
+    // first click) so the column reads as sortable without the user having
+    // to discover that by clicking blind — _sortTable then swaps it for a
+    // colored ▲/▼ and highlights the header once this column is the active sort.
     return '<th class="sbr-sortable ' + extraClass + '" data-sort-field="' + field +
       '" style="cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="Click to sort">' +
-      label + ' <span class="sbr-sort-arrow" data-sort-field="' + field + '" style="color:#4f46e5;display:inline-block;width:10px;vertical-align:baseline;line-height:1"></span></th>';
+      label + ' <span class="sbr-sort-arrow" data-sort-field="' + field + '">&#8645;</span></th>';
   }
 
   /* Reorder the rendered .sbr-row elements by a data-* attribute already on
@@ -735,12 +731,23 @@ window.ReconUI = (function () {
     // real Arrays) — pull plain DOM elements out with .get() to sort them.
     var rows = $tbody.find(".sbr-row").detach().get();
     var isNumeric = field !== "date";
+    // Deposit and Withdrawal are mutually exclusive per row — a withdrawal-only
+    // row's Deposit value (and vice versa) is blank/not-applicable, not a real
+    // "smallest" amount. Left in the normal numeric sort, those blanks (stored
+    // as 0) clump at the very top of an ascending sort ahead of every real
+    // amount. Pin them to the end instead, in both sort directions, and only
+    // for these two fields — Date and AI Match keep their original behavior.
+    var blankLast = (field === "deposit" || field === "withdrawal");
     rows.sort(function (a, b) {
       var av = a.getAttribute("data-" + field) || "";
       var bv = b.getAttribute("data-" + field) || "";
       if (isNumeric) {
         av = parseFloat(av) || 0;
         bv = parseFloat(bv) || 0;
+        if (blankLast) {
+          var aBlank = av === 0, bBlank = bv === 0;
+          if (aBlank !== bBlank) return aBlank ? 1 : -1;
+        }
         return dir === "asc" ? av - bv : bv - av;
       }
       if (av === bv) return 0;
@@ -753,8 +760,16 @@ window.ReconUI = (function () {
       $(row).find(".sbr-idx-col").text(i + 1);
     });
 
-    $container.find(".sbr-sort-arrow").text("");
-    $container.find('.sbr-sort-arrow[data-sort-field="' + field + '"]').text(dir === "asc" ? "▲" : "▼");
+    // Reset every sortable header back to the neutral ⇅ state, then mark the
+    // one actually active — a colored arrow plus a highlighted header background
+    // makes it obvious at a glance which column and direction the table is
+    // currently sorted by, instead of only showing up after already clicking it.
+    $container.find(".sbr-sortable").removeClass("sbr-sortable-active");
+    $container.find(".sbr-sort-arrow").removeClass("sbr-sort-arrow-active").html("&#8645;");
+    $container.find('.sbr-sortable[data-sort-field="' + field + '"]').addClass("sbr-sortable-active");
+    $container.find('.sbr-sort-arrow[data-sort-field="' + field + '"]')
+      .addClass("sbr-sort-arrow-active")
+      .text(dir === "asc" ? "▲" : "▼");
   }
 
   function renderTransactionTable($container, transactions) {
@@ -866,7 +881,7 @@ window.ReconUI = (function () {
 
     var html = '<table class="sbr-table sbr-txn-table" style="border-collapse: separate; border-spacing: 0;"><colgroup>' +
       '<col style="width:36px"><col style="width:40px"><col style="width:108px">' +
-      '<col style="width:220px"><col style="width:130px"><col style="width:130px">' +
+      '<col style="width:220px"><col style="width:130px"><col style="width:160px">' +
       '<col style="width:130px"><col style="width:150px"><col style="width:180px">' +
       '<col style="width:110px"><col style="width:140px"><col style="width:100px">' +
       '</colgroup><thead><tr>' +
@@ -1578,18 +1593,15 @@ window.ReconUI = (function () {
       queueCounts[q] = (queueCounts[q] || 0) + 1;
     });
 
-    var signalCount = suggestions.filter(function (s) {
-      return s.queue === "Auto" || s.queue === "Review" || s.queue === "High-Val";
-    }).length;
     var autoCount = queueCounts["Auto"] || 0;
 
-    var html = '<div class="sbr-sp-header">' +
+    var html = '<div class="sbr-sp-sticky-top">' +
+      '<div class="sbr-sp-header">' +
       '<span style="font-weight:700;font-size:14px;color:#0f172a">AI Match Pairs</span>' +
       '<div style="display:flex;align-items:center;gap:8px">' +
         '<button class="sbr-btn sbr-sp-export-btn" style="padding:4px 10px;font-size:11px" ' +
           'title="Export the currently visible/filtered cards">&#8595; Export CSV</button>' +
         '<button class="sbr-sp-scroll-btn sbr-scroll-bot-btn" title="Scroll to bottom">&#8681;</button>' +
-        '<span class="sbr-sp-badge">' + signalCount + " SIGNALS</span>" +
       '</div>' +
       "</div>";
 
@@ -1613,7 +1625,8 @@ window.ReconUI = (function () {
               '<span class="sbr-sp-qtab-num">' + cnt + "</span>" +
               '<span class="sbr-sp-qtab-lbl">' + (QUEUE_LABEL[q] || q.toUpperCase()) + "</span></span>";
     });
-    html += "</div>";
+    html += "</div>"; // .sbr-sp-queue-tabs
+    html += "</div>"; // .sbr-sp-sticky-top
 
     if (autoCount > 0) {
       html += '<div class="sbr-sp-summary">' + autoCount + " auto-match" +
@@ -1834,6 +1847,8 @@ window.ReconUI = (function () {
           '<option value="Journal Entry">Journal Entry</option>' +
         '</select>' +
         '<span class="sbr-txn-counter sbr-erp-counter">' + count + " vouchers</span>" +
+        '<button class="sbr-btn sbr-erp-export-btn" style="padding:4px 10px;font-size:11px;margin-left:auto" ' +
+          'title="Export the currently visible/filtered vouchers">&#8595; Export CSV</button>' +
       "</div>";
 
     var tableHtml =
@@ -1847,6 +1862,7 @@ window.ReconUI = (function () {
     _neutralizeStickyBreakers($tab);
 
     // Client-side search + type filter (no API round-trip)
+    var currentFiltered = vouchers;
     function applyFilter() {
       var search = ($tab.find(".sbr-erp-search").val() || "").toLowerCase();
       var typeVal = $tab.find(".sbr-erp-type-filter").val();
@@ -1859,6 +1875,7 @@ window.ReconUI = (function () {
         }
         return ok;
       });
+      currentFiltered = filtered;
       $tab.find(".sbr-table tbody").html(buildRows(filtered));
       $tab.find(".sbr-erp-counter").text(
         (filtered.length < count ? filtered.length + " of " : "") + count + " vouchers"
@@ -1867,6 +1884,34 @@ window.ReconUI = (function () {
 
     $tab.off("input", ".sbr-erp-search").on("input", ".sbr-erp-search", applyFilter);
     $tab.off("change", ".sbr-erp-type-filter").on("change", ".sbr-erp-type-filter", applyFilter);
+
+    // Export CSV — same pattern as the AI Match Pairs export: whatever is
+    // currently visible under the active search/type filter, not a fixed
+    // export of every voucher regardless of what's being looked at.
+    $tab.off("click", ".sbr-erp-export-btn").on("click", ".sbr-erp-export-btn", function () {
+      if (!currentFiltered.length) {
+        frappe.msgprint(__("No vouchers to export under the current filter."));
+        return;
+      }
+      var header = ["Type", "Voucher", "Date", "Party / Remark", "Amount", "Reference", "Status"];
+      function esc(v) {
+        var s = String(v === null || v === undefined ? "" : v).replace(/"/g, '""');
+        return '"' + s + '"';
+      }
+      var csvRows = [header.map(esc).join(",")];
+      currentFiltered.forEach(function (v) {
+        csvRows.push([
+          v.type_short || v.type || "", v.name, v.date || "",
+          v.party || "", v.amount || "", v.reference || "",
+          v.status || "",
+        ].map(esc).join(","));
+      });
+      var blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = "sbr_erp_vouchers_export.csv"; a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    });
   }
 
   /* ── Card builder — P2.4 side-by-side pair layout ── */
