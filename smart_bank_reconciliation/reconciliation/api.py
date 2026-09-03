@@ -143,7 +143,6 @@ def get_bank_transactions(bank_account, from_date, to_date):
                 distinct=True,
             ):
                 live_entries.setdefault(gl["voucher_no"], "")
->>>>>>> 4146cec (fix: UI layout and AI matching missing ERP entries)
 
         for row in rows:
             referenced = _referenced_entry_names(row)
