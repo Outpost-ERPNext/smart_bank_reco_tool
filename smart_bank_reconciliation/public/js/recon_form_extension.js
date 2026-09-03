@@ -438,7 +438,7 @@ function sbr_recompute_closing_balance(frm) {
     ? frm.fields_dict.recon_ui_container.$wrapper : null;
   if (!$canvas) return;
   var txns = $canvas.data("transactions");
-  var opening = 0; // Forced to 0 to only show net change for the period
+  var opening = parseFloat(frm.doc.account_opening_balance) || 0;
   if (!txns || !txns.length) {
     // No transactions loaded (e.g. opening balance arrived before any statement
     // was fetched/uploaded) — there's no real bank-side data yet, so leave this
@@ -660,7 +660,7 @@ function sbr_load_transactions(frm) {
       ReconUI.renderSummaryTiles($canvas, qCounts);
       ReconUI.renderTabShell($canvas, data.total || 0);
       if (data.total) {
-        $canvas.data("sbr-opening-balance", 0); // Forced to 0 to only show net change
+        $canvas.data("sbr-opening-balance", parseFloat(frm.doc.account_opening_balance) || 0);
         var totals = ReconUI.renderTransactionTable($canvas, data.transactions);
         ReconUI.filterByQueue($canvas, null);
         // Closing Balance (Bank) is auto-computed, not manually entered —
@@ -832,8 +832,19 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
         sbr_inject_unmatched_suggestions(data);
         ReconUI.renderSuggestionsPanel($canvas, data.suggestions);
         ReconUI.renderAIBanner($canvas, data.queue_counts);
-        ReconUI.filterByQueue($canvas, null);
-        ReconUI.switchTab($canvas, "bank");
+        // Preserve whatever the user is currently looking at. This used to
+        // force the queue filter back to null and jump to the Bank
+        // Transactions tab, so a filter or tab chosen while the (auto-run) AI
+        // pass was still working got silently thrown away the moment it
+        // finished — the user saw their filter "not stick" and refreshed.
+        // On a normal first run there is nothing selected yet, so this
+        // behaves exactly as before.
+        var activeQueue = $canvas.data("sbr-queue-filter") || null;
+        var $activeTab  = $canvas.find(".sbr-tab.sbr-tab-active");
+        var activeTab   = $activeTab.length ? ($activeTab.data("tab") || "bank") : "bank";
+        // fromDropdown=true: the dropdown already shows this value, so leave it be.
+        ReconUI.filterByQueue($canvas, activeQueue, true);
+        ReconUI.switchTab($canvas, activeTab);
 
         frm._sbr_ai_running = false;
         frm._sbr_ai_done = true;
@@ -2070,16 +2081,23 @@ function sbr_open_consolidate_transactions_modal(frm) {
   /* ─── build left-panel rows from a (filtered) array ─── */
   function buildLeftRows(arr) {
     if (!arr.length) {
-      return '<tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:28px 0;font-size:12px">No transactions match the filter</td></tr>';
+      return '<tr><td colspan="6" style="text-align:center;color:#9ca3af;padding:28px 0;font-size:12px">No transactions match the filter</td></tr>';
     }
     return arr.map(function (t) {
       var isSel = !!selected[t.name];
+      // Reference is shown (not just filterable) so the reference filter below
+      // is actually usable — otherwise you'd be filtering on a value the list
+      // never displays. Falls back to the narration, which is where many banks
+      // put the only usable reference.
+      var ref = t.reference_number || t.description || "";
       return '<tr class="sbr-cons-row" data-name="' + t.name + '" style="cursor:pointer;transition:background .12s' + (isSel ? ";background:#eff6ff" : "") + '">' +
         '<td style="width:40px;text-align:center;padding:8px">' +
           '<input type="checkbox" class="sbr-cons-chk" data-name="' + t.name + '"' + (isSel ? " checked" : "") + ' style="cursor:pointer;width:15px;height:15px">' +
         "</td>" +
         '<td style="font-family:monospace;font-size:11px;padding:8px 6px;color:#374151">' + t.name + "</td>" +
         '<td style="padding:8px 6px;font-size:12px;color:#6b7280">' + (t.date || "") + "</td>" +
+        '<td style="padding:8px 6px;font-size:11px;color:#6b7280;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' +
+          String(ref).replace(/"/g, "&quot;") + '">' + (ref || "—") + "</td>" +
         '<td style="padding:8px 6px;text-align:right;color:#16a34a;font-weight:600">' + (parseFloat(t.deposit || 0) > 0 ? fmt(t.deposit) : "—") + "</td>" +
         '<td style="padding:8px 6px;text-align:right;color:#dc2626;font-weight:600">' + (parseFloat(t.withdrawal || 0) > 0 ? fmt(t.withdrawal) : "—") + "</td>" +
         "</tr>";
@@ -2093,6 +2111,11 @@ function sbr_open_consolidate_transactions_modal(frm) {
     };
     var filterInputHtml = function (cls, placeholder) {
       return '<input type="number" class="' + cls + '" placeholder="' + placeholder + '" min="0" step="1"' +
+        ' style="flex:1;min-width:0;box-sizing:border-box;padding:5px 8px;font-size:12px;border:1px solid #d1d5db;' +
+        'border-radius:6px;outline:none;background:#fff;color:#374151;">';
+    };
+    var textFilterHtml = function (cls, placeholder) {
+      return '<input type="text" class="' + cls + '" placeholder="' + placeholder + '"' +
         ' style="flex:1;min-width:0;box-sizing:border-box;padding:5px 8px;font-size:12px;border:1px solid #d1d5db;' +
         'border-radius:6px;outline:none;background:#fff;color:#374151;">';
     };
@@ -2111,11 +2134,15 @@ function sbr_open_consolidate_transactions_modal(frm) {
           filterInputHtml("sbr-filter-dep", "Enter Deposit Amount") +
           filterInputHtml("sbr-filter-wit", "Enter Withdrawal Amount") +
         "</div>" +
+        '<div style="display:flex;gap:8px;margin-bottom:8px">' +
+          textFilterHtml("sbr-filter-ref", "Search Reference / Narration") +
+        "</div>" +
         '<div style="max-height:340px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:8px">' +
           '<table style="width:100%;border-collapse:collapse">' +
             '<thead style="position:sticky;top:0;z-index:1;background:#f9fafb;border-bottom:1px solid #e5e7eb"><tr>' +
               "<th></th>" +
-              TH("Name") + TH("Date") + TH("Deposit", "right") + TH("Withdrawal", "right") +
+              TH("Name") + TH("Date") + TH("Reference") +
+              TH("Deposit", "right") + TH("Withdrawal", "right") +
             "</tr></thead>" +
             '<tbody class="sbr-cons-left-body">' + buildLeftRows(txns) + "</tbody>" +
           "</table>" +
@@ -2154,14 +2181,21 @@ function sbr_open_consolidate_transactions_modal(frm) {
     var $leftBody = $wrap.find(".sbr-cons-left-body");
 
     /* ─ filter inputs: re-render only the left tbody ─ */
-    $wrap.on("input", ".sbr-filter-dep, .sbr-filter-wit", function () {
+    $wrap.on("input", ".sbr-filter-dep, .sbr-filter-wit, .sbr-filter-ref", function () {
       var depVal = parseFloat($wrap.find(".sbr-filter-dep").val());
       var witVal = parseFloat($wrap.find(".sbr-filter-wit").val());
+      var refVal = ($wrap.find(".sbr-filter-ref").val() || "").trim().toLowerCase();
       var filtered = txns.filter(function (t) {
         var dep = parseFloat(t.deposit    || 0);
         var wit = parseFloat(t.withdrawal || 0);
         if (!isNaN(depVal) && dep < depVal) return false;
         if (!isNaN(witVal) && wit < witVal) return false;
+        // Reference match also looks at the narration — many banks put the
+        // only usable reference there rather than in the reference field.
+        if (refVal) {
+          var hay = ((t.reference_number || "") + " " + (t.description || "")).toLowerCase();
+          if (hay.indexOf(refVal) === -1) return false;
+        }
         return true;
       });
       $leftBody.html(buildLeftRows(filtered));
@@ -2221,6 +2255,12 @@ function sbr_open_consolidate_transactions_modal(frm) {
               [data.count, ReconUI.fmtCurrency(Math.abs(data.net_amount))]),
             indicator: "orange",
           }, 12);
+          // Skip the auto AI re-run on this reload. Consolidate already wrote
+          // the group's match info to every member server-side, so a fresh
+          // full-statement AI pass adds nothing — and on a large statement it
+          // locks the UI for as long as it takes, which reads as the page
+          // hanging and forces a manual refresh.
+          frm._sbr_no_auto_ai = true;
           setTimeout(function () { sbr_load_transactions(frm); }, 400);
           return;
         }
@@ -2232,7 +2272,11 @@ function sbr_open_consolidate_transactions_modal(frm) {
             " (" + data.confidence.toFixed(1) + __("% confidence) — review and approve each in the Review queue"),
           indicator: "green",
         }, 12);
-        // Reload the transaction list so the transactions show their new Review status
+        // Reload the transaction list so the transactions show their new Review
+        // status — but without the auto AI re-run (see the no-match branch
+        // above: the match info is already written, and re-scoring the whole
+        // statement here is what made consolidation appear to hang).
+        frm._sbr_no_auto_ai = true;
         setTimeout(function () { sbr_load_transactions(frm); }, 400);
       },
     });
@@ -2580,6 +2624,38 @@ function sbr_bind_card_actions(frm, $canvas) {
   $canvas.on("click", ".sbr-btn-unreconcile", function (e) {
     e.stopPropagation();
     sbr_open_unreconcile_dialog(frm, $canvas, $(this).data("txn"));
+  });
+
+  // Delete a bank line the tool flagged as a reversal/bounce. Permanent, so it
+  // asks first; the backend re-checks the Reversal flag and refuses if the line
+  // has since been reconciled.
+  $canvas.off("click", ".sbr-btn-del-reversal");
+  $canvas.on("click", ".sbr-btn-del-reversal", function (e) {
+    e.stopPropagation();
+    var txn = $(this).data("txn");
+    frappe.confirm(
+      __("Delete reversed bank transaction <b>{0}</b>?<br><br>This permanently removes the " +
+         "bank statement line. Use this when the reversal means the money never actually " +
+         "moved and the line should not be reconciled at all.", [txn]),
+      function () {
+        frappe.call({
+          method: "smart_bank_reconciliation.reconciliation.api.delete_reversed_transaction",
+          args: { bank_transaction: txn },
+          freeze: true,
+          freeze_message: __("Deleting {0}…", [txn]),
+          callback: function (r) {
+            if (r.exc) return;
+            $canvas.find('.sbr-row[data-txn="' + txn + '"]').fadeOut(150, function () {
+              $(this).remove();
+            });
+            frappe.show_alert({ message: __("{0} deleted.", [txn]), indicator: "green" });
+            // Reload so tiles, totals and the running balance all re-derive
+            // from what's actually left rather than drifting from the DB.
+            setTimeout(function () { sbr_load_transactions(frm); }, 600);
+          },
+        });
+      }
+    );
   });
 
   // Create draft PE / JE

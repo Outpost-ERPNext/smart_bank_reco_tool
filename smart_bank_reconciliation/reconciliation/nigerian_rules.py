@@ -51,10 +51,17 @@ class NigerianRules:
                 + " [FIRS statutory payment detected]"
             )
 
-        # Reversal / bounce — route to Review regardless of confidence
-        if _REVERSAL.search(desc) and scored:
-            scored[0]["match_type"] = "Reversal"
-            scored[0]["_force_review"] = True
+        # Reversal / bounce. Flagged on the transaction itself, not only on a
+        # matched candidate — a reversal with no ERP counterpart is exactly the
+        # case that needs surfacing (it's usually money that never really moved
+        # and the line may need deleting), and gating the flag behind `scored`
+        # meant those went completely unmarked.
+        if _REVERSAL.search(desc):
+            txn["_is_reversal"] = True
+            if scored:
+                # Route to Review regardless of confidence
+                scored[0]["match_type"] = "Reversal"
+                scored[0]["_force_review"] = True
 
     def _apply_wht(self, txn, best):
         erp_amount = float(best.get("amount") or 0)
