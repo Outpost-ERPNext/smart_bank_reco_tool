@@ -125,12 +125,25 @@ def get_bank_transactions(bank_account, from_date, to_date):
             fields=["name", "party_type"],
         ):
             live_entries[pe["name"]] = pe.get("party_type") or ""
-        for je in frappe.db.get_all(
-            "Journal Entry",
-            filters={"name": ["in", name_list], "docstatus": 1},
-            fields=["name"],
-        ):
-            live_entries.setdefault(je["name"], "")
+            
+        for doctype in ["Journal Entry", "Sales Invoice", "Purchase Invoice"]:
+            for doc in frappe.db.get_all(
+                doctype,
+                filters={"name": ["in", name_list], "docstatus": 1},
+                fields=["name"],
+            ):
+                live_entries.setdefault(doc["name"], "")
+                
+        remaining = [n for n in name_list if n not in live_entries]
+        if remaining:
+            for gl in frappe.db.get_all(
+                "GL Entry",
+                filters={"voucher_no": ["in", remaining], "is_cancelled": 0},
+                fields=["voucher_no"],
+                distinct=True,
+            ):
+                live_entries.setdefault(gl["voucher_no"], "")
+>>>>>>> 4146cec (fix: UI layout and AI matching missing ERP entries)
 
         for row in rows:
             referenced = _referenced_entry_names(row)
