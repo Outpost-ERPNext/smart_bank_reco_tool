@@ -266,6 +266,24 @@ class BankMatchingEngine:
 
     def get_queue_counts(self, results):
         from collections import Counter
+        # A Consolidate action tags every member row with the same recon_run_id
+        # and displays them as one merged row (see recon_ui.js's grouping in
+        # renderTransactionTable) — so tile counts must collapse each group to
+        # one economic event too, the same way api.py's _tally_queue_counts
+        # does for the plain (pre-AI-match) transaction list. Without this,
+        # the Total tile double-counts every consolidated group by (member
+        # count - 1) right after AI Match All runs.
+        seen_groups = set()
+        deduped = []
+        for t in results:
+            if t.get("recon_match_type") == "Consolidated" and t.get("recon_run_id"):
+                key = t["recon_run_id"]
+                if key in seen_groups:
+                    continue
+                seen_groups.add(key)
+            deduped.append(t)
+        results = deduped
+
         counts = Counter(t.get("recon_queue") or "Unmatched" for t in results)
         return {
             "total": len(results),
@@ -369,7 +387,7 @@ class BankMatchingEngine:
                 "reference_number", "party_type", "party", "bank_account",
                 "status", "unallocated_amount",
                 "recon_match_type", "recon_confidence", "recon_matched_entries",
-                "recon_ai_reasoning", "recon_queue",
+                "recon_ai_reasoning", "recon_queue", "recon_run_id",
             ],
             order_by="date asc",
         )
