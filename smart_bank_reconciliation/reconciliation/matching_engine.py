@@ -302,14 +302,11 @@ class BankMatchingEngine:
 
     def get_queue_counts(self, results):
         from collections import Counter
-        # A consolidated group is one economic event and renders as one row, so
-        # it must count once — otherwise the Total tile reports more
-        # transactions than the table shows (the "753 instead of 751" report).
-        # Reuses api's helper so this and the non-AI table load can never drift
-        # apart on what a group counts as. Imported locally: api imports this
-        # module at import time, so a module-level import would be circular.
-        from .api import _dedupe_consolidated_groups
-        results = _dedupe_consolidated_groups(results)
+        # One count per raw bank statement line — consolidated groups are NOT
+        # collapsed here. Must stay on the same basis as api._tally_queue_counts,
+        # which the plain (non-AI) table load uses: if the two disagree, the
+        # tiles change value depending on whether the user just ran AI or just
+        # reloaded.
         counts = Counter(t.get("recon_queue") or "Unmatched" for t in results)
         return {
             "total": len(results),

@@ -2,6 +2,79 @@
 
 window.ReconUI = (function () {
 
+  /* ── Runtime style fallback ───────────────────────────────────────────────
+     recon.css does NOT reliably reach every environment: on the client's dev
+     and live servers the bundle is not served/rebuilt (see the earlier
+     "inject styles dynamically to bypass dev server CSS build/cache issues"
+     commits), so anything defined only in recon.css silently does nothing
+     there — frozen header, frozen date column, the AI Match Pairs cards, and
+     the newer sort/reversal/suggested styling all just vanish.
+
+     I removed this block once on the reasoning that recon.css already covered
+     it. That was wrong: it covers it only where recon.css actually loads. It
+     is deliberately restored, and deliberately duplicates recon.css.
+
+     KEEP IN SYNC with recon.css. Values here mirror it; being injected into
+     <head> at runtime, these win on !important ties, so a mismatch shows up
+     as the stylesheet appearing to be ignored.
+  ------------------------------------------------------------------------- */
+  if (!document.getElementById("sbr-v15-styles-inject")) {
+    var _sbrStyle = document.createElement("style");
+    _sbrStyle.id = "sbr-v15-styles-inject";
+    _sbrStyle.innerHTML = [
+      /* scroll container — sticky needs a real scrolling ancestor */
+      ".sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }",
+      /* frozen column header */
+      ".sbr-table thead th { position: sticky !important; top: 0 !important;" +
+        " z-index: 10 !important;" +
+        " background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%) !important;" +
+        " color: #4338ca !important; border-bottom: 2px solid #6366f1 !important; }",
+      /* frozen checkbox / # / date columns */
+      ".sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col {" +
+        " position: sticky !important; z-index: 11 !important; background: #fff !important; }",
+      ".sbr-txn-table .sbr-idx-col { left: 36px !important; }",
+      ".sbr-txn-table .sbr-date-col { left: 76px !important; }",
+      ".sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col {" +
+        " position: sticky !important; left: 0 !important; z-index: 11 !important;" +
+        " background: #fff !important; }",
+      ".sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col," +
+        " .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important;" +
+        " background: #e0e7ff !important; }",
+      /* toolbar dropdowns */
+      ".sbr-queue-filter, .sbr-party-type-filter, .sbr-confidence-filter {" +
+        " background: #eef2ff !important; border-color: #c7d2fe !important;" +
+        " color: #3730a3 !important; }",
+      /* AI Match Pairs — frozen header + queue cards */
+      ".sbr-sp-sticky-top { position: sticky !important; top: 0 !important;" +
+        " z-index: 20 !important; background: #fff !important;" +
+        " border-bottom: 2px solid #e2e8f0 !important;" +
+        " margin-left: -15px; margin-right: -15px;" +
+        " padding-left: 15px; padding-right: 15px; }",
+      /* sort direction indicators (mirror recon.css) */
+      ".sbr-sort-arrow { display: inline-block; width: 10px; vertical-align: baseline;" +
+        " line-height: 1; font-size: 11px; color: #a5adc4; }",
+      ".sbr-sort-arrow-active { color: #4338ca !important; font-weight: 800 !important; }",
+      ".sbr-sortable:hover { background: #e0e7ff; }",
+      ".sbr-sortable.sbr-sortable-active { background: #c7d2fe !important; }",
+      /* reversal highlighting (mirror recon.css) */
+      ".sbr-row-reversal > td { background: #fff7ed !important; }",
+      ".sbr-row-reversal:hover > td { background: #ffedd5 !important; }",
+      ".sbr-reversal-tag { display: inline-block; font-size: 9px; font-weight: 800;" +
+        " letter-spacing: .06em; color: #c2410c; background: #ffedd5;" +
+        " border: 1px solid #fdba74; border-radius: 4px; padding: 1px 5px;" +
+        " margin-right: 4px; vertical-align: middle; white-space: nowrap; }",
+      ".sbr-btn-del-reversal { color: #b91c1c !important; border-color: #fca5a5 !important; }",
+      ".sbr-btn-del-reversal:hover { background: #fee2e2 !important; }",
+      /* AI-suggested (non-reconcilable) entry (mirror recon.css) */
+      ".sbr-link-suggested { color: #64748b !important;" +
+        " border-bottom: 1px dotted #94a3b8; }",
+      ".sbr-suggested-tag { display: inline-block; margin-left: 6px; padding: 0 5px;" +
+        " border: 1px solid #cbd5e1; border-radius: 99px; font-size: 9px;" +
+        " font-weight: 700; color: #64748b; vertical-align: middle; }",
+    ].join("\n");
+    document.head.appendChild(_sbrStyle);
+  }
+
   /* ── Constants ── */
 
   var QUEUE_COLOR = {
@@ -667,9 +740,27 @@ window.ReconUI = (function () {
 
   /* ── Transaction table ── */
 
+  // Rows that store no reconcilable entry (invoice matches) still have a
+  // suggested voucher the AI picked — show it, greyed and labelled, instead of
+  // a bare "—" that contradicted what the Actions modal displayed. It is
+  // deliberately NOT rendered like a normal matched entry: a bank line cannot
+  // be cleared against an invoice, it needs a Payment Entry created first.
+  function _suggestedEntryHtml(t) {
+    var name = t.recon_suggested_entry;
+    if (!name) return "—";
+    var dt = t.recon_suggested_doctype || "";
+    var route = dt ? dt.toLowerCase().replace(/ /g, "-") : _guessEntryRoute(name);
+    var href = route ? "/app/" + route + "/" + encodeURIComponent(name) : "/app/bank-transaction";
+    return '<a class="sbr-link sbr-link-suggested" href="' + href +
+           '" target="_blank" onclick="event.stopPropagation()" title="' +
+           (dt || "Suggested") + ' suggested by AI — a bank line cannot be reconciled ' +
+           'against an invoice directly; create a Payment Entry for it first">' + name + "</a>" +
+           '<span class="sbr-suggested-tag">SUGGESTED</span>';
+  }
+
   function _matchedEntryHtml(t) {
     var rawEntries = t.recon_matched_entries;
-    if (!rawEntries) return "—";
+    if (!rawEntries) return _suggestedEntryHtml(t);
     try {
       var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
       if (entryNames && entryNames.length) {
@@ -681,7 +772,7 @@ window.ReconUI = (function () {
         }).join("<br>");
       }
     } catch (e) {}
-    return "—";
+    return _suggestedEntryHtml(t);
   }
 
   var _entryRouteCache = {};
@@ -992,7 +1083,13 @@ window.ReconUI = (function () {
       "</tr></tfoot></table>";
 
     $container.find(".sbr-table-wrap").html(html);
-    $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
+    // Count rendered rows, not the raw array. A consolidated group is one row
+    // here, and applyFilters recounts the same way — using the raw length made
+    // this counter read 753 on load and then jump to 400 the moment any filter
+    // was touched. The summary cards above are the place the full
+    // per-transaction count (753) is reported.
+    $container.find(".sbr-txn-counter").text(
+      $container.find(".sbr-row").length + " transactions");
     _resolveEntryLinks($container);
     _neutralizeStickyBreakers($container);
 

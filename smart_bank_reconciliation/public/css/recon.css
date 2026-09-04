@@ -1309,3 +1309,22 @@
   padding: 2px 8px;
   white-space: nowrap;
 }
+
+/* A voucher the AI matched that is not a reconcilable entry (an invoice).
+   Muted so it never reads as a confirmed match, but visible so the table
+   agrees with what the Actions modal shows. */
+.sbr-link-suggested {
+  color: #64748b !important;
+  border-bottom: 1px dotted #94a3b8;
+}
+.sbr-suggested-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid #cbd5e1;
+  border-radius: 99px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #64748b;
+  vertical-align: middle;
+}

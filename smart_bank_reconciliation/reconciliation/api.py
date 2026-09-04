@@ -10,34 +10,42 @@ from .matching_engine import BankMatchingEngine
 _KNOWN_RECON_QUEUES = {"Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"}
 
 
-def _dedupe_consolidated_groups(rows):
-    """Collapse rows that a Consolidate action grouped together down to one
-    representative row, so tile/report counts reflect one economic event per
-    group instead of one per raw bank statement line — mirrors how the
-    frontend renders a consolidated group as a single row.
+def _suggested_entry_from_draft(raw):
+    """The voucher the AI matched but deliberately did NOT store as this
+    transaction's reconcilable entry — returned for display only.
 
-    Grouped by recon_run_id: a pre-existing, otherwise-unused custom field
-    repurposed purely as the Consolidate group key (see
-    _consolidate_via_existing_match) — no new field added. Works for both
-    the matched and unmatched outcome, since a group id is written either way.
+    An invoice match stores no matched entry (a bank line cannot be cleared
+    against an invoice directly; see approve_match), which left the "Matched
+    ERP Entry" column blank even though the Actions modal happily showed the
+    invoice — so the column and the modal appeared to disagree. The draft
+    payload already records exactly which invoice it was, so read it back from
+    there rather than storing an entry that must never be reconciled against.
     """
-    seen_keys = set()
-    result = []
-    for r in rows:
-        if r.get("recon_match_type") != "Consolidated" or not r.get("recon_run_id"):
-            result.append(r)
-            continue
-        key = r["recon_run_id"]
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        result.append(r)
-    return result
+    if not raw:
+        return None, None
+    import json as _j
+    try:
+        payload = _j.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None, None
+    refs = (payload or {}).get("references") or []
+    if not refs:
+        return None, None
+    first = refs[0] or {}
+    return first.get("reference_name"), first.get("reference_doctype")
 
 
 def _tally_queue_counts(rows, queue_field="recon_queue"):
+    """Tile counts, one per raw bank statement line.
+
+    These deliberately do NOT collapse consolidated groups. The table below
+    renders a group as a single row, so the tiles and the row count differ on
+    a statement with consolidations — that is intended: the tiles answer "how
+    many bank transactions are in this period", which is the number that has
+    to agree with the Bank Transaction list, while the table answers "how many
+    things do I have to action".
+    """
     from collections import Counter
-    rows = _dedupe_consolidated_groups(rows)
     counts = Counter(
         r.get(queue_field) if r.get(queue_field) in _KNOWN_RECON_QUEUES else "Unmatched"
         for r in rows
@@ -65,7 +73,7 @@ def get_bank_transactions(bank_account, from_date, to_date):
             fields=["name", "date", "deposit", "withdrawal", "description",
                     "reference_number", "party_type", "party", "status", "unallocated_amount",
                     "recon_queue", "recon_confidence", "recon_matched_entries", "recon_match_type",
-                    "recon_run_id"],
+                    "recon_run_id", "recon_draft_payload"],
             order_by="date desc",
         )
     except Exception:
@@ -160,6 +168,18 @@ def get_bank_transactions(bank_account, from_date, to_date):
                     if live_entries.get(n):
                         row["party_type"] = live_entries[n]
                         break
+
+    # Display-only suggested entry for rows that store no reconcilable match,
+    # derived here so a plain reload shows the same thing an AI run does. The
+    # raw draft payload is then dropped — it is only needed to derive this, and
+    # one JSON blob per row would bloat a 700-row statement for nothing.
+    for row in rows:
+        if not row.get("recon_matched_entries"):
+            name, doctype = _suggested_entry_from_draft(row.get("recon_draft_payload"))
+            if name:
+                row["recon_suggested_entry"] = name
+                row["recon_suggested_doctype"] = doctype or ""
+        row.pop("recon_draft_payload", None)
 
     return {"transactions": rows, "total": total, "queue_counts": queue_counts}
 
@@ -257,6 +277,13 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
                 # combined total) after an AI Match run, the way a plain reload
                 # via get_bank_transactions does.
                 "recon_run_id": t.get("recon_run_id") or "",
+                # Display-only: the voucher the AI matched but that is not
+                # stored as a reconcilable entry (invoice matches). Without
+                # this the column read "—" while Actions showed the invoice.
+                "recon_suggested_entry": _suggested_entry_from_draft(
+                    t.get("recon_draft_payload"))[0] or "",
+                "recon_suggested_doctype": _suggested_entry_from_draft(
+                    t.get("recon_draft_payload"))[1] or "",
                 "recon_duplicate_of": t.get("recon_duplicate_of") or [],
             }
             for t in results
@@ -353,6 +380,13 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
                     # omitting it broke consolidated groups apart specifically
                     # when the match ran async.
                     "recon_run_id": t.get("recon_run_id") or "",
+                    # Display-only: the voucher the AI matched but that is not
+                    # stored as a reconcilable entry (invoice matches). Without
+                    # this the column read "—" while Actions showed the invoice.
+                    "recon_suggested_entry": _suggested_entry_from_draft(
+                        t.get("recon_draft_payload"))[0] or "",
+                    "recon_suggested_doctype": _suggested_entry_from_draft(
+                        t.get("recon_draft_payload"))[1] or "",
                     "recon_duplicate_of": t.get("recon_duplicate_of") or [],
                 }
                 for t in results
@@ -792,6 +826,13 @@ def rerun_ai_on_transactions(transaction_names, bank_account, from_date, to_date
             # consolidated group survives a targeted re-run the same as a full
             # match or a plain reload.
             "recon_run_id":          txn.get("recon_run_id") or "",
+            # Display-only: the voucher the AI matched but that is not
+            # stored as a reconcilable entry (invoice matches). Without
+            # this the column read "—" while Actions showed the invoice.
+            "recon_suggested_entry": _suggested_entry_from_draft(
+                txn.get("recon_draft_payload"))[0] or "",
+            "recon_suggested_doctype": _suggested_entry_from_draft(
+                txn.get("recon_draft_payload"))[1] or "",
             "recon_duplicate_of":    txn.get("recon_duplicate_of") or [],
         })
 
@@ -2430,16 +2471,13 @@ def get_reconciliation_report(bank_account, from_date, to_date, company=None):
 
     import json as _json
     from collections import Counter
-    # Dedupe consolidated groups down to one row each for the summary counts
-    # only — matches the main screen's tiles, which do the same. The full
-    # per-transaction list below (transactions_out) still uses the un-deduped
-    # `txns` so every original bank statement line remains individually
-    # listed/exportable.
-    deduped_txns = _dedupe_consolidated_groups(txns)
-    total        = len(deduped_txns)
+    # Counted per raw bank statement line, matching the main screen's tiles
+    # (see _tally_queue_counts) — a consolidated group counts as its member
+    # transactions, not as one.
+    total        = len(txns)
     queue_counts = Counter(
         t.get("recon_queue") if t.get("recon_queue") in _KNOWN_RECON_QUEUES else "Unmatched"
-        for t in deduped_txns
+        for t in txns
     )
 
     reconciled  = queue_counts.get("Reconciled", 0)
