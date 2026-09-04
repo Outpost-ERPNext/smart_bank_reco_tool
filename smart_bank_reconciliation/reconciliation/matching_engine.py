@@ -161,16 +161,28 @@ class BankMatchingEngine:
                     if best_display else None
                 )
 
+                # A reversal with no ERP counterpart still has to be flagged as
+                # one so the tool can highlight it and offer to delete the line
+                # (nigerian_rules sets _is_reversal on the transaction itself).
+                if dup_reason:
+                    unmatched_match_type = "Duplicate"
+                elif txn.get("_is_reversal"):
+                    unmatched_match_type = "Reversal"
+                else:
+                    unmatched_match_type = None
+
                 self._save(
                     txn["name"],
                     queue=queue,
                     confidence=best_display["confidence"] if best_display else 0,
                     reasoning=best_display["reasoning"] if best_display else reasoning,
-                    match_type="Duplicate" if dup_reason else None,
+                    match_type=unmatched_match_type,
                     matched_entries=frappe.as_json(display_entry_names) if display_entry_names else None,
                     signals_json=frappe.as_json(best_display["signals"]) if best_display else None,
                     draft_payload=draft,
                 )
+                if unmatched_match_type:
+                    txn["recon_match_type"] = unmatched_match_type
                 txn["recon_queue"] = queue
                 txn["recon_ai_reasoning"] = best_display["reasoning"] if best_display else reasoning
                 if dup_names:
@@ -236,11 +248,30 @@ class BankMatchingEngine:
                 match_type = "Duplicate" if dup_reason else (
                     best.get("match_type") or ("Partial Invoice Payment" if is_invoice else None)
                 )
+
+                # What actually gets stored as this transaction's matched entry.
+                # Three cases deliberately store nothing:
+                #   - queue "Unmatched": the best candidate scored below the
+                #     review threshold, i.e. too weak to call a match at all.
+                #     Storing it anyway made the Unmatched tile/tab display a
+                #     "Matched ERP Entry" link (and several same-amount rows all
+                #     pointing at the one same entry), which contradicts what
+                #     Unmatched means and blocked them from being consolidated.
+                #   - invoice matches: a bank transaction can't be reconciled
+                #     against an invoice directly (see approve_match), so no
+                #     entry is stored for it.
+                # An empty string — not None — is required to actually clear the
+                # field: _save skips None ("leave as-is"), which would otherwise
+                # leave a stale entry name from an earlier run in place.
+                store_entries = (
+                    "" if (queue == "Unmatched" or is_invoice)
+                    else frappe.as_json(entry_names)
+                )
                 self._save(
                     txn["name"],
                     queue=queue,
                     confidence=conf,
-                    matched_entries=frappe.as_json(entry_names) if not is_invoice else None,
+                    matched_entries=store_entries,
                     match_type=match_type,
                     reasoning=best.get("reasoning"),
                     signals_json=frappe.as_json(best.get("signals", {})),
@@ -255,7 +286,12 @@ class BankMatchingEngine:
                     txn["recon_draft_payload"] = draft
                 txn["recon_match_type"] = match_type
                 txn["recon_ai_reasoning"] = best.get("reasoning")
-                txn["recon_matched_entries"] = frappe.as_json(entry_names)
+                # Keep the in-memory row in lockstep with what was written, so
+                # the table this run returns shows the same thing a reload would.
+                # The invoice suggestion itself is not lost — it still reaches the
+                # AI Match Pairs card through txn["matched"] below, along with the
+                # draft payload that drives "Create PE" for it.
+                txn["recon_matched_entries"] = store_entries
                 txn["matched"] = best
 
             results.append(txn)
@@ -266,24 +302,11 @@ class BankMatchingEngine:
 
     def get_queue_counts(self, results):
         from collections import Counter
-        # A Consolidate action tags every member row with the same recon_run_id
-        # and displays them as one merged row (see recon_ui.js's grouping in
-        # renderTransactionTable) — so tile counts must collapse each group to
-        # one economic event too, the same way api.py's _tally_queue_counts
-        # does for the plain (pre-AI-match) transaction list. Without this,
-        # the Total tile double-counts every consolidated group by (member
-        # count - 1) right after AI Match All runs.
-        seen_groups = set()
-        deduped = []
-        for t in results:
-            if t.get("recon_match_type") == "Consolidated" and t.get("recon_run_id"):
-                key = t["recon_run_id"]
-                if key in seen_groups:
-                    continue
-                seen_groups.add(key)
-            deduped.append(t)
-        results = deduped
-
+        # One count per raw bank statement line — consolidated groups are NOT
+        # collapsed here. Must stay on the same basis as api._tally_queue_counts,
+        # which the plain (non-AI) table load uses: if the two disagree, the
+        # tiles change value depending on whether the user just ran AI or just
+        # reloaded.
         counts = Counter(t.get("recon_queue") or "Unmatched" for t in results)
         return {
             "total": len(results),
@@ -356,6 +379,10 @@ class BankMatchingEngine:
                             t["recon_match_type"] = "Many:1"
                             t["recon_ai_reasoning"] = f"Part of a {r}-transaction group matching {entry.get('entry_type')} {entry.get('reference_no', entry.get('name'))}"
                             t["recon_confidence"] = 85.0
+                            # Mirror the write in-memory too, so the table this
+                            # run returns shows the Many:1 matched entry instead
+                            # of only revealing it after a reload.
+                            t["recon_matched_entries"] = frappe.as_json([entry["name"]])
                             self._save(
                                 t["name"],
                                 queue="Review",
@@ -387,7 +414,12 @@ class BankMatchingEngine:
                 "reference_number", "party_type", "party", "bank_account",
                 "status", "unallocated_amount",
                 "recon_match_type", "recon_confidence", "recon_matched_entries",
-                "recon_ai_reasoning", "recon_queue", "recon_run_id",
+                "recon_ai_reasoning", "recon_queue",
+                # Consolidation group key. The frontend collapses a consolidated
+                # group into a single row keyed on this, so it has to survive the
+                # AI-match response too — without it, running AI Match silently
+                # broke groups back apart into their individual member rows.
+                "recon_run_id",
             ],
             order_by="date asc",
         )

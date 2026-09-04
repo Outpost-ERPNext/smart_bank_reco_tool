@@ -218,6 +218,20 @@ class SignalCalculator:
         elif hist < 0:
             parts.append("Previously rejected by user")
 
+        # For invoices, `amount` is the OUTSTANDING balance (that's what
+        # matching_engine._get_invoice_candidates selects, and what partial-payment
+        # scoring above needs). Showing that as "the invoice amount" made the tool
+        # contradict ERP, which displays the invoice's grand total — and it also
+        # contradicted the Match-Against-Voucher list, which already shows the
+        # grand total. Display the grand total here too, and carry the outstanding
+        # separately so the partial-payment context isn't lost.
+        is_invoice = entry.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
+        grand_total = entry.get("grand_total")
+        display_amount = (
+            grand_total if (is_invoice and grand_total is not None)
+            else entry.get("amount")
+        )
+
         return {
             "name": entry["name"],
             "entry_type": entry["entry_type"],
@@ -226,7 +240,8 @@ class SignalCalculator:
             "match_type": mtype,
             "reasoning": ". ".join(parts) or "Low confidence match",
             "entries": [entry],
-            "amount": entry.get("amount"),
+            "amount": display_amount,
+            "outstanding_amount": entry.get("amount") if is_invoice else None,
             "party": entry.get("party_name") or entry.get("party"),
             "party_type": entry.get("party_type") or "",
             "posting_date": entry.get("posting_date") or entry.get("cheque_date"),

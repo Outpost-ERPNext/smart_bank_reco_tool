@@ -2,22 +2,77 @@
 
 window.ReconUI = (function () {
 
-  /* ── Inject V15 Sticky Fix & Colors (Bypass Dev CSS Cache) ── */
+  /* ── Runtime style fallback ───────────────────────────────────────────────
+     recon.css does NOT reliably reach every environment: on the client's dev
+     and live servers the bundle is not served/rebuilt (see the earlier
+     "inject styles dynamically to bypass dev server CSS build/cache issues"
+     commits), so anything defined only in recon.css silently does nothing
+     there — frozen header, frozen date column, the AI Match Pairs cards, and
+     the newer sort/reversal/suggested styling all just vanish.
+
+     I removed this block once on the reasoning that recon.css already covered
+     it. That was wrong: it covers it only where recon.css actually loads. It
+     is deliberately restored, and deliberately duplicates recon.css.
+
+     KEEP IN SYNC with recon.css. Values here mirror it; being injected into
+     <head> at runtime, these win on !important ties, so a mismatch shows up
+     as the stylesheet appearing to be ignored.
+  ------------------------------------------------------------------------- */
   if (!document.getElementById("sbr-v15-styles-inject")) {
-    var style = document.createElement("style");
-    style.id = "sbr-v15-styles-inject";
-    style.innerHTML = `
-      .sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }
-      .sbr-table thead th { position: sticky !important; top: 0 !important; z-index: 10 !important; background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%) !important; color: #4338ca !important; border-bottom: 2px solid #6366f1 !important; }
-      .sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col { position: sticky !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-txn-table .sbr-idx-col { left: 36px !important; }
-      .sbr-txn-table .sbr-date-col { left: 76px !important; }
-      .sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col { position: sticky !important; left: 0 !important; z-index: 11 !important; background: #fff !important; }
-      .sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col, .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important; background: #e0e7ff !important; }
-      .sbr-queue-filter, .sbr-party-type-filter, .sbr-confidence-filter { background: #eef2ff !important; border-color: #c7d2fe !important; color: #3730a3 !important; }
-      .sbr-sp-sticky-top { position: sticky !important; top: 0 !important; z-index: 20 !important; background: #fff !important; border-bottom: 2px solid #e2e8f0 !important; margin-left: -15px; margin-right: -15px; padding-left: 15px; padding-right: 15px; }
-    `;
-    document.head.appendChild(style);
+    var _sbrStyle = document.createElement("style");
+    _sbrStyle.id = "sbr-v15-styles-inject";
+    _sbrStyle.innerHTML = [
+      /* scroll container — sticky needs a real scrolling ancestor */
+      ".sbr-table-wrap { overflow: auto !important; max-height: 65vh !important; }",
+      /* frozen column header */
+      ".sbr-table thead th { position: sticky !important; top: 0 !important;" +
+        " z-index: 10 !important;" +
+        " background: linear-gradient(180deg, #eef2ff 0%, #e0e7ff 100%) !important;" +
+        " color: #4338ca !important; border-bottom: 2px solid #6366f1 !important; }",
+      /* frozen checkbox / # / date columns */
+      ".sbr-txn-table .sbr-idx-col, .sbr-txn-table .sbr-date-col {" +
+        " position: sticky !important; z-index: 11 !important; background: #fff !important; }",
+      ".sbr-txn-table .sbr-idx-col { left: 36px !important; }",
+      ".sbr-txn-table .sbr-date-col { left: 76px !important; }",
+      ".sbr-table td.sbr-check-col, .sbr-table th.sbr-check-col {" +
+        " position: sticky !important; left: 0 !important; z-index: 11 !important;" +
+        " background: #fff !important; }",
+      ".sbr-table thead th.sbr-check-col, .sbr-txn-table thead th.sbr-idx-col," +
+        " .sbr-txn-table thead th.sbr-date-col { z-index: 15 !important;" +
+        " background: #e0e7ff !important; }",
+      /* toolbar dropdowns */
+      ".sbr-queue-filter, .sbr-party-type-filter, .sbr-confidence-filter {" +
+        " background: #eef2ff !important; border-color: #c7d2fe !important;" +
+        " color: #3730a3 !important; }",
+      /* AI Match Pairs — frozen header + queue cards */
+      ".sbr-sp-sticky-top { position: sticky !important; top: 0 !important;" +
+        " z-index: 20 !important; background: #fff !important;" +
+        " border-bottom: 2px solid #e2e8f0 !important;" +
+        " margin-left: -15px; margin-right: -15px;" +
+        " padding-left: 15px; padding-right: 15px; }",
+      /* sort direction indicators (mirror recon.css) */
+      ".sbr-sort-arrow { display: inline-block; width: 10px; vertical-align: baseline;" +
+        " line-height: 1; font-size: 11px; color: #a5adc4; }",
+      ".sbr-sort-arrow-active { color: #4338ca !important; font-weight: 800 !important; }",
+      ".sbr-sortable:hover { background: #e0e7ff; }",
+      ".sbr-sortable.sbr-sortable-active { background: #c7d2fe !important; }",
+      /* reversal highlighting (mirror recon.css) */
+      ".sbr-row-reversal > td { background: #fff7ed !important; }",
+      ".sbr-row-reversal:hover > td { background: #ffedd5 !important; }",
+      ".sbr-reversal-tag { display: inline-block; font-size: 9px; font-weight: 800;" +
+        " letter-spacing: .06em; color: #c2410c; background: #ffedd5;" +
+        " border: 1px solid #fdba74; border-radius: 4px; padding: 1px 5px;" +
+        " margin-right: 4px; vertical-align: middle; white-space: nowrap; }",
+      ".sbr-btn-del-reversal { color: #b91c1c !important; border-color: #fca5a5 !important; }",
+      ".sbr-btn-del-reversal:hover { background: #fee2e2 !important; }",
+      /* AI-suggested (non-reconcilable) entry (mirror recon.css) */
+      ".sbr-link-suggested { color: #64748b !important;" +
+        " border-bottom: 1px dotted #94a3b8; }",
+      ".sbr-suggested-tag { display: inline-block; margin-left: 6px; padding: 0 5px;" +
+        " border: 1px solid #cbd5e1; border-radius: 99px; font-size: 9px;" +
+        " font-weight: 700; color: #64748b; vertical-align: middle; }",
+    ].join("\n");
+    document.head.appendChild(_sbrStyle);
   }
 
   /* ── Constants ── */
@@ -240,6 +295,16 @@ window.ReconUI = (function () {
 
   function renderTabShell($container, bankCount) {
     if ($container.find(".sbr-tab-bar").length) return; // already built
+
+    // Filter state lives in $container.data(), but the controls that drive it
+    // are rebuilt blank right below. $container itself survives the rebuild, so
+    // without this reset the table stays filtered by a search term / dropdown
+    // value the user can no longer see anywhere — rows silently missing until
+    // they reload the page. Clear the state so it matches the blank controls.
+    ["sbr-text-filter", "sbr-confidence-filter", "sbr-party-type-filter",
+     "sbr-aging-range-filter", "sbr-conf-range-filter",
+     "sbr-sort-field", "sbr-sort-dir",
+    ].forEach(function (key) { $container.removeData(key); });
 
     var $inner = $container.find(".sbr-panel-inner");
 
@@ -675,9 +740,27 @@ window.ReconUI = (function () {
 
   /* ── Transaction table ── */
 
+  // Rows that store no reconcilable entry (invoice matches) still have a
+  // suggested voucher the AI picked — show it, greyed and labelled, instead of
+  // a bare "—" that contradicted what the Actions modal displayed. It is
+  // deliberately NOT rendered like a normal matched entry: a bank line cannot
+  // be cleared against an invoice, it needs a Payment Entry created first.
+  function _suggestedEntryHtml(t) {
+    var name = t.recon_suggested_entry;
+    if (!name) return "—";
+    var dt = t.recon_suggested_doctype || "";
+    var route = dt ? dt.toLowerCase().replace(/ /g, "-") : _guessEntryRoute(name);
+    var href = route ? "/app/" + route + "/" + encodeURIComponent(name) : "/app/bank-transaction";
+    return '<a class="sbr-link sbr-link-suggested" href="' + href +
+           '" target="_blank" onclick="event.stopPropagation()" title="' +
+           (dt || "Suggested") + ' suggested by AI — a bank line cannot be reconciled ' +
+           'against an invoice directly; create a Payment Entry for it first">' + name + "</a>" +
+           '<span class="sbr-suggested-tag">SUGGESTED</span>';
+  }
+
   function _matchedEntryHtml(t) {
     var rawEntries = t.recon_matched_entries;
-    if (!rawEntries) return "—";
+    if (!rawEntries) return _suggestedEntryHtml(t);
     try {
       var entryNames = typeof rawEntries === "string" ? JSON.parse(rawEntries) : rawEntries;
       if (entryNames && entryNames.length) {
@@ -689,7 +772,7 @@ window.ReconUI = (function () {
         }).join("<br>");
       }
     } catch (e) {}
-    return "—";
+    return _suggestedEntryHtml(t);
   }
 
   var _entryRouteCache = {};
@@ -863,12 +946,19 @@ window.ReconUI = (function () {
         totalUnalloc += parseFloat(m.unallocated_amount) || 0;
         if (new Date(m.date) > new Date(latest.date)) latest = m;
       });
+      // Spell out the combined amount in the label as well as in the
+      // Deposit/Withdrawal columns — when several rows collapse into one it
+      // isn't otherwise obvious that the figure shown is a group total rather
+      // than one transaction's own amount.
+      var groupTotal = totalDep > 0 ? totalDep : totalWit;
+      var groupSide  = totalDep > 0 ? "total deposit" : "total withdrawal";
       displayTransactions.push($.extend({}, rep, {
         deposit: totalDep,
         withdrawal: totalWit,
         unallocated_amount: totalUnalloc,
         date: latest.date,
-        description: "Consolidated (" + members.length + " txns): " +
+        description: "Consolidated (" + members.length + " txns) — " +
+          groupSide + " " + formatAmount(groupTotal) + ": " +
           members.map(function (m) { return m.name; }).join(", "),
         _consolidatedBalanceKey: latest.name,
       }));
@@ -924,10 +1014,15 @@ window.ReconUI = (function () {
       var isReconciled = queue === "Reconciled";
 
       var matchedEntryHtml = _matchedEntryHtml(t);
+      // Bank-side reversal / bounce (flagged by nigerian_rules) — money that
+      // usually never really moved, so it gets called out visually and can be
+      // deleted straight from the row.
+      var isReversal = t.recon_match_type === "Reversal";
 
       var searchText = [t.description, t.reference_number, t.party]
         .filter(Boolean).join(" ").toLowerCase().replace(/"/g, "");
-      html += '<tr class="sbr-row' + (isReconciled ? " sbr-row-done" : "") + '"' +
+      html += '<tr class="sbr-row' + (isReconciled ? " sbr-row-done" : "") +
+              (isReversal ? " sbr-row-reversal" : "") + '"' +
               ' data-txn="' + t.name + '" data-queue="' + queue + '"' +
               ' data-party-type="' + (t.party_type || "") + '"' +
               ' data-confidence="' + Math.round(pct) + '"' +
@@ -942,6 +1037,7 @@ window.ReconUI = (function () {
               '<td class="sbr-idx-col" style="color:#94a3b8;font-size:11px;font-variant-numeric:tabular-nums">' + (idx + 1) + "</td>" +
               "<td class='sbr-date-col' style='white-space:nowrap'>" + (t.date || "") + "</td>" +
               "<td class='sbr-desc' title=\"" + (t.description || t.party || "").replace(/"/g, "&quot;") + "\">" +
+                (isReversal ? '<span class="sbr-reversal-tag">&#8635; REVERSAL</span> ' : "") +
                 (t.description || t.party || "—") + "</td>" +
               '<td class="sbr-amt-cell" style="color:#16a34a;font-weight:600;font-variant-numeric:tabular-nums">' +
                 (t.deposit && parseFloat(t.deposit) > 0 ? formatAmount(t.deposit) : "") + "</td>" +
@@ -964,7 +1060,11 @@ window.ReconUI = (function () {
                   ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
                   '" title="Remove this reconciliation">&#8617; Unreconcile</button>'
                 : '<button class="sbr-btn sbr-row-action-btn sbr-btn-action-blue"' +
-                  ' data-txn="' + t.name + '">Actions</button>'
+                  ' data-txn="' + t.name + '">Actions</button>' +
+                  (isReversal
+                    ? ' <button class="sbr-btn sbr-btn-del-reversal" data-txn="' + t.name +
+                      '" title="Delete this reversed bank transaction">&#128465; Delete</button>'
+                    : "")
               ) + "</td>" +
               "</tr>";
     });
@@ -983,7 +1083,13 @@ window.ReconUI = (function () {
       "</tr></tfoot></table>";
 
     $container.find(".sbr-table-wrap").html(html);
-    $container.find(".sbr-txn-counter").text(transactions.length + " transactions");
+    // Count rendered rows, not the raw array. A consolidated group is one row
+    // here, and applyFilters recounts the same way — using the raw length made
+    // this counter read 753 on load and then jump to 400 the moment any filter
+    // was touched. The summary cards above are the place the full
+    // per-transaction count (753) is reported.
+    $container.find(".sbr-txn-counter").text(
+      $container.find(".sbr-row").length + " transactions");
     _resolveEntryLinks($container);
     _neutralizeStickyBreakers($container);
 
@@ -1006,13 +1112,15 @@ window.ReconUI = (function () {
       _sortTable($container, field, dir);
     });
 
-    // Row click → switch to AI tab (Actions button handled by sbr_bind_card_actions)
+    // Row click → highlight only. It used to also jump to the AI Match Pairs
+    // tab (showSuggestionCard), which meant every stray click on a row —
+    // anywhere outside the checkbox — threw the user off the Bank Transactions
+    // tab and they had to navigate back. The row's own "Actions" button is the
+    // deliberate way in, so clicking the row body no longer navigates.
     $container.find(".sbr-row").on("click", function (e) {
       if ($(e.target).is("button, a, input")) return;
-      var txnName = $(this).data("txn");
       $container.find(".sbr-row").removeClass("sbr-row-active");
       $(this).addClass("sbr-row-active");
-      showSuggestionCard($container, txnName);
     });
 
     return { totalDeposit: totalDeposit, totalWithdrawal: totalWithdrawal, netBalance: netBalance };
@@ -1038,6 +1146,12 @@ window.ReconUI = (function () {
         );
       }
     });
+    // Keep the cached transaction array in step with what the AI just returned.
+    // The rows themselves are patched in place above (no full re-render), but
+    // this cache is what getSelectedTxns reads — so without this, actions that
+    // work off the current selection (the Consolidate deposit/withdrawal check)
+    // were still judging the pre-AI copy of each transaction.
+    $container.data("transactions", transactions);
     _resolveEntryLinks($container);
   }
 
@@ -1237,20 +1351,40 @@ window.ReconUI = (function () {
             aiCardHtml +
             // Match pane
             '<div class="sbr-recon-pane" data-pane="match">' +
+              // Server-side voucher search. The list below is a browsable
+              // default (a date window around the bank date, capped), so when
+              // the AI's suggestion is wrong the correct voucher may not be in
+              // it at all. Client-side filters can only narrow what was already
+              // sent — this box re-queries the server instead.
+              '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;' +
+              'margin-bottom:8px">' +
+                '<input type="text" class="sbr-voucher-search" ' +
+                  'placeholder="Search all vouchers — number, party, reference or amount" ' +
+                  'style="flex:1;min-width:230px;padding:5px 9px;border:1px solid #cbd5e1;' +
+                  'border-radius:5px;font-size:12px">' +
+                '<label style="display:flex;align-items:center;gap:4px;font-size:11px;' +
+                  'color:#64748b;white-space:nowrap">&plusmn;' +
+                  '<input type="number" class="sbr-voucher-search-tol" min="0" step="1" ' +
+                    'placeholder="0" title="Amount tolerance — widen a numeric search to catch ' +
+                    'bank charges, FX differences or partial payments" ' +
+                    'style="width:76px;padding:5px 7px;border:1px solid #cbd5e1;' +
+                    'border-radius:5px;font-size:12px">' +
+                  'tolerance</label>' +
+                '<span class="sbr-voucher-search-status" style="font-size:11px;' +
+                  'color:#64748b;white-space:nowrap"></span>' +
+              '</div>' +
               // Filters
               '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;' +
               'margin-bottom:10px;font-size:12px">' +
                 '<span style="font-weight:600;color:#0f172a">Filters</span>' +
-                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
-                  '<input type="checkbox" class="sbr-type-filter" value="Payment Entry" checked> Payment Entry</label>' +
-                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
-                  '<input type="checkbox" class="sbr-type-filter" value="Sales Invoice" checked> Sales Invoice</label>' +
-                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
-                  '<input type="checkbox" class="sbr-type-filter" value="Purchase Invoice" checked> Purchase Invoice</label>' +
-                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
-                  '<input type="checkbox" class="sbr-type-filter" value="Journal Entry" checked> Journal Entry</label>' +
-                '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
-                  '<input type="checkbox" class="sbr-type-filter" value="Loan" checked> Loan</label>' +
+                // Type checkboxes are built from the doctypes actually returned
+                // for this bank account (see _renderTypeFilters below) rather
+                // than hardcoded. The old fixed list both offered dead options
+                // (e.g. "Loan" when no loan voucher was ever returned) and, worse,
+                // silently hid any doctype not on it — Expense Claim, Loan
+                // Disbursement/Repayment and anything else the site books
+                // through the bank would be fetched but never displayed.
+                '<span class="sbr-type-filter-slot" style="display:flex;flex-wrap:wrap;gap:8px 14px"></span>' +
                 '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
                   '<input type="checkbox" class="sbr-exact-filter"> Show Exact Amount Only</label>' +
               '</div>' +
@@ -1320,6 +1454,10 @@ window.ReconUI = (function () {
 
     // Voucher list state
     var allVouchers = [];
+    // The default (unsearched) list is kept aside so clearing the search box
+    // restores exactly what was there before, with no refetch.
+    var defaultVouchers = [];
+    var voucherSearchTimer = null;
 
     function _manyTotal() {
       var total = 0;
@@ -1355,14 +1493,33 @@ window.ReconUI = (function () {
                     ';font-weight:700">' + (isMany ? "AI Match" : "&#9650;" + Math.round(aiConf) + "%") +
                     '</span>';
         }
+        // Search results carry can_reconcile/reconciled; the default list does
+        // not. Only ever block on an explicit false/true so the default list's
+        // behaviour is completely unchanged.
+        var blocked = v.can_reconcile === false;
+        var already = v.reconciled === true;
+        if (blocked) {
+          aiBadge += '<span title="approve_match can only clear Payment Entries and ' +
+            'Journal Entries — create a Payment Entry for this voucher and reconcile ' +
+            'against that" style="font-size:10px;border:1px solid #94a3b8;border-radius:99px;' +
+            'padding:1px 7px;color:#64748b;font-weight:700">NOT RECONCILABLE</span>';
+        } else if (already) {
+          aiBadge += '<span title="Already cleared against a bank transaction — ' +
+            'un-reconcile it there first" style="font-size:10px;border:1px solid #d97706;' +
+            'border-radius:99px;padding:1px 7px;color:#b45309;font-weight:700">ALREADY MATCHED</span>';
+        }
         var rowBg = isSel ? (isMany ? "background:#f5f3ff" : "background:#eff6ff") : "";
         var inputCell = isMany
           ? '<td style="width:30px;text-align:center"><input type="checkbox" class="sbr-voucher-check" ' +
-              'value="' + v.name + '"' + (isSel ? " checked" : "") + '></td>'
+              'value="' + v.name + '"' + (isSel ? " checked" : "") +
+              (blocked ? " disabled" : "") + '></td>'
           : '<td style="width:30px;text-align:center"><input type="radio" class="sbr-voucher-radio" ' +
-              'name="sbr-v-' + rname + '" value="' + v.name + '"' + (isSel ? " checked" : "") + '></td>';
+              'name="sbr-v-' + rname + '" value="' + v.name + '"' + (isSel ? " checked" : "") +
+              (blocked ? " disabled" : "") + '></td>';
         return '<tr class="sbr-voucher-row' + (isSel ? " sbr-voucher-row-selected" : "") +
-               '" style="cursor:pointer;' + rowBg + '">' +
+               (blocked ? " sbr-voucher-row-blocked" : "") +
+               '" style="cursor:' + (blocked ? "not-allowed" : "pointer") + ';' +
+               (blocked ? "opacity:.55;" : "") + rowBg + '">' +
                inputCell +
                '<td style="font-size:11px;color:#94a3b8;font-weight:600;width:28px">' + (idx + 1) + '</td>' +
                '<td style="font-size:12px;white-space:nowrap">' + v.type + '</td>' +
@@ -1417,6 +1574,7 @@ window.ReconUI = (function () {
         // Checkbox: clicking the row toggles the checkbox
         $modal.find(".sbr-voucher-row").on("click", function (e) {
           if ($(e.target).is("a, input")) return;
+          if ($(this).hasClass("sbr-voucher-row-blocked")) return;
           var $cb = $(this).find(".sbr-voucher-check");
           $cb.prop("checked", !$cb.prop("checked"));
           $(this).toggleClass("sbr-voucher-row-selected", $cb.prop("checked"));
@@ -1434,11 +1592,30 @@ window.ReconUI = (function () {
         // Radio: row click selects
         $modal.find(".sbr-voucher-row").on("click", function (e) {
           if ($(e.target).is("a")) return;
+          if ($(this).hasClass("sbr-voucher-row-blocked")) return;
           $modal.find(".sbr-voucher-row").removeClass("sbr-voucher-row-selected").css("background", "");
           $(this).addClass("sbr-voucher-row-selected").css("background", "#eff6ff");
           $(this).find(".sbr-voucher-radio").prop("checked", true);
         });
       }
+    }
+
+    /* Build one checkbox per doctype present in the fetched voucher list, all
+       checked by default so nothing is hidden until the user narrows it down. */
+    function _renderTypeFilters(list) {
+      var seen = {};
+      var types = [];
+      list.forEach(function (v) {
+        if (v.type && !seen[v.type]) { seen[v.type] = true; types.push(v.type); }
+      });
+      types.sort();
+      var html = types.map(function (t) {
+        var safe = String(t).replace(/"/g, "&quot;");
+        return '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
+          '<input type="checkbox" class="sbr-type-filter" value="' + safe + '" checked> ' +
+          t + "</label>";
+      }).join("");
+      $modal.find(".sbr-type-filter-slot").html(html);
     }
 
     function applyFilters() {
@@ -1465,6 +1642,58 @@ window.ReconUI = (function () {
     }
 
     $modal.on("change", ".sbr-type-filter, .sbr-exact-filter", applyFilters);
+
+    /* ── Server-side voucher search ──
+       Answers "the AI suggested the wrong entry, how do I find the right one?".
+       The default list is a date window around the bank date, capped at 100
+       rows, so the correct voucher can be absent entirely — no client-side
+       filter can recover it. This re-queries the server with no date window. */
+    function runVoucherSearch() {
+      var term = ($modal.find(".sbr-voucher-search").val() || "").trim();
+      var tol  = parseFloat($modal.find(".sbr-voucher-search-tol").val()) || 0;
+      var $status = $modal.find(".sbr-voucher-search-status");
+
+      if (!term) {
+        // Restore the default list untouched — no refetch, no lost state.
+        allVouchers = defaultVouchers;
+        $status.text("");
+        _renderTypeFilters(allVouchers);
+        applyFilters();
+        return;
+      }
+
+      $status.text("Searching…");
+      frappe.call({
+        method: "smart_bank_reconciliation.reconciliation.api.search_erp_vouchers",
+        args: {
+          bank_transaction: txnName,
+          query: term,
+          amount_tolerance: tol || null,
+        },
+        callback: function (r) {
+          if (r.exc) { $status.text("Search failed"); return; }
+          var res = r.message || [];
+          allVouchers = res;
+          // Rebuild the type checkboxes from the results. applyFilters hides
+          // any row whose type isn't checked, so a result of a doctype absent
+          // from the default list would otherwise be fetched and then silently
+          // filtered out of view — the same trap the hardcoded type list had.
+          _renderTypeFilters(allVouchers);
+          applyFilters();
+          $status.text(
+            !res.length ? "No matches"
+              : res.length + " result" + (res.length === 1 ? "" : "s") +
+                (res.length >= 100 ? " (capped — refine to narrow)" : "")
+          );
+        },
+      });
+    }
+
+    $modal.on("input", ".sbr-voucher-search", function () {
+      clearTimeout(voucherSearchTimer);
+      voucherSearchTimer = setTimeout(runVoucherSearch, 300);
+    });
+    $modal.on("change", ".sbr-voucher-search-tol", runVoucherSearch);
 
     // Confirm
     $modal.on("click", ".sbr-modal-confirm", function () {
@@ -1539,6 +1768,7 @@ window.ReconUI = (function () {
           return;
         }
         allVouchers = r.message;
+        defaultVouchers = r.message;
         // If AI matched an invoice but backend resolved it to a submitted PE (returned at position 0),
         // promote that PE to preselectedName so its radio gets pre-checked.
         var aiMatchedInvoice = suggestion && suggestion.matched &&
@@ -1547,6 +1777,7 @@ window.ReconUI = (function () {
         if (aiMatchedInvoice && allVouchers.length > 0 && allVouchers[0].type === "Payment Entry") {
           preselectedName = allVouchers[0].name;
         }
+        _renderTypeFilters(allVouchers);
         applyFilters();
       },
     });
@@ -1856,6 +2087,20 @@ window.ReconUI = (function () {
       }).join("");
     }
 
+    // Date bounds for the calendar filters come from the vouchers themselves,
+    // which are already fetched only within the period selected at the top of
+    // the page — so the pickers can't be used to wander outside it.
+    var voucherDates = (vouchers || []).map(function (v) { return v.date; })
+      .filter(Boolean).sort();
+    var minDate = voucherDates.length ? voucherDates[0] : "";
+    var maxDate = voucherDates.length ? voucherDates[voucherDates.length - 1] : "";
+    var dateInput = function (cls, label) {
+      return '<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b">' + label +
+        '<input class="' + cls + '" type="date" value="" min="' + minDate + '" max="' + maxDate + '"' +
+        ' style="padding:4px 6px;border:1px solid #c7d2fe;border-radius:6px;font-size:11px;color:#374151;background:#fff">' +
+        "</label>";
+    };
+
     var toolbarHtml =
       '<div class="sbr-erp-toolbar">' +
         '<input class="sbr-erp-search" type="text" placeholder="Search voucher or party…">' +
@@ -1864,6 +2109,13 @@ window.ReconUI = (function () {
           '<option value="Payment Entry">Payment Entry</option>' +
           '<option value="Journal Entry">Journal Entry</option>' +
         '</select>' +
+        '<select class="sbr-erp-status-filter">' +
+          '<option value="">All Statuses</option>' +
+          '<option value="Cleared">Reconciled</option>' +
+          '<option value="Unreconciled">Unreconciled</option>' +
+        '</select>' +
+        dateInput("sbr-erp-from-date", "From") +
+        dateInput("sbr-erp-to-date", "To") +
         '<span class="sbr-txn-counter sbr-erp-counter">' + count + " vouchers</span>" +
         '<button class="sbr-btn sbr-erp-export-btn" style="padding:4px 10px;font-size:11px;margin-left:auto" ' +
           'title="Export the currently visible/filtered vouchers">&#8595; Export CSV</button>' +
@@ -1884,8 +2136,16 @@ window.ReconUI = (function () {
     function applyFilter() {
       var search = ($tab.find(".sbr-erp-search").val() || "").toLowerCase();
       var typeVal = $tab.find(".sbr-erp-type-filter").val();
+      var statusVal = $tab.find(".sbr-erp-status-filter").val();
+      var fromVal = $tab.find(".sbr-erp-from-date").val();
+      var toVal   = $tab.find(".sbr-erp-to-date").val();
       var filtered = vouchers.filter(function (v) {
         var ok = (!typeVal || v.type === typeVal);
+        if (ok && statusVal) ok = (v.status === statusVal);
+        // Dates are ISO (YYYY-MM-DD) on both sides, so string compare is a
+        // correct chronological compare and needs no Date parsing.
+        if (ok && fromVal) ok = (v.date || "") >= fromVal;
+        if (ok && toVal)   ok = (v.date || "") <= toVal;
         if (ok && search) {
           ok = v.name.toLowerCase().indexOf(search) !== -1 ||
                (v.party || "").toLowerCase().indexOf(search) !== -1 ||
@@ -1902,6 +2162,9 @@ window.ReconUI = (function () {
 
     $tab.off("input", ".sbr-erp-search").on("input", ".sbr-erp-search", applyFilter);
     $tab.off("change", ".sbr-erp-type-filter").on("change", ".sbr-erp-type-filter", applyFilter);
+    $tab.off("change", ".sbr-erp-status-filter").on("change", ".sbr-erp-status-filter", applyFilter);
+    $tab.off("change", ".sbr-erp-from-date, .sbr-erp-to-date")
+        .on("change", ".sbr-erp-from-date, .sbr-erp-to-date", applyFilter);
 
     // Export CSV — same pattern as the AI Match Pairs export: whatever is
     // currently visible under the active search/type filter, not a fixed
@@ -2043,6 +2306,14 @@ window.ReconUI = (function () {
             '<div class="sbr-pair-side-label">ERP ' + mType + "</div>" +
             erpIdHtml +
             '<div class="sbr-pair-amt">' + mAmt + "</div>" +
+            // For an invoice the amount above is its grand total (same figure ERP
+            // shows); the outstanding balance is what the bank amount was actually
+            // scored against, so show it rather than leaving the difference
+            // looking like a mismatch.
+            (matchedEntry.outstanding_amount !== null && matchedEntry.outstanding_amount !== undefined
+              ? '<div class="sbr-pair-field">Outstanding: ' +
+                  formatAmount(matchedEntry.outstanding_amount) + "</div>"
+              : "") +
             (mDate ? '<div class="sbr-pair-field">' + mDate + "</div>" : "") +
             (mRef  ? '<div class="sbr-pair-field sbr-pair-mono">' + mRef + "</div>" : "") +
             (mParty ? '<div class="sbr-pair-field">' + mParty + "</div>" : "") +

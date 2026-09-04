@@ -567,6 +567,29 @@
 .sbr-search-input {
   transition: border-color .12s, box-shadow .12s;
 }
+/* ── Reversed / bounced bank line ── */
+.sbr-row-reversal > td { background: #fff7ed !important; }
+.sbr-row-reversal:hover > td { background: #ffedd5 !important; }
+.sbr-reversal-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  color: #c2410c;
+  background: #ffedd5;
+  border: 1px solid #fdba74;
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-right: 4px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.sbr-btn-del-reversal {
+  color: #b91c1c !important;
+  border-color: #fca5a5 !important;
+}
+.sbr-btn-del-reversal:hover { background: #fee2e2 !important; }
+
 .sbr-sortable:hover { background: #e0e7ff; }
 .sbr-sort-arrow {
   display: inline-block;
@@ -1285,4 +1308,23 @@
   border-radius: 4px;
   padding: 2px 8px;
   white-space: nowrap;
+}
+
+/* A voucher the AI matched that is not a reconcilable entry (an invoice).
+   Muted so it never reads as a confirmed match, but visible so the table
+   agrees with what the Actions modal shows. */
+.sbr-link-suggested {
+  color: #64748b !important;
+  border-bottom: 1px dotted #94a3b8;
+}
+.sbr-suggested-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid #cbd5e1;
+  border-radius: 99px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #64748b;
+  vertical-align: middle;
 }
