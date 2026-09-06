@@ -10,6 +10,80 @@ from .matching_engine import BankMatchingEngine
 _KNOWN_RECON_QUEUES = {"Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"}
 
 
+# ERPNext's own fallback list, used only where the hook is unavailable (v13).
+# Mirrors BankTransaction.clear_linked_payment_entries in ERPNext v13, which
+# hardcodes exactly these before the hook existed.
+_V13_RECONCILABLE_DOCTYPES = [
+    "Payment Entry",
+    "Journal Entry",
+    "Purchase Invoice",
+    "Sales Invoice",
+    "Expense Claim",
+    "Loan Repayment",
+    "Loan Disbursement",
+]
+
+
+def _reconcilable_doctypes():
+    """Every doctype this site can actually clear against a bank line.
+
+    ERPNext exposes this as the "bank_reconciliation_doctypes" hook, which
+    installed apps extend — hrms contributes Expense Claim, lending contributes
+    Loan Repayment/Disbursement. Reading the hook rather than hardcoding keeps
+    the tool installation-aware: a site without hrms is never offered Expense
+    Claim, and an app added later is picked up with no change here.
+
+    v13 predates the hook and returns an empty list, so fall back to the list
+    v13's own BankTransaction hardcodes. Ordering matters only in that names are
+    resolved against these doctypes in turn.
+    """
+    try:
+        hooked = frappe.get_hooks("bank_reconciliation_doctypes") or []
+    except Exception:
+        hooked = []
+    doctypes = [d for d in hooked if d]
+    if not doctypes:
+        doctypes = list(_V13_RECONCILABLE_DOCTYPES)
+    # Only keep what actually exists on this site — lending/hrms may be absent,
+    # and querying a missing doctype raises rather than returning nothing.
+    return [d for d in doctypes if frappe.db.exists("DocType", d)]
+
+
+def _clearance_is_on_child(doctype):
+    """Sales Invoice keeps clearance_date on its POS payment child rows, not on
+    the invoice itself — ERPNext special-cases it the same way."""
+    return doctype == "Sales Invoice"
+
+
+def _voucher_reconcilable_reason(doctype, name, gl_bank_account=None):
+    """Return None if this specific voucher can be cleared, else why it cannot.
+
+    Being a reconcilable *doctype* is not enough — invoices only qualify in the
+    narrow forms that actually moved money through the bank, and ERPNext's own
+    matching queries encode exactly which:
+
+      Sales Invoice   — only via a POS payment row (Sales Invoice Payment)
+                        booked against this bank account.
+      Purchase Invoice— only a cash invoice (is_paid = 1).
+
+    Without these checks a normal credit invoice would be "reconciled": the
+    Sales Invoice branch would update zero child rows and the line would still
+    be marked Reconciled, leaving no clearance recorded anywhere.
+    """
+    if doctype == "Sales Invoice":
+        filters = {"parenttype": "Sales Invoice", "parent": name}
+        if gl_bank_account:
+            filters["account"] = gl_bank_account
+        if not frappe.db.exists("Sales Invoice Payment", filters):
+            return ("{0} is a credit invoice with no POS payment against this bank account. "
+                    "Create a Payment Entry for it and reconcile against that.").format(name)
+    elif doctype == "Purchase Invoice":
+        if not frappe.db.get_value("Purchase Invoice", name, "is_paid"):
+            return ("{0} is a credit invoice, not a cash purchase. "
+                    "Create a Payment Entry for it and reconcile against that.").format(name)
+    return None
+
+
 def _suggested_entry_from_draft(raw):
     """The voucher the AI matched but deliberately did NOT store as this
     transaction's reconcilable entry — returned for display only.
@@ -425,8 +499,14 @@ def get_recon_job_status(job_key):
 @frappe.whitelist()
 def approve_match(bank_transaction, matched_entries, match_type=None):
     """
-    Set clearance_date on matched PE/JE entries and mark the Bank Transaction
-    as Reconciled.
+    Clear the matched ERP vouchers against this bank line and mark the Bank
+    Transaction as Reconciled.
+
+    Accepts any doctype this site can reconcile (see _reconcilable_doctypes) —
+    Payment Entry, Journal Entry, cash Purchase/Sales Invoice, Expense Claim,
+    Loan Repayment/Disbursement — not just PE/JE. Names that resolve to none of
+    them are collected and the whole call is refused rather than silently
+    marking the line reconciled with nothing behind it.
     """
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
 
@@ -438,9 +518,15 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
 
     txn_data = frappe.db.get_value(
         "Bank Transaction", bank_transaction,
-        ["deposit", "withdrawal", "unallocated_amount", "party", "description"],
+        ["deposit", "withdrawal", "unallocated_amount", "party", "description",
+         "bank_account"],
         as_dict=True,
     )
+    # The GL account behind this bank account — used to confirm a POS invoice
+    # payment actually landed in *this* bank, as ERPNext's own matching does.
+    gl_bank_account = frappe.db.get_value(
+        "Bank Account", txn_data.get("bank_account"), "account"
+    ) if txn_data.get("bank_account") else None
     bank_amount = float(txn_data.get("deposit") or txn_data.get("withdrawal") or 0)
 
     # Support both old format (list of name strings) and new format (list of {name, amount} dicts)
@@ -479,22 +565,31 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
     # marking the transaction Reconciled with no reference row behind it.
     linked_any = False
     unresolved = []
+    reconcilable = _reconcilable_doctypes()
     for entry in matched_entries:
         entry_name = _entry_name(entry)
         alloc = _alloc_amount(entry, n)
 
-        if frappe.db.exists("Payment Entry", entry_name):
-            table, payment_document = "tabPayment Entry", "Payment Entry"
-        elif frappe.db.exists("Journal Entry", entry_name):
-            table, payment_document = "tabJournal Entry", "Journal Entry"
-        elif frappe.db.exists("Sales Invoice", entry_name) or frappe.db.exists("Purchase Invoice", entry_name):
-            frappe.throw(
-                "Cannot reconcile bank transaction directly against invoice {0}. "
-                "Create a Payment Entry for the invoice first, then reconcile against the Payment Entry.".format(entry_name)
-            )
-        else:
+        # Resolve the name against every doctype this site can clear, rather
+        # than assuming Payment Entry / Journal Entry. Expense Claims, loan
+        # repayments and cash invoices all post to the bank ledger and are
+        # reconcilable in ERPNext; restricting to PE/JE meant the match window
+        # could offer a voucher that then refused to reconcile.
+        payment_document = None
+        for _dt in reconcilable:
+            if frappe.db.exists(_dt, entry_name):
+                payment_document = _dt
+                break
+
+        if not payment_document:
             unresolved.append(entry_name)
             continue
+
+        blocked = _voucher_reconcilable_reason(payment_document, entry_name, gl_bank_account)
+        if blocked:
+            frappe.throw(blocked)
+
+        table = "tab" + payment_document
 
         already_linked_here = frappe.db.exists(
             "Bank Transaction Payments",
@@ -515,7 +610,15 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
         # get_value takes a DocType and prepends "tab" itself, so passing the
         # raw table name queried "tabtabPayment Entry", errored, and returned
         # None — silently disabling this whole double-allocation guard.
-        existing_clearance = frappe.db.get_value(payment_document, entry_name, "clearance_date")
+        if _clearance_is_on_child(payment_document):
+            # Sales Invoice: clearance sits on the POS payment child rows.
+            existing_clearance = frappe.db.get_value(
+                "Sales Invoice Payment",
+                {"parenttype": payment_document, "parent": entry_name},
+                "clearance_date",
+            )
+        else:
+            existing_clearance = frappe.db.get_value(payment_document, entry_name, "clearance_date")
         if existing_clearance and not already_linked_here:
             linked_txns = frappe.db.get_all(
                 "Bank Transaction Payments",
@@ -545,7 +648,14 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
                     )
                 )
 
-        _update_with_retry(table, entry_name, clearance_date)
+        if _clearance_is_on_child(payment_document):
+            frappe.db.sql(
+                "UPDATE `tabSales Invoice Payment` SET `clearance_date`=%s"
+                " WHERE `parenttype`=%s AND `parent`=%s",
+                (clearance_date, payment_document, entry_name),
+            )
+        else:
+            _update_with_retry(table, entry_name, clearance_date)
         linked_any = True
 
         # Insert into Bank Transaction Payments child table (ERPNext native linking)
@@ -580,10 +690,13 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
     # is an error.
     if matched_entries and not linked_any:
         frappe.throw(
-            "Could not reconcile {0}: {1} cannot be linked to a bank transaction. "
-            "Only Payment Entries and Journal Entries can be cleared directly — "
-            "create a Payment Entry for this voucher and reconcile against that "
-            "instead.".format(bank_transaction, ", ".join(unresolved) or "the selected voucher")
+            "Could not reconcile {0}: {1} could not be matched to any voucher type "
+            "this site can clear ({2}). If this is a credit invoice, create a "
+            "Payment Entry for it and reconcile against that instead.".format(
+                bank_transaction,
+                ", ".join(unresolved) or "the selected voucher",
+                ", ".join(reconcilable),
+            )
         )
 
     # Mark bank transaction as reconciled
@@ -1452,6 +1565,10 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
         limit = 100
 
     company = frappe.db.get_value("Bank Account", txn.bank_account, "company") or ""
+    # Which voucher types this site can actually clear — drives the greyed-out
+    # "NOT RECONCILABLE" state in the match window, so it never blocks a type
+    # approve_match would in fact accept.
+    reconcilable = _reconcilable_doctypes()
 
     # Escape LIKE wildcards so a voucher number containing _ or % is searched
     # literally rather than as a pattern.
@@ -1562,7 +1679,8 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
     # than letting approve_match throw after the fact.
     results += _search(
         "Purchase Invoice",
-        ["name", "posting_date", "supplier", "supplier_name", "grand_total", "bill_no"],
+        ["name", "posting_date", "supplier", "supplier_name", "grand_total",
+         "bill_no", "is_paid"],
         ["name", "supplier", "supplier_name", "bill_no"],
         ["grand_total"],
         lambda pi: {
@@ -1573,14 +1691,16 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
             "amount":        float(pi.grand_total or 0),
             "reference":     pi.bill_no or "",
             "payment_type":  "",
-            "can_reconcile": False,
+            # Only a cash purchase invoice moved money through the bank; a
+            # credit invoice needs a Payment Entry first (approve_match enforces).
+            "can_reconcile": ("Purchase Invoice" in reconcilable) and bool(pi.is_paid),
             "reconciled":    False,
         },
     )
 
     results += _search(
         "Sales Invoice",
-        ["name", "posting_date", "customer", "customer_name", "grand_total"],
+        ["name", "posting_date", "customer", "customer_name", "grand_total", "is_pos"],
         ["name", "customer", "customer_name"],
         ["grand_total"],
         lambda si: {
@@ -1591,7 +1711,8 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
             "amount":        float(si.grand_total or 0),
             "reference":     "",
             "payment_type":  "",
-            "can_reconcile": False,
+            # Only a POS invoice carries a payment row that can be cleared.
+            "can_reconcile": ("Sales Invoice" in reconcilable) and bool(si.is_pos),
             "reconciled":    False,
         },
     )
@@ -1632,7 +1753,7 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
                 "amount":        amount,
                 "reference":     "",
                 "payment_type":  "",
-                "can_reconcile": False,
+                "can_reconcile": vtype in reconcilable,
                 "reconciled":    False,
             })
 
