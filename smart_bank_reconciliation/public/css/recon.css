@@ -584,6 +584,23 @@
   vertical-align: middle;
   white-space: nowrap;
 }
+/* The ORIGINAL line that a reversal cancels — same tinted row, a muted tag,
+   so the pair reads as one unit without two identical-looking badges. */
+.sbr-reversed-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-right: 4px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.sbr-btn-del-pair { font-weight: 600 !important; }
 .sbr-btn-del-reversal {
   color: #b91c1c !important;
   border-color: #fca5a5 !important;

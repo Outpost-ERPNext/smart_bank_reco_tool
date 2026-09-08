@@ -139,6 +139,9 @@ function sbr_restore_from_cache(frm, $canvas) {
   ReconUI.renderAIBanner($canvas, data.queue_counts);
   ReconUI.filterByQueue($canvas, null);
   ReconUI.switchTab($canvas, "bank");
+  // The cached payload can predate a delete, so re-derive rather than trust
+  // whatever the totals were when it was cached.
+  sbr_sync_totals(frm);
 
   frm._sbr_ai_done        = true;
   frm._sbr_auto_count     = (data.queue_counts || {}).auto   || 0;
@@ -169,7 +172,8 @@ function sbr_restore_from_cache(frm, $canvas) {
     method: "smart_bank_reconciliation.reconciliation.api.get_erp_vouchers",
     args: { bank_account: ba, from_date: fd, to_date: td },
     callback: function (er) {
-      if (!er.exc) { ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || []); }
+      if (!er.exc) { ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || [],
+        { from: fd, to: td }); }
     },
   });
   frappe.call({
@@ -468,6 +472,20 @@ function sbr_recompute_closing_balance(frm) {
   }
 }
 
+/* ── Bring every derived figure back in step with the rows now in the table:
+   the footer Totals, Closing Balance (Bank), and the balance bar's ERP
+   difference. Needed wherever the row set can change without a full reload —
+   a delete, or an AI run that patches rows in place. Deleting a line used to
+   leave all three showing the pre-delete statement. ── */
+function sbr_sync_totals(frm) {
+  var $canvas = frm.fields_dict.recon_ui_container
+    ? frm.fields_dict.recon_ui_container.$wrapper : null;
+  if (!$canvas || !window.ReconUI) return;
+  ReconUI.refreshFooterTotals($canvas);
+  sbr_recompute_closing_balance(frm);   // Closing Balance (Bank) field
+  sbr_update_balance_bar(frm);          // ERP closing + difference
+}
+
 /* ── Refresh the balance bar inside the custom panel ── */
 function sbr_update_balance_bar(frm) {
   var $canvas = frm.fields_dict.recon_ui_container
@@ -506,7 +524,8 @@ function sbr_schedule_erp_default_load(frm) {
         args: { bank_account: bank_account, from_date: from_date, to_date: to_date },
         callback: function (er) {
           if (!er.exc) {
-            ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || []);
+            ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || [],
+              { from: from_date, to: to_date });
           }
         },
       });
@@ -533,7 +552,8 @@ function sbr_load_erp_vouchers_default(frm, $canvas) {
     args: { bank_account: bank_account, from_date: from_date, to_date: to_date },
     callback: function (er) {
       if (!er.exc) {
-        ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || []);
+        ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || [],
+          { from: from_date, to: to_date });
       }
     },
   });
@@ -713,7 +733,8 @@ function sbr_load_transactions(frm) {
         args: { bank_account: bank_account, from_date: from_date, to_date: to_date },
         callback: function (er) {
           if (!er.exc) {
-            ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || []);
+            ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || [],
+              { from: from_date, to: to_date });
           }
         },
       });
@@ -827,6 +848,7 @@ function sbr_poll_recon_job(frm, $canvas, job_key) {
         } else {
           ReconUI.updateMatchBadges($canvas, data.transactions);
         }
+        sbr_sync_totals(frm);
 
         ReconUI.renderSummaryTiles($canvas, data.queue_counts);
         sbr_inject_unmatched_suggestions(data);
@@ -2632,6 +2654,10 @@ function sbr_bind_card_actions(frm, $canvas) {
   $canvas.off("click", ".sbr-btn-del-reversal");
   $canvas.on("click", ".sbr-btn-del-reversal", function (e) {
     e.stopPropagation();
+    // The pair button carries both classes so it inherits the styling; its own
+    // handler below does the work. Without this guard both would fire and the
+    // single-delete would race the pair-delete on the same row.
+    if ($(this).hasClass("sbr-btn-del-pair")) return;
     var txn = $(this).data("txn");
     frappe.confirm(
       __("Delete reversed bank transaction <b>{0}</b>?<br><br>This permanently removes the " +
@@ -2647,10 +2673,51 @@ function sbr_bind_card_actions(frm, $canvas) {
             if (r.exc) return;
             $canvas.find('.sbr-row[data-txn="' + txn + '"]').fadeOut(150, function () {
               $(this).remove();
+              // Totals must follow the row out immediately — waiting for the
+              // reload below left them showing the deleted line for a beat.
+              sbr_sync_totals(frm);
             });
             frappe.show_alert({ message: __("{0} deleted.", [txn]), indicator: "green" });
             // Reload so tiles, totals and the running balance all re-derive
             // from what's actually left rather than drifting from the DB.
+            setTimeout(function () { sbr_load_transactions(frm); }, 600);
+          },
+        });
+      }
+    );
+  });
+
+  // Delete a reversal AND the line it cancels, together. The two net to zero,
+  // so removing only one leaves the other looking like a real payment that
+  // never happened. The backend re-derives the pairing before destroying
+  // anything — the row's data-pair is a hint, not the authority.
+  $canvas.off("click", ".sbr-btn-del-pair");
+  $canvas.on("click", ".sbr-btn-del-pair", function (e) {
+    e.stopPropagation();
+    var txn  = $(this).data("txn");
+    var pair = $(this).data("pair");
+    frappe.confirm(
+      __("Delete <b>both</b> bank transactions?<br><br><b>{0}</b><br><b>{1}</b><br><br>" +
+         "These two cancel each other out — a transaction and its reversal — so neither " +
+         "is real money movement. This permanently removes both statement lines.",
+         [txn, pair]),
+      function () {
+        frappe.call({
+          method: "smart_bank_reconciliation.reconciliation.api.delete_reversal_pair",
+          args: { bank_transaction: txn },
+          freeze: true,
+          freeze_message: __("Deleting the reversal pair…"),
+          callback: function (r) {
+            if (r.exc) return;
+            (((r.message || {}).deleted) || [txn, pair]).forEach(function (n) {
+              $canvas.find('.sbr-row[data-txn="' + n + '"]').fadeOut(150, function () {
+                $(this).remove();
+                sbr_sync_totals(frm);
+              });
+            });
+            frappe.show_alert({ message: __("Both transactions deleted."), indicator: "green" });
+            // Reload so tiles, totals and the running balance re-derive from
+            // what is actually left rather than drifting from the DB.
             setTimeout(function () { sbr_load_transactions(frm); }, 600);
           },
         });
@@ -2996,6 +3063,7 @@ function sbr_do_import(frm, $canvas, parsed) {
       ReconUI.renderAIBanner($canvas, data.queue_counts);
       ReconUI.filterByQueue($canvas, null);
       ReconUI.switchTab($canvas, "bank");
+      sbr_sync_totals(frm);
 
       frm._sbr_ai_done = true;
       frm._sbr_auto_count = (data.queue_counts || {}).auto || 0;

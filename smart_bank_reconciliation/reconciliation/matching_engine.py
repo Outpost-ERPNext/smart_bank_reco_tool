@@ -177,8 +177,12 @@ class BankMatchingEngine:
                     confidence=best_display["confidence"] if best_display else 0,
                     reasoning=best_display["reasoning"] if best_display else reasoning,
                     match_type=unmatched_match_type,
-                    matched_entries=frappe.as_json(display_entry_names) if display_entry_names else None,
-                    signals_json=frappe.as_json(best_display["signals"]) if best_display else None,
+                    # Empty string, NOT None: _save treats None as "leave the
+                    # field alone", so a row that scored a match on an earlier
+                    # run and scores nothing now kept its old entry and signal
+                    # pills — an Unmatched row still showing a Matched ERP Entry.
+                    matched_entries=frappe.as_json(display_entry_names) if display_entry_names else "",
+                    signals_json=frappe.as_json(best_display["signals"]) if best_display else "",
                     draft_payload=draft,
                 )
                 if unmatched_match_type:
@@ -222,7 +226,15 @@ class BankMatchingEngine:
                 elif self._is_aging(txn):
                     queue = "Aging"
                 else:
-                    queue = "Unmatched"
+                    # A candidate WAS found here, just a weak one. Routing it to
+                    # "Unmatched" put a row carrying a 49% score under a tile
+                    # that means "nothing in ERP looks like this at all" — the
+                    # score and the queue contradicted each other on screen.
+                    # Review is where a weak match belongs: that tab already
+                    # slices by confidence band (0-10, 11-50, ...), which exists
+                    # precisely to triage these. Unmatched is now reserved for
+                    # transactions with no scored candidate whatsoever.
+                    queue = "Review"
 
                 # Check if the matched ERP entry has an accidental twin in ERP
                 entry_names = [e["name"] for e in best.get("entries", [best])]
@@ -323,7 +335,17 @@ class BankMatchingEngine:
         from itertools import combinations
         from frappe.utils import getdate, date_diff
 
-        unmatched_txns = [t for t in results if t.get("recon_queue") in ("Unmatched", "Aging")]
+        # Weak matches now land in Review rather than Unmatched (see the queue
+        # routing above), but they are exactly the rows a Many:1 group is made
+        # of — several small bank lines that individually match nothing well.
+        # Select on confidence too, so this pass sees the same population it
+        # did before that change.
+        unmatched_txns = [
+            t for t in results
+            if t.get("recon_queue") in ("Unmatched", "Aging")
+            or (t.get("recon_queue") == "Review"
+                and float(t.get("recon_confidence") or 0) < self.review_threshold)
+        ]
         if len(unmatched_txns) < 2:
             return
 

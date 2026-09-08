@@ -11,7 +11,22 @@ WHT_MAX_TOLERANCE = 500        # cap, matching the old flat buffer for large inv
 
 _COT = re.compile(r"\bZ?COT\b|\bCOMMISSION ON TURNOVER\b", re.I)
 _FIRS = re.compile(r"\bFIRS\b|\bFEDERAL INLAND REVENUE\b|\bTIN\b", re.I)
-_REVERSAL = re.compile(r"\bREVERSAL\b|\bREVERSED\b|\bRSVL\b|\bCHQ.?RETURN\b|\bBOUNCE\b", re.I)
+# Bank narrations abbreviate "reversal" as RVSL far more often than RSVL —
+# FCMB/NIBSS lines read "Rvsl:1997388679web:TB1c/...", "RVSL:TRANSACTION
+# CHARGES". Only RSVL was listed, so those went unflagged: no highlight and
+# no delete button on exactly the lines that need them. Both spellings are
+# kept.
+#
+# Deliberately NOT matched: REFUND and SALES RETURN. Both are real money
+# movements with their own ERP vouchers, not bank-side reversals — flagging
+# them would offer to delete legitimate statement lines. REVENUE must not
+# match either, hence \bREV...\b anchoring rather than a bare REV prefix.
+_REVERSAL = re.compile(
+    r"\bREVERSALS?\b|\bREVERSED\b|\bREVERSING\b|\bRVSL\b|\bRSVL\b"
+    r"|\bCHQ.?RETURN\b|\bCHEQUE.?RETURN\b|\bRETURNED\s+CHEQUE\b"
+    r"|\bBOUNCE[DS]?\b|\bCHARGEBACK\b",
+    re.I,
+)
 _INTEREST = re.compile(r"\bINTEREST\b|\bCREDIT INT\b|\bINTEREST CREDIT\b", re.I)
 _PAYROLL = re.compile(r"\bSALARY\b|\bPAYROLL\b|\bSTAFF\b", re.I)
 

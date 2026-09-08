@@ -63,6 +63,11 @@ window.ReconUI = (function () {
         " letter-spacing: .06em; color: #c2410c; background: #ffedd5;" +
         " border: 1px solid #fdba74; border-radius: 4px; padding: 1px 5px;" +
         " margin-right: 4px; vertical-align: middle; white-space: nowrap; }",
+      ".sbr-reversed-tag { display: inline-block; font-size: 9px; font-weight: 800;" +
+        " letter-spacing: .06em; color: #92400e; background: #fef3c7;" +
+        " border: 1px solid #fcd34d; border-radius: 4px; padding: 1px 5px;" +
+        " margin-right: 4px; vertical-align: middle; white-space: nowrap; }",
+      ".sbr-btn-del-pair { font-weight: 600 !important; }",
       ".sbr-btn-del-reversal { color: #b91c1c !important; border-color: #fca5a5 !important; }",
       ".sbr-btn-del-reversal:hover { background: #fee2e2 !important; }",
       /* AI-suggested (non-reconcilable) entry (mirror recon.css) */
@@ -623,7 +628,7 @@ window.ReconUI = (function () {
     $container.find(".sbr-table-footer").css("display", queueName ? "none" : "");
 
     if (total > 0) {
-      $container.find(".sbr-txn-counter").text(
+      $container.find(".sbr-txn-counter:not(.sbr-erp-counter)").text(
         (queueName || txt || partyType || confRangeTable)
           ? "Showing " + visible + " of " + total + " transactions"
           : total + " transactions"
@@ -878,7 +883,7 @@ window.ReconUI = (function () {
       $container.find(".sbr-table-wrap").html(
         '<p class="sbr-empty" style="padding:16px">No transactions found for this period.</p>'
       );
-      $container.find(".sbr-txn-counter").text("0 transactions");
+      $container.find(".sbr-txn-counter:not(.sbr-erp-counter)").text("0 transactions");
       return { totalDeposit: 0, totalWithdrawal: 0, netBalance: parseFloat($container.data("sbr-opening-balance")) || 0 };
     }
 
@@ -965,6 +970,36 @@ window.ReconUI = (function () {
     });
     transactions = displayTransactions;
 
+    // A reversal and the line it cancels are shown as an adjacent pair, the
+    // original first. Server-side pairing (see _pair_reversals in api.py) sets
+    // recon_reversal_of / recon_reversed_by; here the reversal is simply lifted
+    // to sit directly under its original, wherever the original ended up.
+    // Without this the two sit wherever the date sort puts them — often pages
+    // apart — and the user cannot see that they cancel out, let alone remove
+    // both.
+    (function () {
+      var byName = {};
+      transactions.forEach(function (t) { byName[t.name] = t; });
+      var reversalFor = {};   // original name -> its reversal row
+      transactions.forEach(function (t) {
+        // Only pair when BOTH ends survived grouping/filtering, otherwise the
+        // reversal would be pulled out of the list and never re-inserted.
+        if (t.recon_reversal_of && byName[t.recon_reversal_of]) {
+          reversalFor[t.recon_reversal_of] = t;
+        }
+      });
+      if (!Object.keys(reversalFor).length) return;
+      var moved = {};
+      Object.keys(reversalFor).forEach(function (k) { moved[reversalFor[k].name] = true; });
+      var ordered = [];
+      transactions.forEach(function (t) {
+        if (moved[t.name]) return;            // re-inserted under its original
+        ordered.push(t);
+        if (reversalFor[t.name]) ordered.push(reversalFor[t.name]);
+      });
+      transactions = ordered;
+    })();
+
     // Consolidated entries (grouped or individually-unmatched) surface at
     // the top of the Bank Transactions list so it's immediately obvious
     // which rows were consolidated and what they matched against —
@@ -1018,11 +1053,17 @@ window.ReconUI = (function () {
       // usually never really moved, so it gets called out visually and can be
       // deleted straight from the row.
       var isReversal = t.recon_match_type === "Reversal";
+      // The original that a reversal cancels gets the same tinted row, so the
+      // pair reads as one unit rather than the reversal looking like a lone
+      // oddity above an ordinary-looking line.
+      var pairedWith  = t.recon_reversal_of || t.recon_reversed_by || "";
+      var isReversedOriginal = !!t.recon_reversed_by;
 
       var searchText = [t.description, t.reference_number, t.party]
         .filter(Boolean).join(" ").toLowerCase().replace(/"/g, "");
       html += '<tr class="sbr-row' + (isReconciled ? " sbr-row-done" : "") +
-              (isReversal ? " sbr-row-reversal" : "") + '"' +
+              (isReversal || isReversedOriginal ? " sbr-row-reversal" : "") + '"' +
+              (pairedWith ? ' data-pair="' + pairedWith + '"' : "") +
               ' data-txn="' + t.name + '" data-queue="' + queue + '"' +
               ' data-party-type="' + (t.party_type || "") + '"' +
               ' data-confidence="' + Math.round(pct) + '"' +
@@ -1038,6 +1079,9 @@ window.ReconUI = (function () {
               "<td class='sbr-date-col' style='white-space:nowrap'>" + (t.date || "") + "</td>" +
               "<td class='sbr-desc' title=\"" + (t.description || t.party || "").replace(/"/g, "&quot;") + "\">" +
                 (isReversal ? '<span class="sbr-reversal-tag">&#8635; REVERSAL</span> ' : "") +
+                (isReversedOriginal
+                  ? '<span class="sbr-reversed-tag" title="Reversed by ' + t.recon_reversed_by +
+                    '">&#8635; REVERSED</span> ' : "") +
                 (t.description || t.party || "—") + "</td>" +
               '<td class="sbr-amt-cell" style="color:#16a34a;font-weight:600;font-variant-numeric:tabular-nums">' +
                 (t.deposit && parseFloat(t.deposit) > 0 ? formatAmount(t.deposit) : "") + "</td>" +
@@ -1061,9 +1105,16 @@ window.ReconUI = (function () {
                   '" title="Remove this reconciliation">&#8617; Unreconcile</button>'
                 : '<button class="sbr-btn sbr-row-action-btn sbr-btn-action-blue"' +
                   ' data-txn="' + t.name + '">Actions</button>' +
-                  (isReversal
-                    ? ' <button class="sbr-btn sbr-btn-del-reversal" data-txn="' + t.name +
-                      '" title="Delete this reversed bank transaction">&#128465; Delete</button>'
+                  (isReversal || isReversedOriginal
+                    ? (pairedWith
+                        // Both halves net to zero, so removing only one would
+                        // strand the other as a payment that never happened.
+                        ? ' <button class="sbr-btn sbr-btn-del-reversal sbr-btn-del-pair"' +
+                          ' data-txn="' + t.name + '" data-pair="' + pairedWith +
+                          '" title="Delete this transaction and its reversal — they cancel out">' +
+                          '&#128465; Delete Both</button>'
+                        : ' <button class="sbr-btn sbr-btn-del-reversal" data-txn="' + t.name +
+                          '" title="Delete this reversed bank transaction">&#128465; Delete</button>')
                     : "")
               ) + "</td>" +
               "</tr>";
@@ -1075,10 +1126,10 @@ window.ReconUI = (function () {
         '<td class="sbr-idx-col"></td>' +
         '<td class="sbr-date-col"></td>' +
         '<td style="padding:8px 12px;color:#374151">Totals</td>' +
-        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#16a34a;font-variant-numeric:tabular-nums">' + formatAmount(totalDeposit) + "</td>" +
-        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#dc2626;font-variant-numeric:tabular-nums">' + formatAmount(totalWithdrawal) + "</td>" +
+        '<td class="sbr-amt-cell sbr-foot-deposit" style="padding:8px 12px;color:#16a34a;font-variant-numeric:tabular-nums">' + formatAmount(totalDeposit) + "</td>" +
+        '<td class="sbr-amt-cell sbr-foot-withdrawal" style="padding:8px 12px;color:#dc2626;font-variant-numeric:tabular-nums">' + formatAmount(totalWithdrawal) + "</td>" +
         "<td></td>" +
-        '<td class="sbr-amt-cell" style="padding:8px 12px;color:#0f172a;font-variant-numeric:tabular-nums">' + formatAmount(netBalance) + "</td>" +
+        '<td class="sbr-amt-cell sbr-foot-balance" style="padding:8px 12px;color:#0f172a;font-variant-numeric:tabular-nums">' + formatAmount(netBalance) + "</td>" +
         '<td colspan="4"></td>' +
       "</tr></tfoot></table>";
 
@@ -1088,7 +1139,7 @@ window.ReconUI = (function () {
     // this counter read 753 on load and then jump to 400 the moment any filter
     // was touched. The summary cards above are the place the full
     // per-transaction count (753) is reported.
-    $container.find(".sbr-txn-counter").text(
+    $container.find(".sbr-txn-counter:not(.sbr-erp-counter)").text(
       $container.find(".sbr-row").length + " transactions");
     _resolveEntryLinks($container);
     _neutralizeStickyBreakers($container);
@@ -1126,6 +1177,33 @@ window.ReconUI = (function () {
     return { totalDeposit: totalDeposit, totalWithdrawal: totalWithdrawal, netBalance: netBalance };
   }
 
+  /* ── Recompute the footer Totals from the rows actually in the table ──
+     The footer is written once by renderTransactionTable. Anything that
+     changes the row set WITHOUT a full re-render — a delete, or the in-place
+     badge patch after an AI run — left it showing figures for rows that are
+     no longer there, so Totals disagreed with the statement.
+
+     Reads the per-row data attributes rather than any cached array, so it is
+     always in step with what is on screen. Returns the new totals. */
+  function refreshFooterTotals($container) {
+    var $rows = $container.find(".sbr-row");
+    if (!$rows.length) return null;
+    var totalDeposit = 0, totalWithdrawal = 0;
+    $rows.each(function () {
+      totalDeposit    += parseFloat($(this).data("deposit"))    || 0;
+      totalWithdrawal += parseFloat($(this).data("withdrawal")) || 0;
+    });
+    var opening = parseFloat($container.data("sbr-opening-balance")) || 0;
+    var netBalance = opening + totalDeposit - totalWithdrawal;
+    $container.find(".sbr-foot-deposit").text(formatAmount(totalDeposit));
+    $container.find(".sbr-foot-withdrawal").text(formatAmount(totalWithdrawal));
+    $container.find(".sbr-foot-balance").text(formatAmount(netBalance));
+    $container.find(".sbr-txn-counter:not(.sbr-erp-counter)").text(
+      $rows.length + " transactions");
+    return { totalDeposit: totalDeposit, totalWithdrawal: totalWithdrawal,
+             netBalance: netBalance };
+  }
+
   function updateMatchBadges($container, transactions) {
     if (!transactions) return;
     transactions.forEach(function (t) {
@@ -1152,6 +1230,9 @@ window.ReconUI = (function () {
     // work off the current selection (the Consolidate deposit/withdrawal check)
     // were still judging the pre-AI copy of each transaction.
     $container.data("transactions", transactions);
+    // Rows are patched in place here, so the footer written by the last full
+    // render would otherwise keep totals for a row set that has since changed.
+    refreshFooterTotals($container);
     _resolveEntryLinks($container);
   }
 
@@ -2047,9 +2128,16 @@ window.ReconUI = (function () {
     "JE": { bg: "#EDE9FE", text: "#7C3AED", border: "#7C3AED" },
     "SI": { bg: "#DCFCE7", text: "#16A34A", border: "#16A34A" },
     "PI": { bg: "#FFEDD5", text: "#EA580C", border: "#EA580C" },
+    "EC": { bg: "#FEF3C7", text: "#B45309", border: "#B45309" },
+    "LR": { bg: "#CCFBF1", text: "#0F766E", border: "#0F766E" },
+    "LD": { bg: "#E0F2FE", text: "#0369A1", border: "#0369A1" },
   };
+  // Anything the sweep turns up that isn't listed above still needs a badge —
+  // falling back to the JE purple made every unknown doctype look like a
+  // Journal Entry.
+  var ERP_TYPE_COLOR_DEFAULT = { bg: "#F1F5F9", text: "#475569", border: "#94A3B8" };
 
-  function renderERPVouchersTab($container, vouchers) {
+  function renderERPVouchersTab($container, vouchers, bounds) {
     var $tab = $container.find('.sbr-tab-content[data-tab="erp"]');
     var count = (vouchers || []).length;
     updateTabBadge($container, "erp", count);
@@ -2064,7 +2152,7 @@ window.ReconUI = (function () {
         return '<tr><td colspan="7" class="sbr-empty" style="padding:20px;text-align:center">No vouchers match this filter.</td></tr>';
       }
       return list.map(function (v) {
-        var tc = ERP_TYPE_COLOR[v.type_short] || ERP_TYPE_COLOR["JE"];
+        var tc = ERP_TYPE_COLOR[v.type_short] || ERP_TYPE_COLOR_DEFAULT;
         var badge = '<span class="sbr-badge" style="background:' + tc.bg + ";color:" + tc.text +
                     ";border-color:" + tc.border + '">' + (v.type_short || "?") + "</span>";
         var doctype = encodeURIComponent(v.type);
@@ -2087,13 +2175,23 @@ window.ReconUI = (function () {
       }).join("");
     }
 
-    // Date bounds for the calendar filters come from the vouchers themselves,
-    // which are already fetched only within the period selected at the top of
-    // the page — so the pickers can't be used to wander outside it.
+    // Calendar bounds are the STATEMENT PERIOD chosen at the top of the page,
+    // not the range the returned vouchers happen to span.
+    //
+    // Deriving them from the data clamped the picker to the first and last
+    // voucher date, so a period starting 03-08 whose earliest voucher is 04-08
+    // greyed out 03-08 itself — the user could not select the very date they
+    // had set the period to. The intent was only to stop the picker wandering
+    // OUTSIDE the period, which the period dates express directly.
+    //
+    // Falls back to the voucher extremes when no bounds are passed, so any
+    // caller that hasn't been updated still behaves as before.
     var voucherDates = (vouchers || []).map(function (v) { return v.date; })
       .filter(Boolean).sort();
-    var minDate = voucherDates.length ? voucherDates[0] : "";
-    var maxDate = voucherDates.length ? voucherDates[voucherDates.length - 1] : "";
+    var minDate = (bounds && bounds.from) ||
+                  (voucherDates.length ? voucherDates[0] : "");
+    var maxDate = (bounds && bounds.to) ||
+                  (voucherDates.length ? voucherDates[voucherDates.length - 1] : "");
     var dateInput = function (cls, label) {
       return '<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#64748b">' + label +
         '<input class="' + cls + '" type="date" value="" min="' + minDate + '" max="' + maxDate + '"' +
@@ -2101,13 +2199,28 @@ window.ReconUI = (function () {
         "</label>";
     };
 
+    // Offer exactly the doctypes actually present in this period. The list was
+    // hardcoded to Payment Entry / Journal Entry, so the Expense Claims and
+    // other bank-ledger vouchers the sweep now returns were listed in the table
+    // but could not be filtered for — and the dropdown read as if the tool
+    // only knew about two doctypes.
+    var erpTypeOptions = (function () {
+      var seen = {}, types = [];
+      (vouchers || []).forEach(function (v) {
+        if (v.type && !seen[v.type]) { seen[v.type] = true; types.push(v.type); }
+      });
+      types.sort();
+      return types.map(function (t) {
+        var safe = String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+        return '<option value="' + safe + '">' + safe + "</option>";
+      }).join("");
+    })();
+
     var toolbarHtml =
       '<div class="sbr-erp-toolbar">' +
         '<input class="sbr-erp-search" type="text" placeholder="Search voucher or party…">' +
         '<select class="sbr-erp-type-filter">' +
-          '<option value="">All Types</option>' +
-          '<option value="Payment Entry">Payment Entry</option>' +
-          '<option value="Journal Entry">Journal Entry</option>' +
+          '<option value="">All Types</option>' + erpTypeOptions +
         '</select>' +
         '<select class="sbr-erp-status-filter">' +
           '<option value="">All Statuses</option>' +
@@ -2116,6 +2229,11 @@ window.ReconUI = (function () {
         '</select>' +
         dateInput("sbr-erp-from-date", "From") +
         dateInput("sbr-erp-to-date", "To") +
+        // Carries sbr-txn-counter for the shared styling only. The Bank
+        // Transactions renderer excludes .sbr-erp-counter when it rewrites
+        // its own counter — without that it overwrote this one, so opening
+        // ERP Vouchers after filtering bank rows showed "Showing 2 of 592
+        // transactions" instead of the voucher count.
         '<span class="sbr-txn-counter sbr-erp-counter">' + count + " vouchers</span>" +
         '<button class="sbr-btn sbr-erp-export-btn" style="padding:4px 10px;font-size:11px;margin-left:auto" ' +
           'title="Export the currently visible/filtered vouchers">&#8595; Export CSV</button>' +
@@ -3256,6 +3374,7 @@ window.ReconUI = (function () {
     renderBalanceSummary:   renderBalanceSummary,
     renderAIBanner:         renderAIBanner,
     renderTransactionTable: renderTransactionTable,
+    refreshFooterTotals:    refreshFooterTotals,
     updateMatchBadges:      updateMatchBadges,
     renderSuggestionsPanel: renderSuggestionsPanel,
     renderERPVouchersTab:   renderERPVouchersTab,
