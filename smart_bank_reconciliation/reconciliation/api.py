@@ -1,4 +1,5 @@
 import json
+import re
 import frappe
 from frappe import _
 from frappe.utils import nowdate, getdate, flt, add_days
@@ -8,6 +9,200 @@ from .matching_engine import BankMatchingEngine
 # transactions never run through the matching engine. Any value outside this known-outcome
 # set must fold into "Unmatched" so tile counts always sum to the total record count.
 _KNOWN_RECON_QUEUES = {"Auto", "Review", "Unmatched", "High-Val", "Duplicate", "Aging", "Reconciled"}
+
+
+# ERPNext's own fallback list, used only where the hook is unavailable (v13).
+# Mirrors BankTransaction.clear_linked_payment_entries in ERPNext v13, which
+# hardcodes exactly these before the hook existed.
+_V13_RECONCILABLE_DOCTYPES = [
+    "Payment Entry",
+    "Journal Entry",
+    "Purchase Invoice",
+    "Sales Invoice",
+    "Expense Claim",
+    "Loan Repayment",
+    "Loan Disbursement",
+]
+
+
+def _reconcilable_doctypes():
+    """Every doctype this site can actually clear against a bank line.
+
+    ERPNext exposes this as the "bank_reconciliation_doctypes" hook, which
+    installed apps extend — hrms contributes Expense Claim, lending contributes
+    Loan Repayment/Disbursement. Reading the hook rather than hardcoding keeps
+    the tool installation-aware: a site without hrms is never offered Expense
+    Claim, and an app added later is picked up with no change here.
+
+    v13 predates the hook and returns an empty list, so fall back to the list
+    v13's own BankTransaction hardcodes. Ordering matters only in that names are
+    resolved against these doctypes in turn.
+    """
+    try:
+        hooked = frappe.get_hooks("bank_reconciliation_doctypes") or []
+    except Exception:
+        hooked = []
+    doctypes = [d for d in hooked if d]
+    if not doctypes:
+        doctypes = list(_V13_RECONCILABLE_DOCTYPES)
+    # Only keep what actually exists on this site — lending/hrms may be absent,
+    # and querying a missing doctype raises rather than returning nothing.
+    return [d for d in doctypes if frappe.db.exists("DocType", d)]
+
+
+def _voucher_short_code(doctype):
+    """Two/three-letter badge for the ERP Vouchers tab ("Expense Claim" -> "EC").
+
+    Derived from the doctype name rather than a lookup table so a doctype this
+    app has never heard of still gets a sensible badge instead of "?".
+    """
+    words = [w for w in str(doctype or "").replace("-", " ").split() if w]
+    if not words:
+        return "?"
+    if len(words) == 1:
+        return words[0][:2].upper()
+    return "".join(w[0] for w in words[:3]).upper()
+
+
+def _clearance_is_on_child(doctype):
+    """Sales Invoice keeps clearance_date on its POS payment child rows, not on
+    the invoice itself — ERPNext special-cases it the same way."""
+    return doctype == "Sales Invoice"
+
+
+def _voucher_reconcilable_reason(doctype, name, gl_bank_account=None):
+    """Return None if this specific voucher can be cleared, else why it cannot.
+
+    Being a reconcilable *doctype* is not enough — invoices only qualify in the
+    narrow forms that actually moved money through the bank, and ERPNext's own
+    matching queries encode exactly which:
+
+      Sales Invoice   — only via a POS payment row (Sales Invoice Payment)
+                        booked against this bank account.
+      Purchase Invoice— only a cash invoice (is_paid = 1).
+
+    Without these checks a normal credit invoice would be "reconciled": the
+    Sales Invoice branch would update zero child rows and the line would still
+    be marked Reconciled, leaving no clearance recorded anywhere.
+    """
+    if doctype == "Sales Invoice":
+        filters = {"parenttype": "Sales Invoice", "parent": name}
+        if gl_bank_account:
+            filters["account"] = gl_bank_account
+        if not frappe.db.exists("Sales Invoice Payment", filters):
+            return ("{0} is a credit invoice with no POS payment against this bank account. "
+                    "Create a Payment Entry for it and reconcile against that.").format(name)
+    elif doctype == "Purchase Invoice":
+        if not frappe.db.get_value("Purchase Invoice", name, "is_paid"):
+            return ("{0} is a credit invoice, not a cash purchase. "
+                    "Create a Payment Entry for it and reconcile against that.").format(name)
+    elif doctype == "Expense Claim":
+        # A claim only qualifies if it actually posted to THIS bank account —
+        # i.e. it was booked with "Is Paid". A claim settled by a Payment Entry
+        # never moved money through the bank, so clearing it here would stamp a
+        # clearance date on the wrong voucher and leave the real one open.
+        if gl_bank_account:
+            posted_here = frappe.db.exists("GL Entry", {
+                "voucher_type": "Expense Claim",
+                "voucher_no":   name,
+                "account":      gl_bank_account,
+                "is_cancelled": 0,
+            })
+        else:
+            posted_here = frappe.db.get_value("Expense Claim", name, "is_paid")
+        if not posted_here:
+            return ("{0} was not paid directly from this bank account — it is settled by a "
+                    "Payment Entry. Reconcile that Payment Entry instead.").format(name)
+    return None
+
+
+# The reversal marker itself, plus any transaction id glued to it, so the rest
+# of the narration can be compared against the original line. Both spellings
+# are listed deliberately: banks write RVSL far more often than RSVL, and a
+# character class like R[VS]SL silently matches only one of them.
+_REVERSAL_MARK = re.compile(
+    r"\b(?:RVSL|RSVL|REVERSALS?|REVERSED|REVERSING)\b\s*:?\s*\d*", re.I
+)
+# Below this many comparable characters a narration is too generic to pair on.
+_REVERSAL_MIN_CORE = 8
+
+
+def _narration_core(desc):
+    """Narration reduced to comparable characters, reversal marker removed."""
+    return re.sub(r"[^A-Z0-9]", "", _REVERSAL_MARK.sub("", (desc or "")).upper())
+
+
+def _pair_reversals(rows):
+    """Link each reversal row to the transaction it cancels, in place.
+
+    Sets recon_reversal_of on the reversal and recon_reversed_by on the
+    original, so the table can show the two together and offer to delete the
+    pair — they net to nothing and both belong off the statement.
+
+    Pairing is derived, not stored: no custom field, and it re-derives on every
+    fetch so it cannot go stale after a delete or a re-import.
+
+    The narration is the reliable signal. A bank writes the reversal as its own
+    marker followed by the ORIGINAL line's text ("Rsvl:web:TB1c/DEPOT PYT TO
+    ABIMBOLA..."), and because the narration field is fixed-width that prefix
+    pushes the tail off the end. So the reversal's text is a PREFIX of the
+    original's, never equal to it — matching on equality finds nothing.
+
+    Amount alone is useless here: a statement carries hundreds of identical
+    NGN 53.75 charges. Amount plus opposite side plus the narration prefix is
+    what makes a pair unambiguous.
+    """
+    from .nigerian_rules import _REVERSAL
+
+    reversals, originals = [], []
+    for r in rows:
+        r["recon_reversal_of"] = ""
+        r["recon_reversed_by"] = ""
+        if _REVERSAL.search(r.get("description") or ""):
+            reversals.append(r)
+        else:
+            originals.append(r)
+    if not reversals:
+        return rows
+
+    def _amt(r):
+        return round(float(r.get("deposit") or 0) or float(r.get("withdrawal") or 0), 2)
+
+    def _is_deposit(r):
+        return float(r.get("deposit") or 0) > 0
+
+    by_amount = {}
+    for o in originals:
+        by_amount.setdefault(_amt(o), []).append(o)
+
+    claimed = set()
+    # Oldest first, so when two reversals could take the same original the
+    # earlier one gets it rather than whichever happened to be fetched first.
+    for rev in sorted(reversals, key=lambda r: str(r.get("date") or "")):
+        core = _narration_core(rev.get("description"))
+        if len(core) < _REVERSAL_MIN_CORE:
+            continue
+        best, best_gap = None, None
+        for cand in by_amount.get(_amt(rev), ()):
+            if cand["name"] in claimed:
+                continue
+            # A reversal moves money the opposite way to the line it cancels.
+            if _is_deposit(cand) == _is_deposit(rev):
+                continue
+            cand_date, rev_date = str(cand.get("date") or ""), str(rev.get("date") or "")
+            if cand_date and rev_date and cand_date > rev_date:
+                continue  # the original cannot post after its own reversal
+            cand_core = _narration_core(cand.get("description"))
+            if not (cand_core.startswith(core) or core.startswith(cand_core)):
+                continue
+            gap = abs((getdate(rev_date) - getdate(cand_date)).days) if (cand_date and rev_date) else 0
+            if best is None or gap < best_gap:
+                best, best_gap = cand, gap
+        if best is not None:
+            claimed.add(best["name"])
+            rev["recon_reversal_of"] = best["name"]
+            best["recon_reversed_by"] = rev["name"]
+    return rows
 
 
 def _suggested_entry_from_draft(raw):
@@ -100,6 +295,10 @@ def get_bank_transactions(bank_account, from_date, to_date):
     # queue_counts.total already dedupes consolidated groups (they display as
     # one row); keep the plain "total" field in lockstep so nothing that
     # reads it separately drifts out of sync with the tile counts.
+    # Link each reversal to the line it cancels so the table can show the two
+    # together and offer to remove both.
+    _pair_reversals(rows)
+
     queue_counts = _tally_queue_counts(rows)
     total = queue_counts["total"]
 
@@ -256,7 +455,9 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
 
     return {
         "queue_counts": queue_counts,
-        "transactions": [
+        # Same reversal pairing as the plain reload, so the two lines stay
+        # adjacent and deletable together after an AI run too.
+        "transactions": _pair_reversals([
             {
                 "name": t["name"],
                 "date": str(t.get("date") or ""),
@@ -287,7 +488,7 @@ def get_suggestions(bank_account, from_date, to_date, company, settings_json=Non
                 "recon_duplicate_of": t.get("recon_duplicate_of") or [],
             }
             for t in results
-        ],
+        ]),
         "suggestions": suggestions,
     }
 
@@ -359,7 +560,9 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
 
         data = {
             "queue_counts": queue_counts,
-            "transactions": [
+            # Same reversal pairing as the plain reload, so the two lines stay
+            # adjacent and deletable together after an AI run too.
+            "transactions": _pair_reversals([
                 {
                     "name": t["name"],
                     "date": str(t.get("date") or ""),
@@ -390,7 +593,7 @@ def _run_recon_job_bg(job_key, bank_account, from_date, to_date, company, settin
                     "recon_duplicate_of": t.get("recon_duplicate_of") or [],
                 }
                 for t in results
-            ],
+            ]),
             "suggestions": suggestions,
         }
 
@@ -425,8 +628,14 @@ def get_recon_job_status(job_key):
 @frappe.whitelist()
 def approve_match(bank_transaction, matched_entries, match_type=None):
     """
-    Set clearance_date on matched PE/JE entries and mark the Bank Transaction
-    as Reconciled.
+    Clear the matched ERP vouchers against this bank line and mark the Bank
+    Transaction as Reconciled.
+
+    Accepts any doctype this site can reconcile (see _reconcilable_doctypes) —
+    Payment Entry, Journal Entry, cash Purchase/Sales Invoice, Expense Claim,
+    Loan Repayment/Disbursement — not just PE/JE. Names that resolve to none of
+    them are collected and the whole call is refused rather than silently
+    marking the line reconciled with nothing behind it.
     """
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
 
@@ -438,9 +647,15 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
 
     txn_data = frappe.db.get_value(
         "Bank Transaction", bank_transaction,
-        ["deposit", "withdrawal", "unallocated_amount", "party", "description"],
+        ["deposit", "withdrawal", "unallocated_amount", "party", "description",
+         "bank_account"],
         as_dict=True,
     )
+    # The GL account behind this bank account — used to confirm a POS invoice
+    # payment actually landed in *this* bank, as ERPNext's own matching does.
+    gl_bank_account = frappe.db.get_value(
+        "Bank Account", txn_data.get("bank_account"), "account"
+    ) if txn_data.get("bank_account") else None
     bank_amount = float(txn_data.get("deposit") or txn_data.get("withdrawal") or 0)
 
     # Support both old format (list of name strings) and new format (list of {name, amount} dicts)
@@ -479,22 +694,31 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
     # marking the transaction Reconciled with no reference row behind it.
     linked_any = False
     unresolved = []
+    reconcilable = _reconcilable_doctypes()
     for entry in matched_entries:
         entry_name = _entry_name(entry)
         alloc = _alloc_amount(entry, n)
 
-        if frappe.db.exists("Payment Entry", entry_name):
-            table, payment_document = "tabPayment Entry", "Payment Entry"
-        elif frappe.db.exists("Journal Entry", entry_name):
-            table, payment_document = "tabJournal Entry", "Journal Entry"
-        elif frappe.db.exists("Sales Invoice", entry_name) or frappe.db.exists("Purchase Invoice", entry_name):
-            frappe.throw(
-                "Cannot reconcile bank transaction directly against invoice {0}. "
-                "Create a Payment Entry for the invoice first, then reconcile against the Payment Entry.".format(entry_name)
-            )
-        else:
+        # Resolve the name against every doctype this site can clear, rather
+        # than assuming Payment Entry / Journal Entry. Expense Claims, loan
+        # repayments and cash invoices all post to the bank ledger and are
+        # reconcilable in ERPNext; restricting to PE/JE meant the match window
+        # could offer a voucher that then refused to reconcile.
+        payment_document = None
+        for _dt in reconcilable:
+            if frappe.db.exists(_dt, entry_name):
+                payment_document = _dt
+                break
+
+        if not payment_document:
             unresolved.append(entry_name)
             continue
+
+        blocked = _voucher_reconcilable_reason(payment_document, entry_name, gl_bank_account)
+        if blocked:
+            frappe.throw(blocked)
+
+        table = "tab" + payment_document
 
         already_linked_here = frappe.db.exists(
             "Bank Transaction Payments",
@@ -515,7 +739,15 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
         # get_value takes a DocType and prepends "tab" itself, so passing the
         # raw table name queried "tabtabPayment Entry", errored, and returned
         # None — silently disabling this whole double-allocation guard.
-        existing_clearance = frappe.db.get_value(payment_document, entry_name, "clearance_date")
+        if _clearance_is_on_child(payment_document):
+            # Sales Invoice: clearance sits on the POS payment child rows.
+            existing_clearance = frappe.db.get_value(
+                "Sales Invoice Payment",
+                {"parenttype": payment_document, "parent": entry_name},
+                "clearance_date",
+            )
+        else:
+            existing_clearance = frappe.db.get_value(payment_document, entry_name, "clearance_date")
         if existing_clearance and not already_linked_here:
             linked_txns = frappe.db.get_all(
                 "Bank Transaction Payments",
@@ -545,7 +777,14 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
                     )
                 )
 
-        _update_with_retry(table, entry_name, clearance_date)
+        if _clearance_is_on_child(payment_document):
+            frappe.db.sql(
+                "UPDATE `tabSales Invoice Payment` SET `clearance_date`=%s"
+                " WHERE `parenttype`=%s AND `parent`=%s",
+                (clearance_date, payment_document, entry_name),
+            )
+        else:
+            _update_with_retry(table, entry_name, clearance_date)
         linked_any = True
 
         # Insert into Bank Transaction Payments child table (ERPNext native linking)
@@ -580,10 +819,13 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
     # is an error.
     if matched_entries and not linked_any:
         frappe.throw(
-            "Could not reconcile {0}: {1} cannot be linked to a bank transaction. "
-            "Only Payment Entries and Journal Entries can be cleared directly — "
-            "create a Payment Entry for this voucher and reconcile against that "
-            "instead.".format(bank_transaction, ", ".join(unresolved) or "the selected voucher")
+            "Could not reconcile {0}: {1} could not be matched to any voucher type "
+            "this site can clear ({2}). If this is a credit invoice, create a "
+            "Payment Entry for it and reconcile against that instead.".format(
+                bank_transaction,
+                ", ".join(unresolved) or "the selected voucher",
+                ", ".join(reconcilable),
+            )
         )
 
     # Mark bank transaction as reconciled
@@ -946,6 +1188,76 @@ def delete_reversed_transaction(bank_transaction):
     return {"status": "deleted", "name": bank_transaction}
 
 
+def _delete_bank_transaction_row(name):
+    """Cancel and hard-delete one Bank Transaction, allocation rows included."""
+    frappe.db.sql(
+        "UPDATE `tabBank Transaction` SET docstatus=2 WHERE name=%s AND docstatus=1", (name,)
+    )
+    # Child rows first: a bare parent DELETE orphans them, and ERPNext reads
+    # how much of a Payment Entry is still allocatable from exactly these rows,
+    # so orphans make a PE look permanently consumed by a transaction that no
+    # longer exists.
+    frappe.db.sql("DELETE FROM `tabBank Transaction Payments` WHERE parent=%s", (name,))
+    frappe.db.sql("DELETE FROM `tabBank Transaction` WHERE name=%s", (name,))
+
+
+@frappe.whitelist()
+def delete_reversal_pair(bank_transaction):
+    """Delete a reversal AND the transaction it cancels, in one action.
+
+    A reversal and its original net to zero — neither is real money movement,
+    and leaving them on the statement makes the closing balance reconcile only
+    by coincidence. Deleting the reversal alone leaves the original stranded,
+    looking like an unreconciled payment that never happened.
+
+    The pairing is re-derived here from the database rather than trusted from
+    the client: the browser's copy can be stale, and this permanently destroys
+    two rows.
+    """
+    frappe.only_for(["Accounts Manager", "System Manager"])
+
+    row = frappe.db.get_value(
+        "Bank Transaction", bank_transaction,
+        ["name", "bank_account", "date", "deposit", "withdrawal", "description", "status"],
+        as_dict=True,
+    )
+    if not row:
+        frappe.throw(_("Bank Transaction {0} not found.").format(bank_transaction))
+
+    siblings = frappe.db.get_all(
+        "Bank Transaction",
+        filters={"bank_account": row.bank_account, "docstatus": 1},
+        fields=["name", "date", "deposit", "withdrawal", "description", "status"],
+    )
+    rows = [dict(r) for r in siblings]
+    _pair_reversals(rows)
+
+    me = next((r for r in rows if r["name"] == bank_transaction), None)
+    if not me:
+        frappe.throw(_("Bank Transaction {0} is not open for deletion.").format(bank_transaction))
+
+    partner = me.get("recon_reversal_of") or me.get("recon_reversed_by")
+    if not partner:
+        frappe.throw(_(
+            "No reversal pair found for {0}. Use the single Delete action instead."
+        ).format(bank_transaction))
+
+    targets = [bank_transaction, partner]
+    for name in targets:
+        status = frappe.db.get_value("Bank Transaction", name, "status")
+        if (status or "") == "Reconciled":
+            frappe.throw(_(
+                "{0} is already reconciled. Un-reconcile it first, then delete the pair."
+            ).format(name))
+
+    frappe.db.commit()  # close the read snapshot before writing (avoids MySQL 1020)
+    for name in targets:
+        _delete_bank_transaction_row(name)
+    frappe.db.commit()
+
+    return {"status": "deleted", "deleted": targets}
+
+
 @frappe.whitelist()
 def bulk_delete_duplicate_transactions(bank_transactions):
     """Cancel and delete multiple Bank Transactions that are all in the Duplicate queue."""
@@ -1306,6 +1618,48 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             "payment_type": "",
         })
 
+    # Expense Claims — company-wide, on the same footing as the invoices above.
+    #
+    # The GL sweep below only finds a claim that posted straight to this bank
+    # account ("Is Paid" ticked). Sites that pay claims the normal way — claim
+    # to a payable, then a Payment Entry — have claims that never touch the
+    # bank ledger, so no Expense Claim checkbox appeared at all and the type
+    # looked unsupported. Surfacing them here makes the modal agree with the
+    # ERP Vouchers tab; _voucher_reconcilable_reason still refuses to clear one
+    # that did not move money through this bank.
+    if frappe.db.exists("DocType", "Expense Claim"):
+        ec_filters = [
+            ["posting_date", "between", [date_from, date_to]],
+            ["docstatus", "=", 1],
+        ]
+        if company:
+            ec_filters.append(["company", "=", company])
+        try:
+            ec_meta = frappe.get_meta("Expense Claim")
+            # grand_total is zeroed once a claim is paid (it tracks the unpaid
+            # balance), so take the first non-zero of these instead.
+            ec_amount_fields = [f for f in ("grand_total", "total_sanctioned_amount",
+                                            "total_claimed_amount") if ec_meta.has_field(f)]
+            ecs = frappe.db.get_all(
+                "Expense Claim",
+                filters=ec_filters,
+                fields=["name", "posting_date", "employee", "employee_name"] + ec_amount_fields,
+                order_by="posting_date desc",
+            )
+        except Exception:
+            ecs = []
+        for ec in ecs:
+            vouchers.append({
+                "name":         ec.name,
+                "type":         "Expense Claim",
+                "date":         str(ec.posting_date),
+                "party":        ec.employee_name or ec.employee or "",
+                "amount":       next((float(ec.get(f) or 0) for f in ec_amount_fields
+                                      if float(ec.get(f) or 0)), 0.0),
+                "reference":    "",
+                "payment_type": "",
+            })
+
     # Every OTHER doctype that actually posted against this bank's GL account —
     # Expense Claim, Loan Disbursement/Repayment, and anything else a given site
     # books through the bank. Discovered via GL Entry rather than by hardcoding
@@ -1340,7 +1694,13 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
             agg["net"] += float(gl.debit or 0) - float(gl.credit or 0)
             if not agg["party"] and gl.party:
                 agg["party"] = gl.party
+        # Expense Claim is fetched company-wide above, so one that ALSO posts
+        # to this bank account would otherwise be listed twice.
+        already_listed = {(v["type"], v["name"]) for v in vouchers}
+
         for (vtype, vno), agg in other_vouchers.items():
+            if (vtype, vno) in already_listed:
+                continue
             amount = abs(agg["net"])
             # A voucher whose bank-side legs cancel out moved nothing through
             # the bank; there is no amount for a bank line to match against.
@@ -1399,6 +1759,75 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
 
     vouchers.sort(key=_sort_key)
 
+    # Fill the 100 slots FAIRLY ACROSS DOCTYPES instead of taking a straight
+    # top-100 off the date sort.
+    #
+    # A busy account defeats the straight cut entirely. On a real statement
+    # month there can be 1,000+ vouchers inside the +/-60-day window; if 100 of
+    # them are Payment Entries and Journal Entries dated within a day or two of
+    # the bank line, they take every slot and NOTHING else ever reaches the
+    # browser — no Purchase Invoice, no Sales Invoice, no Expense Claim. The
+    # modal then renders its type filters from what it received, so the user is
+    # shown a two-checkbox "Journal Entry / Payment Entry" list and reasonably
+    # concludes the tool only supports those two doctypes.
+    #
+    # Round-robin one voucher per doctype, each type still in its own
+    # date-proximity order, so every doctype present in the window is
+    # represented and the common ones simply take the slots the rare ones
+    # don't need.
+    LIMIT = 100
+    if len(vouchers) > LIMIT:
+        for i, v in enumerate(vouchers):
+            v["_i"] = i
+
+        taken = set()
+        selected = []
+
+        def _keep(v):
+            selected.append(v)
+            taken.add(v["_i"])
+
+        # Never let the cap hide the AI's own suggestion or an exact-amount
+        # match — those are the two things the user is most likely hunting for.
+        if preselected_entry:
+            for v in vouchers:
+                if v["name"] == preselected_entry:
+                    _keep(v)
+                    break
+        for v in vouchers:
+            if len(selected) >= LIMIT:
+                break
+            if v["_i"] in taken:
+                continue
+            if txn_amount and abs(float(v.get("amount") or 0) - txn_amount) <= 0.01:
+                _keep(v)
+
+        by_type = {}
+        for v in vouchers:
+            if v["_i"] not in taken:
+                by_type.setdefault(v["type"], []).append(v)
+
+        types = list(by_type)
+        cursor = dict.fromkeys(types, 0)
+        while len(selected) < LIMIT and types:
+            for vtype in list(types):
+                if len(selected) >= LIMIT:
+                    break
+                rows = by_type[vtype]
+                pos = cursor[vtype]
+                if pos >= len(rows):
+                    types.remove(vtype)
+                    continue
+                _keep(rows[pos])
+                cursor[vtype] = pos + 1
+
+        # Restore natural order — the round-robin was only a selection device,
+        # the user still wants the closest-dated rows at the top.
+        selected.sort(key=_sort_key)
+        for v in selected:
+            v.pop("_i", None)
+        vouchers = selected
+
     # Pin the preselected entry to position 0 regardless of where the date sort placed it.
     # This ensures the AI-suggested match is always the first row the user sees in the modal.
     if preselected_entry:
@@ -1406,7 +1835,7 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         if idx is not None and idx != 0:
             vouchers.insert(0, vouchers.pop(idx))
 
-    return vouchers[:100]
+    return vouchers[:LIMIT]
 
 
 @frappe.whitelist()
@@ -1452,6 +1881,10 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
         limit = 100
 
     company = frappe.db.get_value("Bank Account", txn.bank_account, "company") or ""
+    # Which voucher types this site can actually clear — drives the greyed-out
+    # "NOT RECONCILABLE" state in the match window, so it never blocks a type
+    # approve_match would in fact accept.
+    reconcilable = _reconcilable_doctypes()
 
     # Escape LIKE wildcards so a voucher number containing _ or % is searched
     # literally rather than as a pattern.
@@ -1558,11 +1991,16 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
 
     # ---- Invoices (searchable, but NOT directly reconcilable) ----
     # Surfaced because reviewers search by invoice number constantly; flagged
+    # Resolved once here (not only in the GL sweep further down) because the
+    # Expense Claim search below needs it to decide can_reconcile.
+    _ec_gl_account = frappe.db.get_value("Bank Account", txn.bank_account, "account")
+
     # can_reconcile False so the UI can show why it cannot be picked, rather
     # than letting approve_match throw after the fact.
     results += _search(
         "Purchase Invoice",
-        ["name", "posting_date", "supplier", "supplier_name", "grand_total", "bill_no"],
+        ["name", "posting_date", "supplier", "supplier_name", "grand_total",
+         "bill_no", "is_paid"],
         ["name", "supplier", "supplier_name", "bill_no"],
         ["grand_total"],
         lambda pi: {
@@ -1573,14 +2011,16 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
             "amount":        float(pi.grand_total or 0),
             "reference":     pi.bill_no or "",
             "payment_type":  "",
-            "can_reconcile": False,
+            # Only a cash purchase invoice moved money through the bank; a
+            # credit invoice needs a Payment Entry first (approve_match enforces).
+            "can_reconcile": ("Purchase Invoice" in reconcilable) and bool(pi.is_paid),
             "reconciled":    False,
         },
     )
 
     results += _search(
         "Sales Invoice",
-        ["name", "posting_date", "customer", "customer_name", "grand_total"],
+        ["name", "posting_date", "customer", "customer_name", "grand_total", "is_pos"],
         ["name", "customer", "customer_name"],
         ["grand_total"],
         lambda si: {
@@ -1591,10 +2031,57 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
             "amount":        float(si.grand_total or 0),
             "reference":     "",
             "payment_type":  "",
-            "can_reconcile": False,
+            # Only a POS invoice carries a payment row that can be cleared.
+            "can_reconcile": ("Sales Invoice" in reconcilable) and bool(si.is_pos),
             "reconciled":    False,
         },
     )
+
+    # Expense Claims — searchable by claim number or employee, company-wide.
+    #
+    # The GL sweep below only reaches a claim that posted to this bank account,
+    # and the default list is confined to a +/-60-day window. A claim outside
+    # that window was therefore unreachable by ANY route: searching "HR-EXP"
+    # returned nothing at all. Since search is the escape hatch for exactly
+    # that case, it has to cover the doctype the default list can offer.
+    if frappe.db.exists("DocType", "Expense Claim"):
+        try:
+            _ec_meta = frappe.get_meta("Expense Claim")
+            # grand_total is zeroed once the claim is paid; take the first
+            # non-zero of these instead (same rule as the default list).
+            _ec_amounts = [f for f in ("grand_total", "total_sanctioned_amount",
+                                       "total_claimed_amount") if _ec_meta.has_field(f)]
+            results += _search(
+                "Expense Claim",
+                ["name", "posting_date", "employee", "employee_name"] + _ec_amounts,
+                ["name", "employee", "employee_name"],
+                _ec_amounts,
+                lambda ec: {
+                    "name":          ec.name,
+                    "type":          "Expense Claim",
+                    "date":          str(ec.posting_date or ""),
+                    "party":         ec.employee_name or ec.employee or "",
+                    "amount":        next((float(ec.get(f) or 0) for f in _ec_amounts
+                                           if float(ec.get(f) or 0)), 0.0),
+                    "reference":     "",
+                    "payment_type":  "",
+                    # Only a claim that actually posted to THIS bank account can
+                    # be cleared; one settled by a Payment Entry never moved
+                    # money through the bank (_voucher_reconcilable_reason
+                    # enforces the same rule on submit).
+                    "can_reconcile": ("Expense Claim" in reconcilable) and bool(
+                        frappe.db.exists("GL Entry", {
+                            "voucher_type": "Expense Claim",
+                            "voucher_no":   ec.name,
+                            "account":      _ec_gl_account,
+                            "is_cancelled": 0,
+                        }) if _ec_gl_account else False
+                    ),
+                    "reconciled":    False,
+                },
+            )
+        except Exception:
+            pass
 
     # ---- Other doctypes that posted to this bank's GL account ----
     # Kept consistent with the default list, which shows these too. Matched on
@@ -1620,7 +2107,15 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
             a["net"] += float(gl.debit or 0) - float(gl.credit or 0)
             if not a["party"] and gl.party:
                 a["party"] = gl.party
+        # Expense Claim is searched company-wide above, so one that ALSO posts
+        # to this bank account would be returned twice — once from that search
+        # (which knows the employee name) and once from this sweep (which does
+        # not). Keep the richer row and skip the sweep's duplicate.
+        already_found = {(v["type"], v["name"]) for v in results}
+
         for (vtype, vno), a in gl_agg.items():
+            if (vtype, vno) in already_found:
+                continue
             amount = abs(a["net"])
             if not amount:
                 continue
@@ -1632,7 +2127,7 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
                 "amount":        amount,
                 "reference":     "",
                 "payment_type":  "",
-                "can_reconcile": False,
+                "can_reconcile": vtype in reconcilable,
                 "reconciled":    False,
             })
 
@@ -1864,12 +2359,26 @@ def get_consolidatable_transactions(bank_account, from_date, to_date):
             "unallocated_amount": [">", 0],
         },
         fields=["name", "date", "deposit", "withdrawal", "description", "reference_number",
-                "unallocated_amount", "recon_matched_entries"],
+                "unallocated_amount", "recon_matched_entries", "recon_confidence"],
         order_by="date asc",
     )
-    txns = [t for t in txns if not t.get("recon_matched_entries")]
+    # Exclude only transactions carrying a match strong enough to act on.
+    #
+    # Weak matches (below the review threshold) used to be queued "Unmatched"
+    # with their entry cleared, so they arrived here consolidatable. They now
+    # sit in Review WITH their entry stored, and a plain "has an entry" test
+    # would silently drop them from the Consolidate picker — the very rows most
+    # likely to need grouping, since several small bank lines matching nothing
+    # well is what a consolidation usually is.
+    _review_threshold = float(_load_sbr_settings().get("review_threshold") or 50)
+    txns = [
+        t for t in txns
+        if not t.get("recon_matched_entries")
+        or float(t.get("recon_confidence") or 0) < _review_threshold
+    ]
     for t in txns:
         t.pop("recon_matched_entries", None)
+        t.pop("recon_confidence", None)
     return txns
 
 
@@ -2027,7 +2536,17 @@ def consolidate_selected_bank_charges(transaction_names, bank_account=None, comp
 
 @frappe.whitelist()
 def get_erp_vouchers(bank_account, from_date, to_date):
-    """Fetch submitted Payment Entries and Journal Entries for the ERP Vouchers tab."""
+    """Fetch every submitted voucher that posted to this bank account, for the
+    ERP Vouchers tab.
+
+    Payment Entry and Journal Entry are queried directly (they carry the bank
+    account in known fields). Everything else a site books through the bank —
+    Expense Claim, Loan Repayment/Disbursement, cash invoices — is discovered
+    via GL Entry, so no doctype needs hardcoding here and apps that aren't
+    installed simply contribute nothing.
+
+    A "Contra Entry" is a Journal Entry voucher_type, so it already arrives with
+    the JE fetch; its voucher_type is carried through in payment_type."""
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
 
     ba_doc = frappe.db.get_value("Bank Account", bank_account, ["account", "company"], as_dict=True) or {}
@@ -2100,6 +2619,201 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                     "payment_type": je.voucher_type or "",
                     "status":       "Cleared" if je.clearance_date else "Unreconciled",
                 })
+
+    # Sales and Purchase Invoices, company-wide rather than bank-GL scoped.
+    #
+    # A credit invoice never touches the bank account itself — the Payment
+    # Entry settling it does — so a strict bank-ledger query returns none of
+    # them. The match modal already fetches invoices company-wide, because a
+    # bank line is routinely matched against the invoice it pays. This tab was
+    # the only view that disagreed, so an invoice that WAS offered in the match
+    # window could not be found in the voucher list.
+    #
+    # Their "Cleared" state is resolved below in the same batched way as the
+    # sweep vouchers, not per row.
+    # Expense Claim rides along here for the same reason: it is reconcilable,
+    # but unless it was booked with "Is Paid" straight against the bank it is
+    # settled by a Payment Entry and so never appears in the bank ledger. It
+    # was therefore invisible on sites that pay claims the normal way.
+    # Field names verified present on both ERPNext 13 and 15.
+    invoice_specs = (
+        ("Sales Invoice",    "SI", "customer", "customer_name"),
+        ("Purchase Invoice", "PI", "supplier", "supplier_name"),
+        ("Expense Claim",    "EC", "employee", "employee_name"),
+    )
+    invoice_rows = []
+    for dtype, short, party_field, party_name_field in invoice_specs:
+        if not frappe.db.exists("DocType", dtype):
+            continue
+        inv_filters = [
+            ["posting_date", "between", [from_date, to_date]],
+            ["docstatus", "=", 1],
+        ]
+        if company:
+            inv_filters.append(["company", "=", company])
+        meta = frappe.get_meta(dtype)
+        # Fetch every amount field the doctype has and pick the first NON-ZERO
+        # one per row. Expense Claim zeroes its grand_total once the claim is
+        # paid (it tracks the unpaid balance), so keying on grand_total alone
+        # showed every settled claim as 0.00 — the real figure lives in
+        # total_sanctioned_amount.
+        amount_fields = [f for f in ("grand_total", "total_sanctioned_amount",
+                                     "total_claimed_amount") if meta.has_field(f)]
+        if not amount_fields:
+            continue
+        # Only invoices carry outstanding_amount; Expense Claim tracks
+        # settlement through its own status field instead.
+        outstanding_field = "outstanding_amount" if meta.has_field("outstanding_amount") else None
+        fields = ["name", "posting_date", party_field, party_name_field] + amount_fields
+        if outstanding_field:
+            fields.append(outstanding_field)
+        if meta.has_field("status"):
+            fields.append("status")
+        try:
+            rows = frappe.db.get_all(dtype, filters=inv_filters, fields=fields,
+                                     order_by="posting_date desc")
+        except Exception:
+            continue
+        for inv in rows:
+            if outstanding_field:
+                settled = not float(inv.get(outstanding_field) or 0)
+            else:
+                settled = (inv.get("status") or "") == "Paid"
+            invoice_rows.append({
+                "name":         inv.name,
+                "type":         dtype,
+                "type_short":   short,
+                "date":         str(inv.posting_date),
+                "party":        inv.get(party_name_field) or inv.get(party_field) or "",
+                "amount":       next((float(inv.get(f) or 0) for f in amount_fields
+                                      if float(inv.get(f) or 0)), 0.0),
+                "reference":    "",
+                # Drives the red/green amount colour the same way payment_type
+                # does for a PE: settled reads as money in, still-owed as out.
+                "payment_type": "Receive" if settled else "Pay",
+                "_settled":     settled,
+            })
+
+    if invoice_rows:
+        inv_names = {}
+        for r in invoice_rows:
+            inv_names.setdefault(r["type"], []).append(r["name"])
+        inv_cleared = set()
+        for dtype, names in inv_names.items():
+            try:
+                if _clearance_is_on_child(dtype):
+                    crows = frappe.db.get_all(
+                        "Sales Invoice Payment",
+                        filters={"parenttype": dtype, "parent": ["in", names],
+                                 "clearance_date": ["is", "set"]},
+                        fields=["parent"],
+                    )
+                    inv_cleared |= {(dtype, c.parent) for c in crows}
+                elif frappe.get_meta(dtype).has_field("clearance_date"):
+                    crows = frappe.db.get_all(
+                        dtype,
+                        filters={"name": ["in", names], "clearance_date": ["is", "set"]},
+                        fields=["name"],
+                    )
+                    inv_cleared |= {(dtype, c.name) for c in crows}
+            except Exception:
+                continue
+        for r in invoice_rows:
+            # An invoice with nothing outstanding is settled even when it was
+            # never bank-cleared directly (the PE that paid it carries the
+            # clearance), so treat either as reconciled for this tab's filter.
+            settled = r.pop("_settled", False)
+            r["status"] = ("Cleared" if ((r["type"], r["name"]) in inv_cleared or settled)
+                           else "Unreconciled")
+            vouchers.append(r)
+
+    # Every OTHER doctype that actually posted against this bank's GL account.
+    # Mirrors the GL sweep in get_erp_vouchers_for_match — this tab previously
+    # showed only Payment Entry and Journal Entry, so an Expense Claim paid
+    # straight from the bank was invisible here even though it is part of the
+    # bank ledger and is reconcilable.
+    if gl_account:
+        gl_rows = frappe.db.get_all(
+            "GL Entry",
+            filters={
+                "account":      gl_account,
+                "posting_date": ["between", [from_date, to_date]],
+                "is_cancelled": 0,
+                "voucher_type": ["not in", ["Payment Entry", "Journal Entry"]],
+            },
+            fields=["voucher_type", "voucher_no", "posting_date", "debit", "credit",
+                    "party", "remarks"],
+        )
+
+        # Net debit against credit per voucher — a voucher with legs on both
+        # sides of the bank account moved only the difference, not the sum.
+        others = {}
+        for gl in gl_rows:
+            key = (gl.voucher_type, gl.voucher_no)
+            agg = others.setdefault(key, {
+                "net": 0.0, "date": gl.posting_date,
+                "party": gl.party or "", "remarks": gl.remarks or "",
+            })
+            agg["net"] += float(gl.debit or 0) - float(gl.credit or 0)
+            if not agg["party"] and gl.party:
+                agg["party"] = gl.party
+
+        # Resolve "already cleared" in ONE query per doctype rather than one per
+        # voucher — this tab can list hundreds of rows.
+        names_by_type = {}
+        for (vtype, vno) in others:
+            names_by_type.setdefault(vtype, []).append(vno)
+
+        cleared = set()
+        for vtype, names in names_by_type.items():
+            if not frappe.db.exists("DocType", vtype):
+                continue
+            try:
+                if _clearance_is_on_child(vtype):
+                    rows = frappe.db.get_all(
+                        "Sales Invoice Payment",
+                        filters={"parenttype": vtype, "parent": ["in", names],
+                                 "clearance_date": ["is", "set"]},
+                        fields=["parent"],
+                    )
+                    cleared |= {(vtype, r.parent) for r in rows}
+                elif frappe.get_meta(vtype).has_field("clearance_date"):
+                    rows = frappe.db.get_all(
+                        vtype,
+                        filters={"name": ["in", names], "clearance_date": ["is", "set"]},
+                        fields=["name"],
+                    )
+                    cleared |= {(vtype, r.name) for r in rows}
+            except Exception:
+                # A doctype we cannot introspect must not take the whole tab
+                # down; it simply shows as Unreconciled.
+                continue
+
+        # Expense Claim and cash invoices are fetched company-wide above, so a
+        # voucher that ALSO posts to this bank account would otherwise be
+        # listed twice — once from that fetch and once from this sweep. Key on
+        # (type, name) rather than name alone: two doctypes can share a name.
+        already = {(v["type"], v["name"]) for v in vouchers}
+
+        for (vtype, vno), agg in others.items():
+            if (vtype, vno) in already:
+                continue
+            amount = abs(agg["net"])
+            if not amount:
+                continue  # legs cancelled out — nothing moved through the bank
+            vouchers.append({
+                "name":         vno,
+                "type":         vtype,
+                "type_short":   _voucher_short_code(vtype),
+                "date":         str(agg["date"] or ""),
+                "party":        agg["party"] or (agg["remarks"] or "")[:60],
+                "amount":       amount,
+                "reference":    "",
+                # Drives the red/green amount colour in the table: a negative
+                # net means money left the bank, same sense as a PE of type Pay.
+                "payment_type": "Pay" if agg["net"] < 0 else "Receive",
+                "status":       "Cleared" if (vtype, vno) in cleared else "Unreconciled",
+            })
 
     vouchers.sort(key=lambda v: v["date"], reverse=True)
     return {"vouchers": vouchers, "total": len(vouchers)}
