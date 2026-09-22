@@ -1574,15 +1574,23 @@ window.ReconUI = (function () {
                     ';font-weight:700">' + (isMany ? "AI Match" : "&#9650;" + Math.round(aiConf) + "%") +
                     '</span>';
         }
-        // Search results carry can_reconcile/reconciled; the default list does
-        // not. Only ever block on an explicit false/true so the default list's
-        // behaviour is completely unchanged.
+        // Both the default list and the search results now carry can_reconcile
+        // (search adds reconciled as well). Still only ever block on an explicit
+        // false/true, so any caller that omits the flag renders as before.
         var blocked = v.can_reconcile === false;
         var already = v.reconciled === true;
         if (blocked) {
-          aiBadge += '<span title="approve_match can only clear Payment Entries and ' +
-            'Journal Entries — create a Payment Entry for this voucher and reconcile ' +
-            'against that" style="font-size:10px;border:1px solid #94a3b8;border-radius:99px;' +
+          // Prefer the server's own reason, so the tooltip says exactly why THIS
+          // voucher cannot be cleared (unpaid expense claim, credit invoice, ...)
+          // rather than the old blanket "only PE/JE" text, which stopped being
+          // true once Expense Claims and cash invoices became clearable.
+          var blockWhy = String(v.block_reason ||
+            "This voucher never moved money through this bank account. " +
+            "Create a Payment Entry for it and reconcile against that instead.")
+            .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          aiBadge += '<span title="' + blockWhy + '" style="font-size:10px;' +
+            'border:1px solid #94a3b8;border-radius:99px;' +
             'padding:1px 7px;color:#64748b;font-weight:700">NOT RECONCILABLE</span>';
         } else if (already) {
           aiBadge += '<span title="Already cleared against a bank transaction — ' +
