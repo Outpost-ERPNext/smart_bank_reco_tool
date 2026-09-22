@@ -1835,7 +1835,31 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         if idx is not None and idx != 0:
             vouchers.insert(0, vouchers.pop(idx))
 
-    return vouchers[:LIMIT]
+    vouchers = vouchers[:LIMIT]
+
+    # Flag the rows that cannot actually be cleared, so the modal greys them out
+    # up front instead of letting the user pick one and meet a throw on Submit.
+    #
+    # search_erp_vouchers has always returned these two flags; this default list
+    # did not, which is why a credit invoice or an unpaid Expense Claim looked
+    # selectable here. The check is the same helper approve_match enforces on
+    # submit, so the greyed row and the error message can never disagree.
+    # Payment Entry and Journal Entry short-circuit inside the helper with no
+    # query, so the cost is bounded by the invoices and claims actually listed.
+    _reconcilable = _reconcilable_doctypes()
+    for v in vouchers:
+        if v.get("can_reconcile") is not None:
+            continue
+        if v["type"] not in _reconcilable:
+            v["can_reconcile"] = False
+            v["block_reason"] = "{0} cannot be cleared against a bank line on this site.".format(v["type"])
+            continue
+        reason = _voucher_reconcilable_reason(v["type"], v["name"], gl_bank_account)
+        v["can_reconcile"] = not reason
+        if reason:
+            v["block_reason"] = reason
+
+    return vouchers
 
 
 @frappe.whitelist()
