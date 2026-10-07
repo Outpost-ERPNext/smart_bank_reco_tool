@@ -218,19 +218,25 @@ class SignalCalculator:
         elif hist < 0:
             parts.append("Previously rejected by user")
 
-        # For invoices, `amount` is the OUTSTANDING balance (that's what
-        # matching_engine._get_invoice_candidates selects, and what partial-payment
-        # scoring above needs). Showing that as "the invoice amount" made the tool
-        # contradict ERP, which displays the invoice's grand total — and it also
-        # contradicted the Match-Against-Voucher list, which already shows the
-        # grand total. Display the grand total here too, and carry the outstanding
-        # separately so the partial-payment context isn't lost.
+        # Show the figure that was actually SCORED against the bank line, and
+        # name the voucher's own total underneath it.
+        #
+        # This used to be the other way round for invoices: `amount` is the
+        # outstanding balance (what partial-payment scoring above compares), but
+        # the card displayed grand_total instead. A 50.00 bank line matching an
+        # invoice with 50.00 still outstanding therefore rendered as "Amount
+        # 100%" next to an amount of 545,850.00 — the signal and the number on
+        # screen described different things, and the suggestion looked absurd.
+        # The same mismatch applies to a payment with tax withheld at source or
+        # a journal whose bank row is a fraction of the voucher.
+        #
+        # voucher_total carries the total for the secondary line; it is not what
+        # anything compares against.
         is_invoice = entry.get("entry_type") in ("Sales Invoice", "Purchase Invoice")
-        grand_total = entry.get("grand_total")
-        display_amount = (
-            grand_total if (is_invoice and grand_total is not None)
-            else entry.get("amount")
-        )
+        display_amount = entry.get("amount")
+        voucher_total = entry.get("voucher_total")
+        if voucher_total is None and is_invoice:
+            voucher_total = entry.get("grand_total")
 
         return {
             "name": entry["name"],
@@ -241,6 +247,7 @@ class SignalCalculator:
             "reasoning": ". ".join(parts) or "Low confidence match",
             "entries": [entry],
             "amount": display_amount,
+            "voucher_total": voucher_total,
             "outstanding_amount": entry.get("amount") if is_invoice else None,
             "party": entry.get("party_name") or entry.get("party"),
             "party_type": entry.get("party_type") or "",
