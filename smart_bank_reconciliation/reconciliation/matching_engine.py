@@ -7,6 +7,101 @@ from .nigerian_rules import NigerianRules
 from .draft_generator import DraftGenerator
 from .pattern_store import PatternStore
 
+def get_bank_leg_amounts(gl_account, date_from=None, date_to=None, voucher_names=None):
+    """Map {voucher_no: amount that actually moved through this bank's GL account}.
+
+    A voucher's own total is NOT what hit the bank. A payment of 600,000 with
+    1% TDS withheld debits the supplier 600,000 but only credits the bank
+    594,000 — and 594,000 is what the bank statement says. Likewise a salary
+    or bank-charge Journal Entry can be worth lakhs in total while the line
+    touching the bank is a few hundred.
+
+    Showing (and scoring) the voucher total instead of the bank leg made those
+    vouchers look like a mismatch against the very bank line they belong to.
+    The general ledger already holds the exact figure, so read it from there
+    rather than inferring it from each doctype's own amount fields.
+
+    Debits and credits are netted, not summed: a voucher carrying both legs
+    against the bank (a correction, or a transfer booked in one voucher) would
+    otherwise report the sum of the two rather than the money that moved.
+
+    The figure returned is in the BANK ACCOUNT'S OWN CURRENCY, not the company's.
+    `debit`/`credit` on a GL Entry are company currency: on a USD bank account
+    under an NGN company they hold the naira equivalent, so a line worth $353.97
+    would come back as ₦10,889,366.12 — and be compared against, and displayed
+    beside, a statement that is denominated in dollars.
+    `debit_in_account_currency` is the dollar figure, which is what the bank
+    statement shows and what Bank Transaction stores. The two columns are
+    identical on a single-currency site, so this costs nothing there; the
+    company-currency net is kept only as a fallback for old rows that never
+    populated the account-currency columns.
+    """
+    if not gl_account:
+        return {}
+
+    conditions = ["account = %(account)s", "is_cancelled = 0"]
+    values = {"account": gl_account}
+    if date_from and date_to:
+        conditions.append("posting_date BETWEEN %(date_from)s AND %(date_to)s")
+        values["date_from"] = date_from
+        values["date_to"] = date_to
+    # `is not None` deliberately: an empty list means "no vouchers to look up"
+    # and must return nothing. Treating it as "not provided" would drop the
+    # filter and sweep the account's entire ledger instead.
+    if voucher_names is not None:
+        names = tuple({n for n in voucher_names if n})
+        if not names:
+            return {}
+        conditions.append("voucher_no IN %(names)s")
+        values["names"] = names
+
+    rows = frappe.db.sql(
+        """
+        SELECT voucher_no,
+               SUM(debit_in_account_currency)  AS dr_acc,
+               SUM(credit_in_account_currency) AS cr_acc,
+               SUM(debit)                      AS dr,
+               SUM(credit)                     AS cr
+        FROM `tabGL Entry`
+        WHERE {0}
+        GROUP BY voucher_no
+        """.format(" AND ".join(conditions)),
+        values,
+        as_dict=True,
+    )
+
+    legs = {}
+    for r in rows:
+        in_account = abs(float(r["dr_acc"] or 0) - float(r["cr_acc"] or 0))
+        in_company = abs(float(r["dr"] or 0) - float(r["cr"] or 0))
+        legs[r["voucher_no"]] = in_account or in_company
+    return legs
+
+
+def apply_bank_leg_amount(voucher, bank_legs, voucher_total):
+    """Point one listed voucher at its bank-leg amount, keeping the total for display.
+
+    `amount` is what everything downstream compares against the bank line —
+    scoring, the modal's exact-amount filter, the 1:Many running total — so it
+    has to be the bank leg. `voucher_total` and `bank_leg_diff` are carried
+    alongside purely so the UI can explain a gap ("594,000 of 600,000") rather
+    than leaving it looking like the wrong voucher.
+
+    A voucher with no leg on this bank account (an unpaid invoice offered for
+    matching) keeps its own total — there is no bank figure to prefer.
+    """
+    total = float(voucher_total or 0)
+    voucher["voucher_total"] = total
+    leg = bank_legs.get(voucher.get("name"))
+    if leg is None or not leg:
+        voucher["amount"] = total
+        return voucher
+    voucher["amount"] = leg
+    if abs(leg - total) >= 0.01:
+        voucher["bank_leg_diff"] = total - leg
+    return voucher
+
+
 HIGH_VALUE_THRESHOLD = 50_000_000  # NGN 50 million
 AGING_DAYS = 10
 AUTO_THRESHOLD = 80.0
@@ -478,10 +573,24 @@ class BankMatchingEngine:
             as_dict=True,
         )
 
+        # The exact money that moved through this bank account, per voucher.
+        # One indexed query over the same window the candidates came from, so
+        # both the Payment Entry and the Journal Entry loops below can swap
+        # their own voucher totals for the figure the bank actually saw.
+        bank_legs = get_bank_leg_amounts(gl_account, date_from, date_to)
+
         pe_list = list(pe_rows)
         for pe in pe_list:
             pe["entry_type"] = "Payment Entry"
-            pe["amount"] = float(pe.get("received_amount") or pe.get("paid_amount") or 0)
+            # paid_amount/received_amount is the gross figure. Anything withheld
+            # on the way out (TDS/WHT) never reached the bank, so scoring the
+            # gross against the statement line reported a mismatch on a payment
+            # that is in fact exact — at a 2% deduction the amount signal scored
+            # zero and the match was lost entirely.
+            apply_bank_leg_amount(
+                pe, bank_legs,
+                float(pe.get("received_amount") or pe.get("paid_amount") or 0),
+            )
 
         # Journal Entries — only those that have at least one account row touching
         # this bank's GL account (e.g. bank charges, salary JEs, petty cash).
@@ -506,7 +615,14 @@ class BankMatchingEngine:
         je_list = list(je_list)
         for je in je_list:
             je["entry_type"] = "Journal Entry"
-            je["amount"] = float(je.get("total_debit") or je.get("total_credit") or 0)
+            # total_debit is the whole voucher. A JE is selected here because ONE
+            # of its rows touches the bank, and that row is all the bank line can
+            # match — a 500,000 salary JE carrying a 450 bank charge must offer
+            # 450, not 500,000.
+            apply_bank_leg_amount(
+                je, bank_legs,
+                float(je.get("total_debit") or je.get("total_credit") or 0),
+            )
 
         return pe_list + je_list + self._get_invoice_candidates(date_from, date_to)
 
@@ -530,6 +646,12 @@ class BankMatchingEngine:
             si["party_type"] = "Customer"
             si["name"] = si["reference_no"]
             si["party_name"] = si.get("customer_name")
+            # An invoice has no leg on the bank account — it is offered as
+            # "this bank line settles this invoice", so the figure scored is the
+            # outstanding balance (already aliased to `amount`). Carry the
+            # invoice total separately so the UI can show both and a part-paid
+            # invoice stops looking like the wrong amount.
+            si["voucher_total"] = float(si.get("grand_total") or 0)
 
         pi_list = frappe.db.sql(
             """
@@ -550,6 +672,7 @@ class BankMatchingEngine:
             pi["party_type"] = "Supplier"
             pi["name"] = pi["reference_no"]
             pi["party_name"] = pi.get("supplier_name")
+            pi["voucher_total"] = float(pi.get("grand_total") or 0)
 
         return list(si_list) + list(pi_list)
 

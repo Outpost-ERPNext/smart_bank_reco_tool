@@ -566,6 +566,18 @@ function sbr_build_toolbar(frm) {
   // automatically when Bank Account + date range are set
   // (sbr_debounce_filter_load), so this being disabled doesn't block anything.
   frm.page.add_inner_button(__("Fetch Bank Transactions"), function () {}).prop("disabled", true).css("opacity", "0.5");
+  frm.page.add_inner_button(__("⟳ Refresh"), function () {
+    if (!frm.doc.bank_account || !frm.doc.bank_statement_from_date || !frm.doc.bank_statement_to_date) {
+      frappe.msgprint(__("Please set Bank Account and date range first."));
+      return;
+    }
+    // Reload the data only. AI is deliberately NOT re-run: refreshing after a
+    // reconciliation should show the current position, not re-score the whole
+    // period (which is slow and would discard reviewer decisions in progress).
+    frm._sbr_no_auto_ai = true;
+    sbr_load_transactions(frm);
+    frappe.show_alert({ message: __("Refreshed."), indicator: "green" });
+  });
   frm.page.add_inner_button(__("↺ Reset AI"), function () {
     if (!frm.doc.bank_account || !frm.doc.bank_statement_from_date || !frm.doc.bank_statement_to_date) {
       frappe.msgprint(__("Please set Bank Account and date range first."));
@@ -1096,7 +1108,8 @@ function sbr_handle_modal_confirm(frm, $canvas, txnName, result, $modal) {
     // 1:Many returns selectedVouchers (array of {name,amount}); 1:1 returns selectedVoucher (string)
     var entriesToReconcile = result.selectedVouchers ||
         (result.selectedVoucher ? [{ name: result.selectedVoucher, amount: 0 }] : []);
-    sbr_approve_group(members, entriesToReconcile, function (failed) {
+
+    function _afterMatch(failed) {
       $modal.remove();
       members.forEach(function (n) { if (failed.indexOf(n) === -1) sbr_mark_row_reconciled($canvas, n); });
       if (failed.length) {
@@ -1107,7 +1120,28 @@ function sbr_handle_modal_confirm(frm, $canvas, txnName, result, $modal) {
           indicator: "green",
         });
       }
-    });
+    }
+
+    // Hand-picked vouchers against a CONSOLIDATED group have to be split across
+    // its member lines, not repeated in full against each one — see
+    // approve_group_match. sbr_approve_group's repeat-to-every-member is only
+    // safe when the entries carry no amounts (each member then falls back to
+    // its own bank amount), which is the single-select case below.
+    if (members.length > 1 && result.selectedVouchers && result.selectedVouchers.length) {
+      frappe.call({
+        method: "smart_bank_reconciliation.reconciliation.api.approve_group_match",
+        args: { bank_transactions: members, matched_entries: result.selectedVouchers },
+        freeze: true,
+        freeze_message: __("Reconciling the group…"),
+        callback: function (r) {
+          if (r.exc) { _afterMatch(members); return; }
+          _afterMatch(Object.keys((r.message || {}).failed || {}));
+        },
+      });
+      return;
+    }
+
+    sbr_approve_group(members, entriesToReconcile, _afterMatch);
   } else if (result.pane === "createVoucher") {
     $modal.remove();
     $(document).off("keydown.sbrmodal");
@@ -1497,7 +1531,112 @@ function sbr_open_update_transaction_dialog(txnName) {
 }
 
 /* ── Unreconcile a Bank Transaction ── */
+/* ── Unreconcile a CONSOLIDATED group ──────────────────────────────────────
+   The table shows a group as one row carrying one member's name, so the
+   ordinary dialog below could only ever free that one member — the rest stayed
+   reconciled, with their vouchers still cleared and no row left on screen that
+   could reach them. A group is reconciled as one unit, so it comes apart as one
+   unit: every line, every voucher, one confirmation. ── */
+function sbr_open_unreconcile_group_dialog(frm, $canvas, txnName, members) {
+  frappe.call({
+    method: "smart_bank_reconciliation.reconciliation.api.get_linked_payment_entries_for_group",
+    args: { bank_transaction_name: txnName },
+    callback: function (resp) {
+      if (resp.exc) return;
+      var res     = resp.message || {};
+      var entries = res.entries || [];
+      var lines   = res.members || members || [];
+      if (!entries.length) {
+        frappe.show_alert({
+          message: __("No linked vouchers found on this consolidated group."),
+          indicator: "orange",
+        });
+        return;
+      }
+
+      var rowsHtml = entries.map(function (e, i) {
+        var route = (e.payment_document || "").toLowerCase().replace(/ /g, "-");
+        return '<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;' +
+          (i > 0 ? "border-top:1px solid #e5e7eb;" : "") + 'font-size:12px">' +
+          '<span style="font-family:ui-monospace,monospace;color:#64748b;min-width:168px">' +
+            e.parent + '</span>' +
+          '<span style="flex:1;font-family:ui-monospace,monospace">' +
+            '<a href="/app/' + route + '/' + encodeURIComponent(e.payment_entry) +
+            '" target="_blank" style="color:#1d4ed8;text-decoration:none">' +
+            e.payment_entry + '</a>' +
+            '<span style="color:#94a3b8"> · ' + (e.payment_document || "") + '</span>' +
+          '</span>' +
+          '<span style="font-variant-numeric:tabular-nums;font-weight:600;color:#0f172a">' +
+            ReconUI.fmtCurrency(parseFloat(e.allocated_amount || 0)) + '</span>' +
+          '</div>';
+      }).join("");
+
+      var d = new frappe.ui.Dialog({
+        title: __("Unreconcile Consolidated Group"),
+        fields: [{ fieldtype: "HTML", options:
+          '<div style="background:#ecfeff;border:1px solid #a5f3fc;border-radius:6px;' +
+          'padding:9px 12px;margin-bottom:12px;font-size:12px;color:#155e75">' +
+          __("This row is <b>{0} bank transactions</b> consolidated into one. " +
+             "They were reconciled together, so they are released together — " +
+             "all {1} voucher link(s) below are removed.",
+             [lines.length, entries.length]) +
+          '</div>' +
+          '<div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden;' +
+          'max-height:240px;overflow-y:auto">' + rowsHtml + '</div>' +
+          '<div style="margin-top:12px;padding:10px 12px;background:#fef3c7;' +
+          'border:1px solid #fde68a;border-radius:6px;font-size:12px;color:#92400e;line-height:1.5">' +
+          '<strong>What this does:</strong> Removes each bank-to-voucher link and clears the ' +
+          '<em>clearance date</em> on every voucher listed. The vouchers\' accounting ' +
+          'allocation to invoices is <strong>not</strong> affected — the books stay balanced. ' +
+          'The lines remain consolidated; use <b>Unconsolidate</b> to split them up.' +
+          '</div>',
+        }],
+        primary_action_label: __("Unreconcile All"),
+        primary_action: function () {
+          d.disable_primary_action();
+          frappe.call({
+            method: "smart_bank_reconciliation.reconciliation.api.unreconcile_consolidated_group",
+            args: { bank_transaction_name: txnName },
+            freeze: true,
+            freeze_message: __("Releasing the group…"),
+            callback: function (r) {
+              if (r.exc) { d.enable_primary_action(); return; }
+              var out = r.message || {};
+              d.hide();
+              if (out.failed && Object.keys(out.failed).length) {
+                frappe.show_alert({
+                  message: __("Some lines could not be released: {0}",
+                              [Object.keys(out.failed).join(", ")]),
+                  indicator: "red",
+                }, 10);
+              } else {
+                frappe.show_alert({
+                  message: __("Released {0} voucher link(s) across {1} bank transactions.",
+                              [out.unreconciled || entries.length, (out.members || lines).length]),
+                  indicator: "green",
+                });
+              }
+              // Several rows changed state behind one collapsed row, so repaint
+              // from the data rather than patching the DOM. AI is not re-run.
+              frm._sbr_no_auto_ai = true;
+              sbr_load_transactions(frm);
+            },
+          });
+        },
+      });
+      d.show();
+    },
+  });
+}
+
 function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
+  // A consolidated row stands for several bank lines; releasing only the one
+  // whose name it carries left the others reconciled and unreachable.
+  var _members = sbr_group_members($canvas, txnName);
+  if (_members && _members.length > 1) {
+    sbr_open_unreconcile_group_dialog(frm, $canvas, txnName, _members);
+    return;
+  }
   frappe.call({
     method: "frappe.client.get_value",
     args: {
@@ -1611,7 +1750,12 @@ function sbr_open_unreconcile_dialog(frm, $canvas, txnName) {
 
                   // ── Update the row in the Bank Transactions table ──────────
                   var $row = $canvas.find('.sbr-row[data-txn="' + txnName + '"]');
-                  $row.removeClass("sbr-row-done").attr("data-queue", "Unreconciled");
+                  // Mirror the queue the server just assigned, so the tiles and the
+                  // queue filter agree with the database. "Unreconciled" is a status,
+                  // not a queue, and tagging the row with it dropped the line out of
+                  // every tile instead of moving it to the right one.
+                  $row.removeClass("sbr-row-done")
+                      .attr("data-queue", (res.message || {}).recon_queue || "Unmatched");
 
                   // Restore checkbox
                   $row.find("td.sbr-check-col").html(
@@ -1676,6 +1820,10 @@ function sbr_mark_row_reconciled($canvas, txnName) {
     .css("opacity", ".45")
     .find(".sbr-card-actions")
     .html('<p class="sbr-success">&#10003; Reconciled.</p>');
+
+  // The row has moved queue, so the tiles above it are now stale. Recount them
+  // from the table rather than leaving the user to reload the browser.
+  if (window.ReconUI && ReconUI.refreshQueueTiles) ReconUI.refreshQueueTiles($canvas);
 }
 
 /* ── Consolidate Bank Charges modal (two-panel, auto-identified charges) ── */
@@ -2646,6 +2794,45 @@ function sbr_bind_card_actions(frm, $canvas) {
   $canvas.on("click", ".sbr-btn-unreconcile", function (e) {
     e.stopPropagation();
     sbr_open_unreconcile_dialog(frm, $canvas, $(this).data("txn"));
+  });
+
+  // Split a consolidated group back into its individual bank lines. Nothing is
+  // deleted — consolidation only tags the rows — so this is fully reversible in
+  // both directions. A reload follows because one row becomes several, which
+  // changes the tiles, the totals and the running balance.
+  $canvas.off("click", ".sbr-btn-unconsolidate");
+  $canvas.on("click", ".sbr-btn-unconsolidate", function (e) {
+    e.stopPropagation();
+    var txn     = $(this).data("txn");
+    var members = sbr_group_members($canvas, txn) || [];
+    frappe.confirm(
+      __("Split this consolidated group back into {0} separate bank transactions?" +
+         "<br><br>Nothing is deleted. Each line returns to the list on its own and " +
+         "is re-checked for its own match.",
+         [members.length || 2]),
+      function () {
+        frappe.call({
+          method: "smart_bank_reconciliation.reconciliation.api.unconsolidate_transactions",
+          args: { bank_transaction: txn },
+          freeze: true,
+          freeze_message: __("Splitting the group…"),
+          callback: function (r) {
+            if (r.exc) return;
+            var res = r.message || {};
+            frappe.show_alert({
+              message: __("Split into {0} transactions.", [res.count || members.length]),
+              indicator: "green",
+            });
+            // The collapsed row has to become several rows, so a targeted DOM
+            // patch cannot express the result — reload the data. AI is NOT
+            // re-run for the whole statement: the server already re-scored
+            // just the freed rows.
+            frm._sbr_no_auto_ai = true;
+            sbr_load_transactions(frm);
+          },
+        });
+      }
+    );
   });
 
   // Delete a bank line the tool flagged as a reversal/bounce. Permanent, so it

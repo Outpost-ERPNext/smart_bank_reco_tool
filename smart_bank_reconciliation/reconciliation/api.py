@@ -3,7 +3,11 @@ import re
 import frappe
 from frappe import _
 from frappe.utils import nowdate, getdate, flt, add_days
-from .matching_engine import BankMatchingEngine
+from .matching_engine import (
+    BankMatchingEngine,
+    apply_bank_leg_amount,
+    get_bank_leg_amounts,
+)
 
 # The Select field also allows "Pending" (its default/unscored state) and blank/NULL for
 # transactions never run through the matching engine. Any value outside this known-outcome
@@ -125,6 +129,46 @@ _REVERSAL_MARK = re.compile(
 )
 # Below this many comparable characters a narration is too generic to pair on.
 _REVERSAL_MIN_CORE = 8
+
+
+def _match_target_amount(txn):
+    """The amount this row is actually asking to clear.
+
+    A consolidated group is several bank lines collapsed into ONE row showing
+    their combined total, and the voucher that clears it is the one matching
+    that total — not any single member's amount. The modal opens on one
+    member's name, so the server was ranking, capping and amount-matching
+    against that member alone while the browser filtered on the group total.
+    The voucher the user wanted could therefore be cut from the 100 rows sent,
+    and "exact amount" would then report no match at all for a group whose
+    total matches a voucher exactly.
+
+    Members are summed net (deposits positive, withdrawals negative), the same
+    way _consolidate_via_existing_match scores the group in the first place, so
+    both paths agree on what the group is worth.
+
+    Takes the row dict; it must carry recon_match_type and recon_run_id.
+    """
+    own = abs(float(txn.get("deposit") or 0) - float(txn.get("withdrawal") or 0))
+    if txn.get("recon_match_type") != "Consolidated" or not txn.get("recon_run_id"):
+        return own
+
+    members = frappe.db.get_all(
+        "Bank Transaction",
+        filters={
+            "recon_run_id":     txn.get("recon_run_id"),
+            "recon_match_type": "Consolidated",
+            "docstatus":        1,
+        },
+        fields=["deposit", "withdrawal"],
+    )
+    # A "group" of one is not a group — the table leaves it as a normal row, so
+    # the server must treat it the same way.
+    if len(members) < 2:
+        return own
+    total = sum(float(m.get("deposit") or 0) - float(m.get("withdrawal") or 0)
+                for m in members)
+    return abs(total) or own
 
 
 def _narration_core(desc):
@@ -828,11 +872,25 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
             )
         )
 
-    # Mark bank transaction as reconciled
+    # Mark bank transaction as reconciled.
+    #
+    # allocated_amount is re-derived from the reference rows just written, not
+    # left where it was. Only unallocated_amount was being set here, so a line
+    # reconciled through this tool ended up with payment rows worth the full
+    # amount but allocated_amount still 0 — ERPNext's own Bank Transaction form
+    # and reports read that field, and unreconcile_bank_transaction recomputes
+    # it from the same child rows, so the two halves disagreed until something
+    # else happened to rewrite it.
+    allocated = frappe.db.sql(
+        """SELECT COALESCE(SUM(allocated_amount), 0)
+           FROM `tabBank Transaction Payments` WHERE parent = %s""",
+        (bank_transaction,),
+    )[0][0]
     frappe.db.set_value("Bank Transaction", bank_transaction, {
         "recon_queue": "Reconciled",
         "recon_user_action": "Accepted",
         "status": "Reconciled",
+        "allocated_amount": flt(allocated),
         "unallocated_amount": 0,
     })
 
@@ -850,6 +908,106 @@ def approve_match(bank_transaction, matched_entries, match_type=None):
     frappe.db.commit()
 
     return {"status": "ok", "clearance_date": clearance_date}
+
+
+@frappe.whitelist()
+def approve_group_match(bank_transactions, matched_entries):
+    """Clear several ERP vouchers against several bank lines that were consolidated.
+
+    approve_match allocates a given {name, amount} to ONE bank transaction. The
+    caller used to hand the same list to every member of a consolidated group,
+    which was harmless while the list carried no amounts (each member then fell
+    back to its own bank amount) but over-allocates the moment the user picks
+    the vouchers by hand: a group of three lines matched to three vouchers would
+    book all three vouchers in full against each of the three lines.
+
+    The group's lines and the chosen vouchers add up to the same total — the
+    modal refuses to submit otherwise — so they are filled against each other in
+    order, splitting a voucher across two lines where one line cannot absorb it.
+    Partial allocation of a voucher to a bank transaction is what Bank
+    Transaction Payments rows are for, and approve_match already allows the
+    members of one Consolidate group to share a voucher between them.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    if isinstance(bank_transactions, str):
+        bank_transactions = json.loads(bank_transactions)
+    if isinstance(matched_entries, str):
+        matched_entries = json.loads(matched_entries)
+    if not bank_transactions or not matched_entries:
+        frappe.throw(_("Select at least one bank transaction and one voucher."))
+
+    rows = frappe.db.get_all(
+        "Bank Transaction",
+        filters={"name": ["in", bank_transactions], "docstatus": 1},
+        fields=["name", "deposit", "withdrawal"],
+    )
+    found = {r["name"]: r for r in rows}
+    missing = [n for n in bank_transactions if n not in found]
+    if missing:
+        frappe.throw(_("Bank Transaction(s) not found: {0}").format(", ".join(missing)))
+
+    # Keep the caller's order on both sides so the split is reproducible.
+    members = [
+        (n, abs(float(found[n].get("deposit") or 0) - float(found[n].get("withdrawal") or 0)))
+        for n in bank_transactions
+    ]
+    vouchers = [
+        (e["name"] if isinstance(e, dict) else e,
+         float((e or {}).get("amount") or 0) if isinstance(e, dict) else 0.0)
+        for e in matched_entries
+    ]
+
+    bank_total    = sum(a for _, a in members)
+    voucher_total = sum(a for _, a in vouchers)
+    if not bank_total:
+        frappe.throw(_("These bank transactions have no amount to reconcile."))
+    # Without per-voucher amounts there is nothing to split; let approve_match
+    # apply its own even division per member, exactly as before.
+    if voucher_total and abs(voucher_total - bank_total) >= 0.01:
+        frappe.throw(_(
+            "The selected vouchers total {0} but these bank transactions total {1}. "
+            "A bank line has to be accounted for in full."
+        ).format(frappe.format_value(voucher_total, {"fieldtype": "Currency"}),
+                 frappe.format_value(bank_total, {"fieldtype": "Currency"})))
+
+    if not voucher_total:
+        per_member = {n: [v for v, _a in vouchers] for n, _amt in members}
+    else:
+        per_member = {n: [] for n, _ in members}
+        mi = vi = 0
+        rem_m = members[0][1]
+        rem_v = vouchers[0][1]
+        # 0.005 — half a minor unit. Anything smaller is rounding, not a balance.
+        while mi < len(members) and vi < len(vouchers):
+            take = min(rem_m, rem_v)
+            if take > 0:
+                per_member[members[mi][0]].append(
+                    {"name": vouchers[vi][0], "amount": round(take, 2)}
+                )
+            rem_m -= take
+            rem_v -= take
+            if rem_m < 0.005:
+                mi += 1
+                if mi < len(members):
+                    rem_m = members[mi][1]
+            if rem_v < 0.005:
+                vi += 1
+                if vi < len(vouchers):
+                    rem_v = vouchers[vi][1]
+
+    results = {}
+    failed = {}
+    for name, _amt in members:
+        entries = per_member.get(name) or []
+        if not entries:
+            continue
+        try:
+            results[name] = approve_match(name, entries)
+        except Exception as exc:
+            failed[name] = str(exc)
+
+    return {"approved": list(results), "failed": failed, "allocation": per_member}
 
 
 @frappe.whitelist()
@@ -1500,7 +1658,9 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
 
     txn = frappe.db.get_value(
         "Bank Transaction", bank_transaction,
-        ["deposit", "withdrawal", "date", "bank_account"],
+        ["deposit", "withdrawal", "date", "bank_account",
+         # Needed by _match_target_amount to recognise a consolidated group.
+         "recon_match_type", "recon_run_id"],
         as_dict=True,
     )
     if not txn:
@@ -1678,7 +1838,8 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
                 "is_cancelled": 0,
                 "voucher_type": ["not in", ["Payment Entry", "Journal Entry"]],
             },
-            fields=["voucher_type", "voucher_no", "posting_date", "debit", "credit", "party"],
+            fields=["voucher_type", "voucher_no", "posting_date", "debit", "credit",
+                    "debit_in_account_currency", "credit_in_account_currency", "party"],
         )
         # One voucher can post several lines against the bank account; net them
         # so each voucher appears once with its true bank-side movement.
@@ -1691,7 +1852,14 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         for gl in gl_rows:
             key = (gl.voucher_type, gl.voucher_no)
             agg = other_vouchers.setdefault(key, {"net": 0.0, "date": gl.posting_date, "party": gl.party or ""})
-            agg["net"] += float(gl.debit or 0) - float(gl.credit or 0)
+            # Account currency, not company currency: debit/credit hold the
+            # company-currency equivalent, so on a USD bank account under an
+            # NGN company they report naira against a dollar statement.
+            # debit/credit remain the fallback for rows predating the
+            # account-currency columns.
+            agg["net"] += (float(gl.debit_in_account_currency or 0)
+                           - float(gl.credit_in_account_currency or 0)) or (
+                           float(gl.debit or 0) - float(gl.credit or 0))
             if not agg["party"] and gl.party:
                 agg["party"] = gl.party
         # Expense Claim is fetched company-wide above, so one that ALSO posts
@@ -1712,6 +1880,9 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
                 "date":         str(agg["date"] or ""),
                 "party":        agg["party"],
                 "amount":       amount,
+                # Derived from the bank's own GL rows, so it already IS the bank
+                # leg — flagged here so the pass below leaves it alone.
+                "voucher_total": amount,
                 "reference":    "",
                 "payment_type": "",
             })
@@ -1738,6 +1909,28 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
         if preselected_entry not in existing_names:
             _inject_preselected(preselected_entry, vouchers)
 
+    # Replace each voucher's own total with the amount that actually moved
+    # through this bank account.
+    #
+    # A payment of 600,000 with 1% TDS withheld shows 600,000 on the Payment
+    # Entry but credits the bank 594,000 — and 594,000 is the figure on the
+    # statement line the user is trying to clear. Listing the gross made the
+    # right voucher read as the wrong amount, hid it from the "exact amount"
+    # filter, and left the 1:Many running total unable to reach the bank
+    # figure. The same applies to a Journal Entry whose bank row is a small
+    # charge inside a much larger voucher.
+    #
+    # Done here, after the preselected entry is injected and before the sort
+    # and the 100-row cap, so both of those also rank on the corrected figure.
+    if gl_bank_account:
+        _bank_legs = get_bank_leg_amounts(gl_bank_account, date_from, date_to)
+        for v in vouchers:
+            # GL-sweep rows set voucher_total themselves — their amount is
+            # already the netted bank movement.
+            if "voucher_total" in v:
+                continue
+            apply_bank_leg_amount(v, _bank_legs, v.get("amount"))
+
     # Sort all vouchers by date proximity to the bank transaction, but float
     # amount matches to the top first.
     #
@@ -1749,7 +1942,9 @@ def get_erp_vouchers_for_match(bank_transaction, preselected_entry=None):
     # searched (Expense Claim and friends, via the GL sweep above) puts more
     # vouchers in competition for those 100 slots, so make the ones the user is
     # actually hunting for immune to the cut.
-    txn_amount = abs(float(txn.deposit or 0) - float(txn.withdrawal or 0))
+    # The group total when this row is a consolidated group, otherwise the
+    # transaction's own amount — see _match_target_amount.
+    txn_amount = _match_target_amount(txn)
 
     def _sort_key(v):
         amount_gap = abs(float(v.get("amount") or 0) - txn_amount)
@@ -1887,7 +2082,8 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
 
     txn = frappe.db.get_value(
         "Bank Transaction", bank_transaction,
-        ["deposit", "withdrawal", "date", "bank_account"],
+        ["deposit", "withdrawal", "date", "bank_account",
+         "recon_match_type", "recon_run_id"],
         as_dict=True,
     )
     if not txn:
@@ -2149,16 +2345,36 @@ def search_erp_vouchers(bank_transaction, query=None, amount_tolerance=None,
                 "date":          str(a["date"] or ""),
                 "party":         a["party"],
                 "amount":        amount,
+                # Netted from the bank's own GL rows — already the bank leg.
+                "voucher_total": amount,
                 "reference":     "",
                 "payment_type":  "",
                 "can_reconcile": vtype in reconcilable,
                 "reconciled":    False,
             })
 
+    # Same bank-leg correction the default list applies, so a voucher found by
+    # search reports the figure that reached the bank rather than its own gross
+    # total (see get_erp_vouchers_for_match). Scoped to the names actually
+    # found — this endpoint deliberately has no date window, so looking the
+    # legs up by date range would sweep the account's entire history.
+    if gl_bank_account:
+        _search_legs = get_bank_leg_amounts(
+            gl_bank_account,
+            voucher_names=[v["name"] for v in results if "voucher_total" not in v],
+        )
+        for v in results:
+            if "voucher_total" in v:
+                continue
+            apply_bank_leg_amount(v, _search_legs, v.get("amount"))
+
     # Usable rows first (reconcilable and not already cleared), then closest to
     # the bank transaction's own amount, then newest - so the row the reviewer
     # most likely wants is at the top and never lost to the result cap.
-    bank_amount = abs(float(txn.deposit or 0) - float(txn.withdrawal or 0))
+    # Ranked against the group total for a consolidated row, same as the
+    # default list — otherwise a search would push the voucher matching the
+    # group below vouchers matching one member.
+    bank_amount = _match_target_amount(txn)
 
     # Two passes, relying on Python's stable sort: newest first, then rank on
     # top of that. Clearer than expressing a descending date inside a single
@@ -2371,6 +2587,100 @@ def consolidate_transactions(transaction_names, company=None):
 
 
 @frappe.whitelist()
+def unconsolidate_transactions(bank_transaction):
+    """Break a consolidated group back into its individual bank lines.
+
+    Consolidation creates no document — it only tags each member with a shared
+    recon_run_id and a "Consolidated" match type (see
+    _consolidate_via_existing_match), which is what makes the table collapse
+    them into one row. Undoing it is therefore just clearing those tags; there
+    is nothing to cancel or delete.
+
+    Called with ANY member of the group; the whole group is resolved from the
+    shared run id, because the table only ever shows the group's representative
+    row and that is the name the button carries.
+
+    A group whose match has already been approved is refused rather than
+    silently broken apart: approve_match wrote a Bank Transaction Payments row
+    against each member, and clearing the grouping would leave those
+    allocations in place with no way to see what they belonged to. Unreconcile
+    first, then unconsolidate.
+    """
+    frappe.only_for(["Accounts Manager", "System Manager"])
+
+    row = frappe.db.get_value(
+        "Bank Transaction", bank_transaction,
+        ["name", "recon_match_type", "recon_run_id", "bank_account"],
+        as_dict=True,
+    )
+    if not row:
+        frappe.throw(_("Bank Transaction {0} not found.").format(bank_transaction))
+    if row.get("recon_match_type") != "Consolidated" or not row.get("recon_run_id"):
+        frappe.throw(_("{0} is not part of a consolidated group.").format(bank_transaction))
+
+    members = frappe.db.get_all(
+        "Bank Transaction",
+        filters={
+            "recon_run_id":     row["recon_run_id"],
+            "recon_match_type": "Consolidated",
+            "docstatus":        1,
+        },
+        fields=["name", "date", "status", "bank_account"],
+    )
+    if len(members) < 2:
+        frappe.throw(_("{0} is not part of a consolidated group.").format(bank_transaction))
+
+    reconciled = [m["name"] for m in members if m.get("status") == "Reconciled"]
+    if reconciled:
+        frappe.throw(_(
+            "This consolidated group has already been reconciled ({0}). "
+            "Unreconcile it first, then unconsolidate."
+        ).format(", ".join(reconciled)))
+
+    for m in members:
+        frappe.db.set_value("Bank Transaction", m["name"], {
+            "recon_match_type":      "",
+            "recon_run_id":          "",
+            "recon_user_action":     "",
+            "recon_matched_entries": "",
+            "recon_confidence":      0,
+            "recon_ai_reasoning":    "",
+            "recon_signals_json":    "",
+            "recon_queue":           "Unmatched",
+        })
+    frappe.db.commit()
+
+    # Re-score the freed rows individually so each one comes back with its own
+    # suggestion straight away, instead of sitting in Unmatched until the next
+    # full AI run. Best-effort: the rows are already cleanly ungrouped above, so
+    # a failure here costs the user a Reset AI, not their data.
+    rescored = False
+    try:
+        bank_account = row.get("bank_account") or members[0].get("bank_account")
+        dates = [m["date"] for m in members if m.get("date")]
+        company = frappe.db.get_value("Bank Account", bank_account, "company")
+        if bank_account and dates and company:
+            BankMatchingEngine(
+                bank_account, min(dates), max(dates), company,
+                settings=_load_sbr_settings(),
+                only_names=[m["name"] for m in members],
+            ).run()
+            frappe.db.commit()
+            rescored = True
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "SBR: re-score after unconsolidate failed",
+        )
+
+    return {
+        "transactions": [m["name"] for m in members],
+        "count":        len(members),
+        "rescored":     rescored,
+    }
+
+
+@frappe.whitelist()
 def get_consolidatable_transactions(bank_account, from_date, to_date):
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     txns = frappe.db.get_all(
@@ -2576,6 +2886,17 @@ def get_erp_vouchers(bank_account, from_date, to_date):
     ba_doc = frappe.db.get_value("Bank Account", bank_account, ["account", "company"], as_dict=True) or {}
     gl_account = ba_doc.get("account")
     company    = ba_doc.get("company")
+
+    # The currency this tab's amounts are headed with. Every bank-ledger
+    # voucher is reported in it (that is what the statement is in); an invoice
+    # raised in some other currency carries its own, so the row can say so
+    # rather than silently presenting one currency's number under another's
+    # symbol.
+    bank_currency = (frappe.db.get_value("Account", gl_account, "account_currency")
+                     if gl_account else None) or \
+                    (frappe.db.get_value("Company", company, "default_currency")
+                     if company else None) or ""
+
     vouchers = []
 
     # Payment Entries scoped to the bank GL account (paid_from OR paid_to = gl_account)
@@ -2596,9 +2917,17 @@ def get_erp_vouchers(bank_account, from_date, to_date):
     else:
         pe_rows = []
 
+    # The amount that actually crossed THIS bank account, in the bank's own
+    # currency — see get_bank_leg_amounts. This tab showed each voucher's own
+    # total instead, which was wrong twice over on a foreign-currency account:
+    # wrong figure (a journal's whole total rather than its bank row) and wrong
+    # currency (company currency under a heading showing the bank's symbol), so
+    # a $353.97 bank row was listed as "$ 10,889,366.12" — the naira total.
+    bank_legs = get_bank_leg_amounts(gl_account, from_date, to_date) if gl_account else {}
+
     for pe in pe_rows:
         amount = float(pe.paid_amount or 0) or float(pe.received_amount or 0)
-        vouchers.append({
+        row = {
             "name":         pe.name,
             "type":         "Payment Entry",
             "type_short":   "PE",
@@ -2608,7 +2937,10 @@ def get_erp_vouchers(bank_account, from_date, to_date):
             "reference":    pe.reference_no or "",
             "payment_type": pe.payment_type or "",
             "status":       "Cleared" if pe.clearance_date else "Unreconciled",
-        })
+            "currency":     bank_currency,
+        }
+        apply_bank_leg_amount(row, bank_legs, amount)
+        vouchers.append(row)
 
     # Journal Entries linked to the bank GL account
     if gl_account:
@@ -2632,7 +2964,7 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                 order_by="posting_date desc",
             )
             for je in jes:
-                vouchers.append({
+                row = {
                     "name":         je.name,
                     "type":         "Journal Entry",
                     "type_short":   "JE",
@@ -2642,7 +2974,13 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                     "reference":    je.cheque_no or "",
                     "payment_type": je.voucher_type or "",
                     "status":       "Cleared" if je.clearance_date else "Unreconciled",
-                })
+                    "currency":     bank_currency,
+                }
+                # total_debit is the whole voucher in company currency. An
+                # Exchange Rate Revaluation journal touches every bank account
+                # at once, so its total says nothing about this one.
+                apply_bank_leg_amount(row, bank_legs, float(je.total_debit or 0))
+                vouchers.append(row)
 
     # Sales and Purchase Invoices, company-wide rather than bank-GL scoped.
     #
@@ -2693,6 +3031,12 @@ def get_erp_vouchers(bank_account, from_date, to_date):
             fields.append(outstanding_field)
         if meta.has_field("status"):
             fields.append("status")
+        # grand_total is in the INVOICE's currency, which need not be the bank's
+        # or even the company's. Carry it so the row is labelled with the
+        # currency its number is actually in.
+        has_currency = meta.has_field("currency")
+        if has_currency:
+            fields.append("currency")
         try:
             rows = frappe.db.get_all(dtype, filters=inv_filters, fields=fields,
                                      order_by="posting_date desc")
@@ -2715,6 +3059,7 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                 # Drives the red/green amount colour the same way payment_type
                 # does for a PE: settled reads as money in, still-owed as out.
                 "payment_type": "Receive" if settled else "Pay",
+                "currency":     (inv.get("currency") if has_currency else None) or bank_currency,
                 "_settled":     settled,
             })
 
@@ -2766,6 +3111,7 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                 "voucher_type": ["not in", ["Payment Entry", "Journal Entry"]],
             },
             fields=["voucher_type", "voucher_no", "posting_date", "debit", "credit",
+                    "debit_in_account_currency", "credit_in_account_currency",
                     "party", "remarks"],
         )
 
@@ -2778,7 +3124,14 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                 "net": 0.0, "date": gl.posting_date,
                 "party": gl.party or "", "remarks": gl.remarks or "",
             })
-            agg["net"] += float(gl.debit or 0) - float(gl.credit or 0)
+            # Account currency, not company currency: debit/credit hold the
+            # company-currency equivalent, so on a USD bank account under an
+            # NGN company they report naira against a dollar statement.
+            # debit/credit remain the fallback for rows predating the
+            # account-currency columns.
+            agg["net"] += (float(gl.debit_in_account_currency or 0)
+                           - float(gl.credit_in_account_currency or 0)) or (
+                           float(gl.debit or 0) - float(gl.credit or 0))
             if not agg["party"] and gl.party:
                 agg["party"] = gl.party
 
@@ -2837,6 +3190,9 @@ def get_erp_vouchers(bank_account, from_date, to_date):
                 # net means money left the bank, same sense as a PE of type Pay.
                 "payment_type": "Pay" if agg["net"] < 0 else "Receive",
                 "status":       "Cleared" if (vtype, vno) in cleared else "Unreconciled",
+                # Netted from this bank account's own GL rows, so already in the
+                # bank's currency.
+                "currency":     bank_currency,
             })
 
     vouchers.sort(key=lambda v: v["date"], reverse=True)
@@ -3614,6 +3970,110 @@ def get_linked_payment_entries_for_bt(bank_transaction_name):
     )
 
 
+def _consolidated_group_names(bank_transaction_name):
+    """Every bank line consolidated together with this one, itself included.
+
+    Returns a single-element list for an ordinary row. A "group" of one is not
+    a group — the table leaves it as a normal row — so it is reported as one too.
+    """
+    row = frappe.db.get_value(
+        "Bank Transaction", bank_transaction_name,
+        ["recon_match_type", "recon_run_id"], as_dict=True,
+    ) or {}
+    if row.get("recon_match_type") != "Consolidated" or not row.get("recon_run_id"):
+        return [bank_transaction_name]
+    members = [
+        m["name"] for m in frappe.db.get_all(
+            "Bank Transaction",
+            filters={
+                "recon_run_id":     row["recon_run_id"],
+                "recon_match_type": "Consolidated",
+                "docstatus":        1,
+            },
+            fields=["name"],
+        )
+    ]
+    return sorted(members) if len(members) > 1 else [bank_transaction_name]
+
+
+@frappe.whitelist()
+def get_linked_payment_entries_for_group(bank_transaction_name):
+    """Vouchers linked to EVERY line of this row's consolidated group.
+
+    The table shows a consolidated group as one row carrying one member's name,
+    so the unreconcile dialog was only ever offered that one member's vouchers —
+    see unreconcile_consolidated_group for what that left behind.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    names = _consolidated_group_names(bank_transaction_name)
+    rows = frappe.get_all(
+        "Bank Transaction Payments",
+        filters={"parent": ["in", names]},
+        fields=["name", "parent", "payment_document", "payment_entry", "allocated_amount"],
+    )
+    return {"members": names, "entries": rows, "is_group": len(names) > 1}
+
+
+@frappe.whitelist()
+def unreconcile_consolidated_group(bank_transaction_name):
+    """Unreconcile every line of a consolidated group, and every voucher on them.
+
+    A consolidated group is reconciled as one unit — the lines were combined
+    precisely because they are one bank event — so it has to come apart as one
+    unit too. Unreconciling the row freed only the member whose name the row
+    happened to carry: the rest stayed Reconciled with their vouchers still
+    cleared, leaving a group that was half reconciled and a voucher no one could
+    reach to release, because the only row on screen now looked unreconciled.
+
+    Falls through to the ordinary single-transaction path when the row is not
+    part of a group, so one code path serves both.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    names = _consolidated_group_names(bank_transaction_name)
+    results = []
+    failed = {}
+    for name in names:
+        links = frappe.get_all(
+            "Bank Transaction Payments",
+            filters={"parent": name},
+            fields=["payment_entry"],
+        )
+        for link in links:
+            try:
+                results.append(
+                    unreconcile_bank_transaction(name, link["payment_entry"])
+                )
+            except Exception as exc:
+                failed.setdefault(name, []).append(
+                    "{0}: {1}".format(link["payment_entry"], exc)
+                )
+
+    # Report each line's final state so the caller can repaint every row it just
+    # freed, not only the one the button was on.
+    states = {
+        r["name"]: {
+            "status":              r.get("status"),
+            "recon_queue":         r.get("recon_queue"),
+            "unallocated_amount":  float(r.get("unallocated_amount") or 0),
+            "allocated_amount":    float(r.get("allocated_amount") or 0),
+        }
+        for r in frappe.db.get_all(
+            "Bank Transaction",
+            filters={"name": ["in", names]},
+            fields=["name", "status", "recon_queue", "unallocated_amount", "allocated_amount"],
+        )
+    }
+    return {
+        "success":      not failed,
+        "members":      names,
+        "unreconciled": len(results),
+        "failed":       failed,
+        "states":       states,
+    }
+
+
 @frappe.whitelist()
 def unreconcile_bank_transaction(bank_transaction_name, payment_entry_name):
     """
@@ -3651,11 +4111,29 @@ def unreconcile_bank_transaction(bank_transaction_name, payment_entry_name):
     unallocated = total - allocated
     status = "Reconciled" if unallocated <= 0 else "Unreconciled"
 
-    frappe.db.set_value("Bank Transaction", bank_transaction_name, {
+    updates = {
         "allocated_amount": allocated,
         "unallocated_amount": unallocated,
         "status": status,
-    })
+    }
+
+    # Move the row out of the Reconciled queue as well, not just out of the
+    # Reconciled status. recon_queue drives the dashboard tiles and the queue
+    # filter; leaving it at "Reconciled" meant an unreconciled transaction kept
+    # being counted and listed as reconciled until the next full AI run, and no
+    # amount of refreshing would correct it because the stored value was wrong.
+    #
+    # Route to Review where a suggestion still stands and to Unmatched where
+    # none does: the reviewer has just rejected this pairing, so the line needs
+    # looking at again rather than being silently re-filed as an auto match.
+    if status != "Reconciled":
+        still_suggested = frappe.db.get_value(
+            "Bank Transaction", bank_transaction_name, "recon_matched_entries"
+        )
+        updates["recon_queue"] = "Review" if still_suggested else "Unmatched"
+        updates["recon_user_action"] = ""
+
+    frappe.db.set_value("Bank Transaction", bank_transaction_name, updates)
 
     frappe.db.commit()
 
@@ -3666,6 +4144,7 @@ def unreconcile_bank_transaction(bank_transaction_name, payment_entry_name):
         "allocated_amount": allocated,
         "unallocated_amount": unallocated,
         "status": status,
+        "recon_queue": updates.get("recon_queue"),
     }
 
 

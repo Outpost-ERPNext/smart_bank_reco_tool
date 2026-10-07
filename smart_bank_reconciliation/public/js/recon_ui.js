@@ -202,6 +202,12 @@ window.ReconUI = (function () {
     _currencyCode = code || null;
   }
 
+  // The bank account's currency code, for rows that need to compare their own
+  // against it (see _erpAmountHtml in the ERP Vouchers tab).
+  function ReconUI_currencyCode() {
+    return _currencyCode || "";
+  }
+
   function currencySymbol() {
     if (typeof get_currency_symbol === "function") {
       return get_currency_symbol(_currencyCode) || "";
@@ -535,6 +541,29 @@ window.ReconUI = (function () {
     });
   }
 
+  /* Recount the queue tiles from the rows currently in the table.
+   *
+   * renderSummaryTiles paints the counts the server returned at load time and
+   * never touches them again, so reconciling or deleting a row left every tile
+   * showing the figure from before the action — the user had to reload the
+   * browser to trust what was on screen. The rows already carry data-queue, so
+   * the live position can be recounted without a server round-trip. */
+  function refreshQueueTiles($container) {
+    var $rows = $container.find(".sbr-row");
+    if (!$rows.length) return;
+    var counts = { TOTAL: $rows.length };
+    $rows.each(function () {
+      var q = $(this).attr("data-queue") || "";
+      for (var label in TILE_TO_QUEUE) {
+        if (TILE_TO_QUEUE[label] === q) { counts[label] = (counts[label] || 0) + 1; break; }
+      }
+    });
+    $container.find(".sbr-tile").each(function () {
+      var $t = $(this);
+      $t.find(".sbr-tile-num").text(counts[$t.attr("data-queue")] || 0);
+    });
+  }
+
   /* ── Balance summary bar ── */
 
   function renderBalanceSummary($container, balance) {
@@ -763,6 +792,21 @@ window.ReconUI = (function () {
            '<span class="sbr-suggested-tag">SUGGESTED</span>';
   }
 
+  /* Secondary line under an ERP amount on the suggestion card: the voucher's
+     own total, shown only when it differs from the amount that reached the
+     bank. See _voucherTotalNote in the match window for the same rule. */
+  function _pairTotalNote(entry) {
+    if (!entry) return "";
+    var total = parseFloat(entry.voucher_total);
+    var amt   = parseFloat(entry.amount);
+    if (isNaN(total) || isNaN(amt) || Math.abs(total - amt) < 0.01) return "";
+    var isInvoice = entry.entry_type === "Sales Invoice" ||
+                    entry.entry_type === "Purchase Invoice";
+    return '<div class="sbr-pair-field">' +
+           (isInvoice ? "Invoice total: " : "Voucher total: ") +
+           formatAmount(total) + "</div>";
+  }
+
   function _matchedEntryHtml(t) {
     var rawEntries = t.recon_matched_entries;
     if (!rawEntries) return _suggestedEntryHtml(t);
@@ -957,10 +1001,40 @@ window.ReconUI = (function () {
       // than one transaction's own amount.
       var groupTotal = totalDep > 0 ? totalDep : totalWit;
       var groupSide  = totalDep > 0 ? "total deposit" : "total withdrawal";
+
+      // The group's own state, NOT the representative's.
+      //
+      // Every other field here is aggregated across the members, but queue and
+      // status were taken from whichever member the row happens to be named
+      // after. A group with four of its five lines cleared therefore announced
+      // itself "Reconciled" while showing a non-zero Unallocated total — the
+      // row contradicted itself, and the one line still outstanding was
+      // invisible. A group is reconciled only when every line in it is.
+      var reconciledCount = 0;
+      var firstOpen = null;
+      members.forEach(function (m) {
+        if (m.recon_queue === "Reconciled") { reconciledCount++; }
+        else if (!firstOpen) { firstOpen = m; }
+      });
+      var allReconciled  = reconciledCount === members.length;
+      var partlyDone     = reconciledCount > 0 && !allReconciled;
+      var groupQueue     = allReconciled ? "Reconciled"
+                         : ((firstOpen && firstOpen.recon_queue) || "Review");
+      var groupStatus    = allReconciled ? "Reconciled" : "Unreconciled";
+
       displayTransactions.push($.extend({}, rep, {
         deposit: totalDep,
         withdrawal: totalWit,
         unallocated_amount: totalUnalloc,
+        recon_queue: groupQueue,
+        status: groupStatus,
+        // Some members are still cleared even though the row now reads as open.
+        // The action cell uses this to keep offering Unreconcile, so those
+        // links can still be released — without it a half-reconciled group
+        // would be unreachable from the table.
+        _groupPartlyReconciled: partlyDone,
+        _groupMemberCount: members.length,
+        _groupReconciledCount: reconciledCount,
         date: latest.date,
         description: "Consolidated (" + members.length + " txns) — " +
           groupSide + " " + formatAmount(groupTotal) + ": " +
@@ -1105,6 +1179,25 @@ window.ReconUI = (function () {
                   '" title="Remove this reconciliation">&#8617; Unreconcile</button>'
                 : '<button class="sbr-btn sbr-row-action-btn sbr-btn-action-blue"' +
                   ' data-txn="' + t.name + '">Actions</button>' +
+                  // A group where only SOME lines are still cleared reads as
+                  // open (correctly — it is not fully reconciled), so the
+                  // Reconciled branch above never runs for it. Offer
+                  // Unreconcile anyway, or the voucher links on the cleared
+                  // members could never be released from this table.
+                  (t._groupPartlyReconciled
+                    ? ' <button class="sbr-btn sbr-btn-unreconcile" data-txn="' + t.name +
+                      '" title="' + t._groupReconciledCount + ' of ' + t._groupMemberCount +
+                      ' lines in this group are still reconciled — release them">' +
+                      '&#8617; Unreconcile (' + t._groupReconciledCount + '/' +
+                      t._groupMemberCount + ')</button>'
+                    : "") +
+                  // A collapsed group needs a way back out — consolidating the
+                  // wrong lines together was otherwise permanent.
+                  (t.recon_match_type === "Consolidated" && groups[t.recon_run_id]
+                    ? ' <button class="sbr-btn sbr-btn-unconsolidate" data-txn="' + t.name +
+                      '" title="Split this group back into its individual bank transactions">' +
+                      '&#8597; Unconsolidate</button>'
+                    : "") +
                   (isReversal || isReversedOriginal
                     ? (pairedWith
                         // Both halves net to zero, so removing only one would
@@ -1275,13 +1368,33 @@ window.ReconUI = (function () {
 
     $(".sbr-modal-overlay").remove();
 
+    // txn comes from the COLLAPSED display list, so for a consolidated group
+    // these are already the group's combined figures — the same total the
+    // server now ranks vouchers against (see _match_target_amount in api.py).
     var txnAmount = parseFloat(txn.deposit || 0) || parseFloat(txn.withdrawal || 0) || 0;
     var isDeposit = parseFloat(txn.deposit || 0) > 0;
     var txnType   = isDeposit ? "Deposit" : "Withdrawal";
+
+    // Say so in the header when it IS a group. The modal opens on one member's
+    // name, so without this the amount reads as that single transaction's and
+    // the user has no way to tell the figure they must match is a combined one.
+    var _groups = $container.data("sbr-groups") || {};
+    var groupMembers = (txn.recon_match_type === "Consolidated" && txn.recon_run_id)
+        ? (_groups[txn.recon_run_id] || null) : null;
+    if (groupMembers && groupMembers.length < 2) groupMembers = null;
+
     var amtStr    = txnAmount > 0 ? txnType + " " + formatAmount(txnAmount) : "—";
+    if (groupMembers) {
+      amtStr += ' <span style="color:#0891b2;font-weight:600">(combined total of ' +
+                groupMembers.length + " bank lines)</span>";
+    }
     var rname     = txnName.replace(/\W/g, "");
 
-    // Detect 1:Many group match
+    // Multi-voucher mode. Starts on when the AI itself found a 1:Many group,
+    // and the user can turn it on (or off) for any transaction via the toggle
+    // in the filter bar — so a group the subset-sum search missed can still be
+    // built by hand. Reassigned at runtime, hence read, never cached, by the
+    // row builder and the confirm handler.
     var isMany = !!(suggestion && suggestion.matched &&
                    suggestion.matched.match_type === "1:Many" &&
                    suggestion.matched.entries && suggestion.matched.entries.length > 1);
@@ -1468,6 +1581,16 @@ window.ReconUI = (function () {
                 '<span class="sbr-type-filter-slot" style="display:flex;flex-wrap:wrap;gap:8px 14px"></span>' +
                 '<label style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
                   '<input type="checkbox" class="sbr-exact-filter"> Show Exact Amount Only</label>' +
+                // Lets the user build a group by hand instead of waiting for the
+                // AI to find one. Several vouchers routinely settle as a single
+                // bank line (a batch payment run, a sweep), and until now the
+                // only way to match them was if the subset-sum search happened
+                // to spot it — otherwise the modal offered single-select only
+                // and the line could not be cleared at all.
+                '<label class="sbr-many-toggle-wrap" style="display:flex;align-items:center;' +
+                'gap:4px;cursor:pointer;padding-left:12px;border-left:1px solid #e2e8f0">' +
+                  '<input type="checkbox" class="sbr-many-toggle"' + (isMany ? " checked" : "") +
+                  '> Match several vouchers to this line</label>' +
               '</div>' +
               '<div style="font-size:12px;font-weight:600;color:#64748b;margin-bottom:6px">' +
                 'Select Voucher to Match</div>' +
@@ -1549,10 +1672,47 @@ window.ReconUI = (function () {
         }
       });
       $modal.find(".sbr-many-total-amt").text(formatAmount(total));
-      var ok = Math.abs(total - txnAmount) < 0.01;
+      var diff = total - txnAmount;
+      var ok   = Math.abs(diff) < 0.01;
+      // Name the gap rather than just flagging a mismatch. "≠ Bank Amount" told
+      // the user they were wrong without telling them by how much, which is the
+      // one number they need to find the missing voucher.
       $modal.find(".sbr-many-total-match")
         .css("color", ok ? "#16a34a" : "#dc2626")
-        .text(ok ? "= Bank Amount ✓" : "≠ Bank Amount");
+        .text(ok
+          ? "= Bank Amount ✓"
+          : (diff < 0 ? "Short by " : "Over by ") + formatAmount(Math.abs(diff)));
+      _syncConfirmState();
+    }
+
+    /* A bank statement line is one atomic movement, so it is cleared in full or
+       not at all: Submit stays disabled until the selected vouchers add up to
+       the line exactly. Allowing a shortfall would mark the line reconciled
+       while part of it is still unaccounted for — the gap is nearly always a
+       bank fee, a rounding difference or a short payment that has to be posted
+       first. Single-voucher mode is unaffected; this only gates the manual
+       group. */
+    function _syncConfirmState() {
+      var $btn = $modal.find(".sbr-modal-confirm");
+      if (!isMany || $modal.find(".sbr-recon-action-sel").val() !== "match") {
+        $btn.prop("disabled", false).css("opacity", "").attr("title", "");
+        return;
+      }
+      var total = 0, n = 0;
+      $modal.find(".sbr-voucher-check:checked").each(function () {
+        var nm = $(this).val();
+        n++;
+        for (var k = 0; k < allVouchers.length; k++) {
+          if (allVouchers[k].name === nm) { total += parseFloat(allVouchers[k].amount || 0); break; }
+        }
+      });
+      var ok = n > 0 && Math.abs(total - txnAmount) < 0.01;
+      $btn.prop("disabled", !ok)
+          .css("opacity", ok ? "" : ".5")
+          .attr("title", ok ? "" : (n === 0
+            ? "Select the vouchers that make up this bank line"
+            : "Selected vouchers must add up to " + formatAmount(txnAmount) +
+              " — currently " + formatAmount(total)));
     }
 
     function buildVoucherRows(list) {
@@ -1617,7 +1777,7 @@ window.ReconUI = (function () {
                  '" target="_blank" onclick="event.stopPropagation()">' + v.name + "</a></td>" +
                '<td style="white-space:nowrap;font-size:12px">' + (v.date || "") + '</td>' +
                '<td style="font-weight:700;font-variant-numeric:tabular-nums;font-size:12px">' +
-                 formatAmount(v.amount) + '</td>' +
+                 formatAmount(v.amount) + _voucherTotalNote(v) + '</td>' +
                '<td style="font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis;' +
                  'white-space:nowrap">' + (v.party || "—") + '</td>' +
                '<td>' + aiBadge + '</td>' +
@@ -1687,10 +1847,29 @@ window.ReconUI = (function () {
           $(this).find(".sbr-voucher-radio").prop("checked", true);
         });
       }
+
+      // The rows were just rebuilt, so what is selected may have changed.
+      _syncConfirmState();
     }
 
     /* Build one checkbox per doctype present in the fetched voucher list, all
        checked by default so nothing is hidden until the user narrows it down. */
+    /* The AMOUNT column shows the money that moved through this bank account,
+       not the voucher's own total — a payment of 600,000 with 1% TDS withheld
+       reaches the bank as 594,000, and 594,000 is what the statement line says.
+       Where the two differ, show the total underneath so the row explains
+       itself instead of looking like the wrong voucher. */
+    function _voucherTotalNote(v) {
+      var total = parseFloat(v.voucher_total);
+      var amt   = parseFloat(v.amount);
+      if (isNaN(total) || isNaN(amt) || Math.abs(total - amt) < 0.01) return "";
+      return '<div style="font-weight:400;font-size:10px;color:#94a3b8;white-space:nowrap" ' +
+             'title="Voucher total ' + formatAmount(total) +
+             '; the difference did not pass through this bank account ' +
+             '(tax withheld at source, or other ledger rows in the same voucher).">of ' +
+             formatAmount(total) + '</div>';
+    }
+
     function _renderTypeFilters(list) {
       var seen = {};
       var types = [];
@@ -1731,6 +1910,33 @@ window.ReconUI = (function () {
     }
 
     $modal.on("change", ".sbr-type-filter, .sbr-exact-filter", applyFilters);
+
+    /* Switching between single and multi select. The selection is carried
+       across both ways — turning multi on keeps the voucher already picked
+       (ticked, as the first member of the group), turning it off keeps the
+       first of the ticked ones — so the user never loses their place. */
+    $modal.on("change", ".sbr-many-toggle", function () {
+      var turningOn = $(this).prop("checked");
+      var carried = [];
+      if (turningOn) {
+        var single = $modal.find(".sbr-voucher-radio:checked").val();
+        if (single) carried = [single];
+      } else {
+        var first = $modal.find(".sbr-voucher-check:checked").first().val();
+        if (first) carried = [first];
+      }
+      isMany = turningOn;
+      if (turningOn) {
+        matchedEntryNames = carried;
+      } else {
+        preselectedName = carried[0] || preselectedName;
+      }
+      applyFilters();
+    });
+
+    // Submit is only gated on the "Match Against Voucher" action, so switching
+    // action has to re-evaluate it or the button could stay stuck disabled.
+    $modal.on("change", ".sbr-recon-action-sel", function () { _syncConfirmState(); });
 
     /* ── Server-side voucher search ──
        Answers "the AI suggested the wrong entry, how do I find the right one?".
@@ -1791,10 +1997,15 @@ window.ReconUI = (function () {
       // 1:Many — collect all checked entries with their individual amounts
       if (action === "match" && isMany) {
         var selectedVouchers = [];
+        var badTypes = [];
         $modal.find(".sbr-voucher-check:checked").each(function () {
           var nm = $(this).val();
           for (var k = 0; k < allVouchers.length; k++) {
             if (allVouchers[k].name === nm) {
+              if (allVouchers[k].type === "Sales Invoice" ||
+                  allVouchers[k].type === "Purchase Invoice") {
+                badTypes.push(nm + " (" + allVouchers[k].type + ")");
+              }
               selectedVouchers.push({ name: nm, amount: allVouchers[k].amount || 0 });
               break;
             }
@@ -1802,6 +2013,41 @@ window.ReconUI = (function () {
         });
         if (!selectedVouchers.length) {
           frappe.msgprint(__("Please select at least one voucher."));
+          return;
+        }
+        // Same rule the single-select path enforces below — an invoice is not a
+        // bank movement, so it cannot be a member of the group either.
+        if (badTypes.length) {
+          frappe.msgprint({
+            title: __("Cannot Reconcile Against Invoice"),
+            indicator: "orange",
+            message: __(
+              "These selections are invoices, not bank movements:<br><b>{0}</b><br><br>" +
+              "Create a <b>Payment Entry</b> for each and include that instead.",
+              [badTypes.join("<br>")]
+            ),
+          });
+          return;
+        }
+        // A bank line is cleared in full or not at all. _syncConfirmState
+        // already disables Submit, but re-check here so the rule holds no
+        // matter how the click arrived.
+        var selTotal = 0;
+        selectedVouchers.forEach(function (v) { selTotal += parseFloat(v.amount || 0); });
+        var selDiff = selTotal - txnAmount;
+        if (Math.abs(selDiff) >= 0.01) {
+          frappe.msgprint({
+            title: __("Amounts Do Not Add Up"),
+            indicator: "orange",
+            message: __(
+              "The {0} selected vouchers total <b>{1}</b>, but this bank line is <b>{2}</b> " +
+              "— {3} <b>{4}</b>.<br><br>A bank line has to be accounted for in full. " +
+              "The difference is usually a bank fee, a rounding difference or a short " +
+              "payment that still needs to be recorded; post it, then include it here.",
+              [selectedVouchers.length, formatAmount(selTotal), formatAmount(txnAmount),
+               selDiff < 0 ? __("short by") : __("over by"), formatAmount(Math.abs(selDiff))]
+            ),
+          });
           return;
         }
         if (typeof onConfirm === "function") {
@@ -2155,6 +2401,23 @@ window.ReconUI = (function () {
       return;
     }
 
+    /* The column is headed with the BANK ACCOUNT's currency, because that is
+       what a bank statement is denominated in and what every bank-ledger
+       voucher is now reported in. An invoice raised in another currency is a
+       different matter — its total is a figure in ITS currency, and printing it
+       under the bank's symbol states something false. Where a row's currency
+       differs, it is formatted and labelled in its own. */
+    function _erpAmountHtml(v) {
+      var cur = v.currency || "";
+      if (!cur || cur === ReconUI_currencyCode()) return formatAmount(v.amount);
+      var amt = (typeof format_currency === "function")
+        ? format_currency(parseFloat(v.amount) || 0, cur, 2)
+        : (parseFloat(v.amount) || 0).toFixed(2);
+      return amt + '<span style="font-weight:400;font-size:10px;color:#94a3b8;' +
+             'margin-left:4px" title="This voucher is denominated in ' + cur +
+             ', not the bank account\'s currency">' + cur + "</span>";
+    }
+
     function buildRows(list) {
       if (!list.length) {
         return '<tr><td colspan="7" class="sbr-empty" style="padding:20px;text-align:center">No vouchers match this filter.</td></tr>';
@@ -2176,7 +2439,8 @@ window.ReconUI = (function () {
           '<td class="sbr-ref">' + link + "</td>" +
           "<td style='white-space:nowrap'>" + (v.date || "") + "</td>" +
           "<td style='max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title='" + (v.party || "") + "'>" + party + "</td>" +
-          '<td style="font-weight:600;font-variant-numeric:tabular-nums;color:' + amtColor + '">' + formatAmount(v.amount) + "</td>" +
+          '<td style="font-weight:600;font-variant-numeric:tabular-nums;color:' + amtColor + '">' +
+            _erpAmountHtml(v) + "</td>" +
           '<td style="font-family:ui-monospace,monospace;font-size:11px;color:#64748b">' + (v.reference || "—") + "</td>" +
           "<td>" + statusHtml + "</td>" +
           "</tr>";
@@ -2432,14 +2696,13 @@ window.ReconUI = (function () {
             '<div class="sbr-pair-side-label">ERP ' + mType + "</div>" +
             erpIdHtml +
             '<div class="sbr-pair-amt">' + mAmt + "</div>" +
-            // For an invoice the amount above is its grand total (same figure ERP
-            // shows); the outstanding balance is what the bank amount was actually
-            // scored against, so show it rather than leaving the difference
-            // looking like a mismatch.
-            (matchedEntry.outstanding_amount !== null && matchedEntry.outstanding_amount !== undefined
-              ? '<div class="sbr-pair-field">Outstanding: ' +
-                  formatAmount(matchedEntry.outstanding_amount) + "</div>"
-              : "") +
+            // The amount above is what this voucher is worth TO THE BANK — the
+            // money that crossed this account, or an invoice's outstanding
+            // balance. Where the voucher's own total differs (tax withheld at
+            // source, a bank charge inside a larger journal, a part-paid
+            // invoice), name the total too so the gap reads as an explanation
+            // rather than a mismatch.
+            _pairTotalNote(matchedEntry) +
             (mDate ? '<div class="sbr-pair-field">' + mDate + "</div>" : "") +
             (mRef  ? '<div class="sbr-pair-field sbr-pair-mono">' + mRef + "</div>" : "") +
             (mParty ? '<div class="sbr-pair-field">' + mParty + "</div>" : "") +
@@ -3378,6 +3641,7 @@ window.ReconUI = (function () {
     signalBadges:           signalBadges,
     renderTabShell:         renderTabShell,
     renderSummaryTiles:     renderSummaryTiles,
+    refreshQueueTiles:      refreshQueueTiles,
     updateTabBadge:         updateTabBadge,
     renderBalanceSummary:   renderBalanceSummary,
     renderAIBanner:         renderAIBanner,
