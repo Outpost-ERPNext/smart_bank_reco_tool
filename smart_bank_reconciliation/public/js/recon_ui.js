@@ -336,6 +336,12 @@ window.ReconUI = (function () {
           ' <span class="sbr-tab-badge">' + (bankCount || 0) + "</span></button>" +
         '<button class="sbr-tab" data-tab="erp">ERP Vouchers' +
           ' <span class="sbr-tab-badge">0</span></button>' +
+        // The two open sides of the reconciliation, kept as their own tabs so
+        // each reads as a worklist rather than a filter of another list.
+        '<button class="sbr-tab" data-tab="bsonly" title="Statement lines with nothing in ERP cleared against them">BS Only' +
+          ' <span class="sbr-tab-badge">0</span></button>' +
+        '<button class="sbr-tab" data-tab="erponly" title="Vouchers posted to this bank account with no statement line cleared against them">ERP Only' +
+          ' <span class="sbr-tab-badge">0</span></button>' +
         '<button class="sbr-tab" data-tab="ai">AI Match Pairs' +
           ' <span class="sbr-tab-badge">0</span></button>' +
         '<button class="sbr-tab" data-tab="audit">Audit Trail' +
@@ -385,6 +391,14 @@ window.ReconUI = (function () {
       '<div class="sbr-tab-content" data-tab="erp" style="display:none">' +
         '<p class="sbr-empty" style="padding:24px 0">ERP Vouchers appear here after loading. ' +
         'Load transactions first, then run AI Match All.</p>' +
+      "</div>" +
+      '<div class="sbr-tab-content" data-tab="bsonly" style="display:none">' +
+        '<p class="sbr-empty" style="padding:24px 0">Load transactions to see statement ' +
+        'lines with no ERP entry cleared against them.</p>' +
+      "</div>" +
+      '<div class="sbr-tab-content" data-tab="erponly" style="display:none">' +
+        '<p class="sbr-empty" style="padding:24px 0">Load transactions to see ERP vouchers ' +
+        'on this bank account with no statement line cleared against them.</p>' +
       "</div>" +
       '<div class="sbr-tab-content" data-tab="ai" style="display:none">' +
         '<div class="sbr-suggestion-panel sbr-suggestion-panel-tab"></div>' +
@@ -2375,6 +2389,182 @@ window.ReconUI = (function () {
     setTimeout(_updateScrollFab, 120);
   }
 
+  /* ── BS Only / ERP Only tabs ──────────────────────────────────────────────
+     The two open sides of a bank reconciliation. BS Only is "in the bank, not
+     in the books"; ERP Only is "in the books, not in the bank". Membership
+     comes from the server (see get_unreconciled_two_sided) — a pending AI
+     suggestion does not settle a line, so a suggested-but-unapproved row
+     stays on both lists, and the suggestion is shown as context. ── */
+
+  // A full-year range on a busy account can put several thousand lines on one
+  // side. Building that string is quick, but handing the browser megabytes of
+  // markup to parse into DOM nodes is not, and no reviewer reads row 3,000 off
+  // the screen. Render a generous slice and say plainly what was held back —
+  // Export CSV always writes the complete list, and search filters the whole
+  // list before this cap applies, so nothing is actually out of reach.
+  var TWO_SIDED_RENDER_CAP = 1000;
+
+  function _twoSidedRows(list, side) {
+    if (!list.length) {
+      return '<tr><td colspan="' + (side === "bs" ? 7 : 6) + '" class="sbr-empty" ' +
+             'style="padding:20px;text-align:center">Nothing outstanding on this side.</td></tr>';
+    }
+    return list.slice(0, TWO_SIDED_RENDER_CAP).map(function (v, i) {
+      var isIn  = v.direction === "Deposit";
+      var color = isIn ? "#16a34a" : "#dc2626";
+      var amt   = '<span style="color:' + color + ';font-weight:600;' +
+                  'font-variant-numeric:tabular-nums">' + formatAmount(v.amount) +
+                  (isIn ? " CR" : " DR") + "</span>";
+      if (side === "bs") {
+        return "<tr>" +
+          '<td style="color:#94a3b8;font-size:11px">' + (i + 1) + "</td>" +
+          "<td style='white-space:nowrap'>" + (v.date || "") + "</td>" +
+          '<td class="sbr-ref"><a class="sbr-link" href="/app/bank-transaction/' +
+            encodeURIComponent(v.name) + '" target="_blank">' + v.name + "</a></td>" +
+          "<td style='max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' title=\"" +
+            String(v.description || "").replace(/"/g, "&quot;") + '">' +
+            (v.description || v.party || "—") + "</td>" +
+          "<td>" + amt + "</td>" +
+          '<td style="font-family:ui-monospace,monospace;font-size:11px;color:#64748b">' +
+            (v.reference || "—") + "</td>" +
+          '<td style="font-size:11px">' + (v.suggested
+            ? '<span style="color:#b45309">' + v.suggested +
+              '</span><span class="sbr-suggested-tag">SUGGESTED</span>'
+            : '<span style="color:#94a3b8">—</span>') + "</td>" +
+          "</tr>";
+      }
+      var tc = ERP_TYPE_COLOR[v.type_short] || ERP_TYPE_COLOR_DEFAULT;
+      return "<tr>" +
+        '<td style="color:#94a3b8;font-size:11px">' + (i + 1) + "</td>" +
+        '<td><span class="sbr-badge" style="background:' + tc.bg + ";color:" + tc.text +
+          ";border-color:" + tc.border + '">' + (v.type_short || "?") + "</span></td>" +
+        '<td class="sbr-ref"><a class="sbr-link" href="/app/' +
+          String(v.type || "").toLowerCase().replace(/ /g, "-") + "/" +
+          encodeURIComponent(v.name) + '" target="_blank">' + v.name + "</a></td>" +
+        "<td style='white-space:nowrap'>" + (v.date || "") + "</td>" +
+        "<td style='max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>" +
+          (v.party || "—") + "</td>" +
+        "<td>" + amt + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function _twoSidedCapNote(total) {
+    if (total <= TWO_SIDED_RENDER_CAP) return "";
+    return '<div class="sbr-twoside-cap" style="margin-top:8px;padding:7px 11px;' +
+      'border:1px solid #fde68a;background:#fffbeb;border-radius:6px;font-size:11px;' +
+      'color:#92400e">Showing the first ' + TWO_SIDED_RENDER_CAP.toLocaleString() +
+      " of " + total.toLocaleString() + " items. Narrow the date range or search to " +
+      "see the rest — <b>Export CSV</b> always writes the complete list.</div>";
+  }
+
+  function _twoSidedPane($tab, list, side, summary, title, blurb) {
+    var net = side === "bs" ? summary.bs_only_net : summary.erp_only_net;
+    var head =
+      '<div style="display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap;' +
+      'padding:10px 12px;margin-bottom:10px;border:1px solid ' +
+      (side === "bs" ? "#bfdbfe" : "#fed7aa") + ';border-radius:8px;background:' +
+      (side === "bs" ? "#eff6ff" : "#fff7ed") + '">' +
+        '<div style="flex:1;min-width:220px">' +
+          '<div style="font-weight:700;font-size:13px;color:#0f172a">' + title + "</div>" +
+          '<div style="font-size:11px;color:#64748b;margin-top:2px">' + blurb + "</div>" +
+        "</div>" +
+        '<div style="text-align:right">' +
+          '<div style="font-size:11px;color:#64748b">ITEMS</div>' +
+          '<div style="font-weight:700;font-size:16px;font-variant-numeric:tabular-nums">' +
+            list.length + "</div>" +
+        "</div>" +
+        '<div style="text-align:right">' +
+          '<div style="font-size:11px;color:#64748b">NET</div>' +
+          '<div style="font-weight:700;font-size:16px;font-variant-numeric:tabular-nums;color:' +
+            (net >= 0 ? "#16a34a" : "#dc2626") + '">' + formatAmount(Math.abs(net)) +
+            (net >= 0 ? " CR" : " DR") + "</div>" +
+        "</div>" +
+      "</div>";
+
+    var toolbar =
+      '<div class="sbr-erp-toolbar">' +
+        '<input class="sbr-twoside-search" type="text" placeholder="Search…">' +
+        '<span class="sbr-txn-counter sbr-twoside-counter">' + list.length + " items</span>" +
+        '<button class="sbr-btn sbr-twoside-export" style="padding:4px 10px;font-size:11px;' +
+          'margin-left:auto">&#8595; Export CSV</button>' +
+      "</div>";
+
+    var header = side === "bs"
+      ? '<th style="width:34px">#</th><th>Date</th><th>Bank Txn</th>' +
+        '<th>Description</th><th>Amount</th><th>Reference</th><th>AI Suggestion</th>'
+      : '<th style="width:34px">#</th><th style="width:44px">Type</th><th>Voucher</th>' +
+        '<th>Date</th><th>Party</th><th>Amount</th>';
+
+    $tab.html(head + toolbar +
+      '<div class="sbr-table-wrap" style="max-height:60vh;overflow:auto;border:1px solid #e2e8f0;' +
+      'border-radius:6px;background:#fff">' +
+      '<table class="sbr-table" style="border-collapse:separate;border-spacing:0">' +
+      "<thead><tr>" + header + "</tr></thead><tbody>" +
+      _twoSidedRows(list, side) + "</tbody></table></div>" +
+      _twoSidedCapNote(list.length));
+    _neutralizeStickyBreakers($tab);
+
+    $tab.find(".sbr-twoside-search").on("input", function () {
+      var q = ($(this).val() || "").toLowerCase();
+      var filtered = !q ? list : list.filter(function (v) {
+        return [v.name, v.description, v.reference, v.party, v.suggested, v.type]
+          .filter(Boolean).join(" ").toLowerCase().indexOf(q) !== -1;
+      });
+      $tab.find("tbody").html(_twoSidedRows(filtered, side));
+      $tab.find(".sbr-twoside-counter").text(filtered.length + " items");
+      $tab.find(".sbr-twoside-cap").replaceWith(_twoSidedCapNote(filtered.length));
+    });
+
+    $tab.find(".sbr-twoside-export").on("click", function () {
+      var cols = side === "bs"
+        ? ["Date", "Bank Txn", "Description", "Direction", "Amount", "Reference", "AI Suggestion"]
+        : ["Type", "Voucher", "Date", "Party", "Direction", "Amount"];
+      var rows = list.map(function (v) {
+        return side === "bs"
+          ? [v.date, v.name, v.description, v.direction, v.amount, v.reference, v.suggested]
+          : [v.type, v.name, v.date, v.party, v.direction, v.amount];
+      });
+      // Same CSV shape the other tabs produce: quote everything, double inner
+      // quotes. Kept local rather than shared so this tab cannot change how the
+      // existing exports behave.
+      function esc(val) {
+        return '"' + String(val === null || val === undefined ? "" : val)
+          .replace(/"/g, '""') + '"';
+      }
+      var csvRows = [cols.map(esc).join(",")];
+      rows.forEach(function (r) { csvRows.push(r.map(esc).join(",")); });
+      var blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+      var url  = URL.createObjectURL(blob);
+      var a    = document.createElement("a");
+      a.href = url;
+      a.download = (side === "bs" ? "sbr_bs_only_" : "sbr_erp_only_") +
+                   (new Date().toISOString().slice(0, 10)) + ".csv";
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    });
+  }
+
+  function renderTwoSidedTabs($container, data) {
+    data = data || {};
+    var summary = data.summary || {};
+    var bs  = data.bs_only  || [];
+    var erp = data.erp_only || [];
+
+    _twoSidedPane($container.find('.sbr-tab-content[data-tab="bsonly"]'), bs, "bs", summary,
+      "BS Only — in the bank, not in the books",
+      "Statement lines in this period that no ERP voucher has been cleared against. " +
+      "A pending AI suggestion does not clear a line, so it still counts here.");
+
+    _twoSidedPane($container.find('.sbr-tab-content[data-tab="erponly"]'), erp, "erp", summary,
+      "ERP Only — in the books, not in the bank",
+      "Vouchers that posted to this bank account in this period with no statement " +
+      "line cleared against them: unpresented cheques, payments raised before the money moved.");
+
+    updateTabBadge($container, "bsonly", bs.length);
+    updateTabBadge($container, "erponly", erp.length);
+  }
+
   /* ── ERP Vouchers tab ── */
 
   var ERP_TYPE_COLOR = {
@@ -3650,6 +3840,7 @@ window.ReconUI = (function () {
     updateMatchBadges:      updateMatchBadges,
     renderSuggestionsPanel: renderSuggestionsPanel,
     renderERPVouchersTab:   renderERPVouchersTab,
+    renderTwoSidedTabs:     renderTwoSidedTabs,
     showSuggestionCard:     showSuggestionCard,
     filterByQueue:          filterByQueue,
     switchTab:              switchTab,

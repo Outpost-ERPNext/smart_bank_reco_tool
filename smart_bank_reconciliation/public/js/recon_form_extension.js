@@ -176,6 +176,8 @@ function sbr_restore_from_cache(frm, $canvas) {
         { from: fd, to: td }); }
     },
   });
+  // Same period, same trigger — keep the two outstanding-item lists in step.
+  sbr_load_two_sided(frm, $canvas);
   frappe.call({
     method: "smart_bank_reconciliation.reconciliation.api.get_aging_erp_entries",
     args: { bank_account: ba, from_date: fd, to_date: td, company: co },
@@ -529,6 +531,8 @@ function sbr_schedule_erp_default_load(frm) {
           }
         },
       });
+      // Same period, same trigger — keep the two outstanding-item lists in step.
+      sbr_load_two_sided(frm, $canvas);
     } else if (attempts < 25) {
       setTimeout(check, 200);
     }
@@ -554,6 +558,35 @@ function sbr_load_erp_vouchers_default(frm, $canvas) {
       if (!er.exc) {
         ReconUI.renderERPVouchersTab($canvas, (er.message || {}).vouchers || [],
           { from: from_date, to: to_date });
+      }
+    },
+  });
+  // The two outstanding-item lists derive from the same period, so they are
+  // refreshed on the same trigger as the voucher list.
+  sbr_load_two_sided(frm, $canvas);
+}
+
+/* ── Load the BS Only / ERP Only tabs ──────────────────────────────────────
+   Loaded alongside the ERP Vouchers tab so both sides are populated by the
+   time the user clicks across; one query each, and neither touches the bank
+   table's own state. ── */
+function sbr_load_two_sided(frm, $canvas) {
+  var bank_account = frm.doc.bank_account;
+  var from_date    = frm.doc.bank_statement_from_date;
+  var to_date      = frm.doc.bank_statement_to_date;
+  if (!bank_account || !from_date || !to_date) return;
+  if (!$canvas) {
+    $canvas = frm.fields_dict.recon_ui_container
+      ? frm.fields_dict.recon_ui_container.$wrapper : null;
+  }
+  if (!$canvas) return;
+  frappe.call({
+    method: "smart_bank_reconciliation.reconciliation.api.get_unreconciled_two_sided",
+    args: { bank_account: bank_account, from_date: from_date, to_date: to_date },
+    callback: function (r) {
+      if (r.exc) return;
+      if (window.ReconUI && ReconUI.renderTwoSidedTabs) {
+        ReconUI.renderTwoSidedTabs($canvas, r.message || {});
       }
     },
   });
@@ -750,6 +783,8 @@ function sbr_load_transactions(frm) {
           }
         },
       });
+      // Same period, same trigger — keep the two outstanding-item lists in step.
+      sbr_load_two_sided(frm, $canvas);
 
 
     },
@@ -1333,6 +1368,25 @@ function sbr_open_create_voucher_dialog(frm, $canvas, txnName) {
             if (r.exc) return;
             dialog.hide();
             sbr_mark_row_reconciled($canvas, txnName);
+            // ERPNext's endpoint reconciles the line and writes its own
+            // reference rows, but knows nothing about this app's fields — so
+            // without this the transaction showed no matched entry, no match
+            // type and a stale queue even though it was plainly reconciled.
+            // Record the voucher it just linked as this line's match.
+            frappe.call({
+              method: "smart_bank_reconciliation.reconciliation.api.sync_recon_fields_from_links",
+              args: { bank_transaction: txnName },
+              callback: function (sr) {
+                var names = ((sr && sr.message) || {}).matched_entries || [];
+                if (!names.length) return;
+                var dt = isJE ? "journal-entry" : "payment-entry";
+                $canvas.find('.sbr-row[data-txn="' + txnName + '"] .sbr-matched-entry-cell')
+                  .html(names.map(function (n) {
+                    return '<a class="sbr-link" href="/app/' + dt + '/' +
+                           encodeURIComponent(n) + '" target="_blank">' + n + "</a>";
+                  }).join("<br>"));
+              },
+            });
             frappe.show_alert({
               message: isJE ? __("Journal Entry created and reconciled.") : __("Payment Entry created and reconciled."),
               indicator: "green",
