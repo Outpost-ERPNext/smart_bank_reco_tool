@@ -412,6 +412,38 @@ def get_bank_transactions(bank_account, from_date, to_date):
                         row["party_type"] = live_entries[n]
                         break
 
+    # A reconciled row with no stored match still has to show what it was
+    # reconciled against.
+    #
+    # recon_matched_entries is only written by this app's own approve path.
+    # Anything that clears a line by ERPNext's route — "Create Voucher", which
+    # hands off to create_journal_entry_bts, or ERPNext's own Bank
+    # Reconciliation Tool — writes the reference rows and nothing else, so the
+    # "Matched ERP Entry" column read "—" for a line that is plainly
+    # reconciled. Fill it in from the links that do exist.
+    #
+    # Read-only and in-memory: a GET must not write. sync_recon_fields_from_links
+    # is the call that makes it durable, and runs after Create Voucher.
+    _needs_links = [
+        r["name"] for r in rows
+        if not (r.get("recon_matched_entries") or "").strip()
+        and (r.get("status") == "Reconciled" or float(r.get("unallocated_amount") or 0) == 0)
+    ]
+    if _needs_links:
+        _links_by_txn = {}
+        for link in frappe.db.get_all(
+            "Bank Transaction Payments",
+            filters={"parent": ["in", _needs_links]},
+            fields=["parent", "payment_entry"],
+            order_by="idx asc",
+        ):
+            if link.get("payment_entry"):
+                _links_by_txn.setdefault(link["parent"], []).append(link["payment_entry"])
+        for row in rows:
+            found = _links_by_txn.get(row["name"])
+            if found:
+                row["recon_matched_entries"] = frappe.as_json(found)
+
     # Display-only suggested entry for rows that store no reconcilable match,
     # derived here so a plain reload shows the same thing an AI run does. The
     # raw draft payload is then dropped — it is only needed to derive this, and
@@ -2681,6 +2713,70 @@ def unconsolidate_transactions(bank_transaction):
 
 
 @frappe.whitelist()
+def sync_recon_fields_from_links(bank_transaction):
+    """Bring this app's own fields in line with the voucher links actually on a
+    Bank Transaction.
+
+    Reconciling through approve_match writes both halves: ERPNext's reference
+    rows AND recon_matched_entries / recon_queue / recon_user_action, which is
+    what the table's "Matched ERP Entry" column, the queue tiles and every
+    export read. Anything that reconciles a transaction by ERPNext's own route
+    writes only the first half — in particular "Create Voucher", which hands
+    off to create_journal_entry_bts / create_payment_entry_bts and lets those
+    reconcile the line. The accounting was correct, but as far as this tool was
+    concerned the line had no match: the column showed "—" and the row carried
+    no match type, no action and a stale queue.
+
+    Reads the links rather than taking a voucher name from the caller, so it is
+    correct whatever created them and on either ERPNext version, and so it can
+    equally repair a line reconciled from ERPNext's own Bank Reconciliation
+    Tool.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    bt = frappe.db.get_value(
+        "Bank Transaction", bank_transaction,
+        ["name", "status", "unallocated_amount", "recon_matched_entries",
+         "recon_match_type", "recon_queue"],
+        as_dict=True,
+    )
+    if not bt:
+        frappe.throw(_("Bank Transaction {0} not found.").format(bank_transaction))
+
+    links = frappe.db.get_all(
+        "Bank Transaction Payments",
+        filters={"parent": bank_transaction},
+        fields=["payment_document", "payment_entry", "allocated_amount"],
+        order_by="idx asc",
+    )
+    names = [l["payment_entry"] for l in links if l.get("payment_entry")]
+    if not names:
+        return {"updated": False, "reason": "no voucher links on this transaction"}
+
+    is_reconciled = (bt.get("status") == "Reconciled"
+                     or float(bt.get("unallocated_amount") or 0) == 0)
+
+    updates = {"recon_matched_entries": frappe.as_json(names)}
+    if is_reconciled:
+        updates["recon_queue"] = "Reconciled"
+        updates["recon_user_action"] = "Accepted"
+    # Only name a match type where there is none; a line the engine already
+    # scored keeps the type it earned ("1:1 Exact", "Approved Pattern", ...).
+    if not (bt.get("recon_match_type") or "").strip():
+        updates["recon_match_type"] = "Manual" if len(names) == 1 else "1:Many"
+
+    frappe.db.set_value("Bank Transaction", bank_transaction, updates)
+    frappe.db.commit()
+
+    return {
+        "updated":        True,
+        "matched_entries": names,
+        "recon_queue":     updates.get("recon_queue") or bt.get("recon_queue"),
+        "recon_match_type": updates.get("recon_match_type") or bt.get("recon_match_type"),
+    }
+
+
+@frappe.whitelist()
 def get_consolidatable_transactions(bank_account, from_date, to_date):
     frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
     txns = frappe.db.get_all(
@@ -3197,6 +3293,165 @@ def get_erp_vouchers(bank_account, from_date, to_date):
 
     vouchers.sort(key=lambda v: v["date"], reverse=True)
     return {"vouchers": vouchers, "total": len(vouchers)}
+
+
+@frappe.whitelist()
+def get_unreconciled_two_sided(bank_account, from_date, to_date, company=None):
+    """The two open sides of a bank reconciliation, as a reviewer thinks of them.
+
+      BS Only  — statement lines in this period that nothing in ERP has been
+                 cleared against. The classic "in the bank, not in the books":
+                 charges, interest, direct debits, receipts nobody booked yet.
+      ERP Only — vouchers that posted to this bank account in this period but
+                 that no statement line has been cleared against. The classic
+                 "in the books, not in the bank": unpresented cheques, payments
+                 raised before the money moved.
+
+    Membership is decided by the reference rows (Bank Transaction Payments),
+    not by a confidence score: a suggestion the reviewer has not accepted is
+    not a match, so a line with a pending suggestion still belongs in BS Only.
+    The suggestion travels with the row so the reviewer can see there IS a
+    candidate without it being counted as settled.
+
+    ERP Only is discovered through the general ledger rather than per doctype,
+    so every voucher type a site books through the bank is covered — Payment
+    Entry, Journal Entry, Expense Claim, loan repayments — and the amount is
+    the money that crossed this account, in this account's own currency.
+    Company-wide invoices are deliberately NOT here: an unpaid sales invoice
+    never touched the bank, so listing it as an unreconciled bank item would
+    bury the real ones.
+    """
+    frappe.only_for(["Accounts User", "Accounts Manager", "System Manager"])
+
+    ba = frappe.db.get_value(
+        "Bank Account", bank_account, ["account", "company"], as_dict=True) or {}
+    gl_account = ba.get("account")
+    company = company or ba.get("company")
+    currency = (frappe.db.get_value("Account", gl_account, "account_currency")
+                if gl_account else None) or \
+               (frappe.db.get_value("Company", company, "default_currency")
+                if company else None) or ""
+
+    # ── Which vouchers are already cleared against SOME line on this account ──
+    # Deliberately not restricted to this period: a voucher cleared by a
+    # statement line in an adjacent month is settled, not outstanding.
+    cleared_vouchers = {
+        r["payment_entry"] for r in frappe.db.sql(
+            """
+            SELECT DISTINCT p.payment_entry
+            FROM `tabBank Transaction Payments` p
+            INNER JOIN `tabBank Transaction` bt ON bt.name = p.parent
+            WHERE bt.bank_account = %s AND bt.docstatus = 1
+            """,
+            (bank_account,), as_dict=True,
+        ) if r.get("payment_entry")
+    }
+
+    # ── BS Only ───────────────────────────────────────────────────────────────
+    bs_rows = frappe.db.sql(
+        """
+        SELECT bt.name, bt.date, bt.deposit, bt.withdrawal, bt.description,
+               bt.reference_number, bt.party_type, bt.party, bt.status,
+               bt.unallocated_amount, bt.recon_queue, bt.recon_confidence,
+               bt.recon_matched_entries, bt.recon_match_type
+        FROM `tabBank Transaction` bt
+        WHERE bt.bank_account = %s
+          AND bt.docstatus = 1
+          AND bt.date BETWEEN %s AND %s
+          AND NOT EXISTS (
+                SELECT 1 FROM `tabBank Transaction Payments` p
+                WHERE p.parent = bt.name
+          )
+          AND IFNULL(bt.status, '') != 'Reconciled'
+        ORDER BY bt.date ASC
+        """,
+        (bank_account, from_date, to_date), as_dict=True,
+    )
+
+    bs_only = []
+    for r in bs_rows:
+        amount = float(r.get("deposit") or 0) - float(r.get("withdrawal") or 0)
+        suggested = ""
+        try:
+            parsed = json.loads(r.get("recon_matched_entries") or "[]")
+            suggested = ", ".join([n for n in parsed if n])
+        except Exception:
+            suggested = ""
+        bs_only.append({
+            "name":          r["name"],
+            "date":          str(r.get("date") or ""),
+            "description":   r.get("description") or "",
+            "reference":     r.get("reference_number") or "",
+            "party":         r.get("party") or "",
+            "deposit":       float(r.get("deposit") or 0),
+            "withdrawal":    float(r.get("withdrawal") or 0),
+            "amount":        abs(amount),
+            "direction":     "Deposit" if amount > 0 else "Withdrawal",
+            "queue":         r.get("recon_queue") or "",
+            "confidence":    float(r.get("recon_confidence") or 0),
+            "suggested":     suggested,
+            "currency":      currency,
+        })
+
+    # ── ERP Only ──────────────────────────────────────────────────────────────
+    erp_only = []
+    if gl_account:
+        gl_rows = frappe.db.sql(
+            """
+            SELECT voucher_type, voucher_no,
+                   MIN(posting_date) AS posting_date,
+                   SUM(debit_in_account_currency)  AS dr_acc,
+                   SUM(credit_in_account_currency) AS cr_acc,
+                   SUM(debit)  AS dr,
+                   SUM(credit) AS cr,
+                   MAX(party)  AS party
+            FROM `tabGL Entry`
+            WHERE account = %s
+              AND is_cancelled = 0
+              AND posting_date BETWEEN %s AND %s
+            GROUP BY voucher_type, voucher_no
+            ORDER BY posting_date ASC
+            """,
+            (gl_account, from_date, to_date), as_dict=True,
+        )
+        for g in gl_rows:
+            if g["voucher_no"] in cleared_vouchers:
+                continue
+            net = (float(g["dr_acc"] or 0) - float(g["cr_acc"] or 0)) or \
+                  (float(g["dr"] or 0) - float(g["cr"] or 0))
+            if not net:
+                continue   # legs cancelled out — nothing moved through the bank
+            erp_only.append({
+                "name":      g["voucher_no"],
+                "type":      g["voucher_type"],
+                "type_short": _voucher_short_code(g["voucher_type"]),
+                "date":      str(g.get("posting_date") or ""),
+                "party":     g.get("party") or "",
+                "amount":    abs(net),
+                "direction": "Deposit" if net > 0 else "Withdrawal",
+                "currency":  currency,
+            })
+
+    def _net(rows):
+        return sum((r["amount"] if r["direction"] == "Deposit" else -r["amount"])
+                   for r in rows)
+
+    return {
+        "bs_only":  bs_only,
+        "erp_only": erp_only,
+        "currency": currency,
+        "summary": {
+            "bs_only_count":  len(bs_only),
+            "bs_only_net":    _net(bs_only),
+            "erp_only_count": len(erp_only),
+            "erp_only_net":   _net(erp_only),
+            # What the two sides say the difference between statement and ledger
+            # should be. A reviewer who clears every item on both lists ends the
+            # period with the two balances equal.
+            "difference":     _net(bs_only) - _net(erp_only),
+        },
+        "period": {"from_date": str(from_date), "to_date": str(to_date)},
+    }
 
 
 @frappe.whitelist()
